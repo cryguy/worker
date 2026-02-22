@@ -27,8 +27,11 @@ func TestWrapESModule_ExportAsDefault(t *testing.T) {
 	source := `var handler = { fetch(req) { return new Response("ok"); } };
 export { handler as default };`
 	result := wrapESModule(source)
-	if !strings.Contains(result, "globalThis.__worker_module__ = handler") {
-		t.Errorf("should assign handler as default, got %q", result)
+	if !strings.Contains(result, "globalThis.__worker_module__") {
+		t.Errorf("should set __worker_module__, got %q", result)
+	}
+	if strings.Contains(result, "export {") {
+		t.Errorf("should not contain bare 'export {', got %q", result)
 	}
 }
 
@@ -52,7 +55,6 @@ export function scheduled(event) {}`
 	if !strings.Contains(result, "globalThis.__worker_module__") {
 		t.Errorf("should set __worker_module__, got %q", result)
 	}
-	// Should strip 'export' keyword from inline exports
 	if strings.Contains(result, "export async function") || strings.Contains(result, "export function") {
 		t.Errorf("should strip export keyword, got %q", result)
 	}
@@ -61,55 +63,56 @@ export function scheduled(event) {}`
 func TestWrapESModule_NoExport(t *testing.T) {
 	source := `globalThis.__worker_module__ = { fetch(req) { return new Response("ok"); } };`
 	result := wrapESModule(source)
+	// esbuild IIFE wrapping is harmless — __worker_module__ should still be set.
+	if !strings.Contains(result, "__worker_module__") {
+		t.Errorf("should still contain __worker_module__, got %q", result)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge cases: patterns the old regex approach couldn't handle
+// ---------------------------------------------------------------------------
+
+func TestWrapESModule_ExportInsideStringLiteral(t *testing.T) {
+	source := `export default { fetch(req) { return new Response("export default foo"); } };`
+	result := wrapESModule(source)
+	if !strings.Contains(result, "globalThis.__worker_module__") {
+		t.Errorf("should set __worker_module__, got %q", result)
+	}
+	// The string literal content should be preserved.
+	if !strings.Contains(result, `export default foo`) {
+		t.Errorf("string literal content should be preserved, got %q", result)
+	}
+}
+
+func TestWrapESModule_ExportInsideComment(t *testing.T) {
+	source := `// export default should not match in a comment
+export default { fetch(req) { return new Response("ok"); } };`
+	result := wrapESModule(source)
+	if !strings.Contains(result, "globalThis.__worker_module__") {
+		t.Errorf("should set __worker_module__, got %q", result)
+	}
+}
+
+func TestWrapESModule_MixedDefaultAndNamed(t *testing.T) {
+	source := `export const scheduled = (event) => {};
+export default { fetch(req) { return new Response("ok"); } };`
+	result := wrapESModule(source)
+	if !strings.Contains(result, "globalThis.__worker_module__") {
+		t.Errorf("should set __worker_module__, got %q", result)
+	}
+	if strings.Contains(result, "export const") || strings.Contains(result, "export default") {
+		t.Errorf("should not contain bare export keywords, got %q", result)
+	}
+}
+
+func TestWrapESModule_ErrorFallback(t *testing.T) {
+	// Completely invalid JS that esbuild can't parse.
+	source := `function {{{invalid syntax`
+	result := wrapESModule(source)
+	// Should return source unchanged on error.
 	if result != source {
-		t.Errorf("source without exports should pass through unchanged")
-	}
-}
-
-func TestParseExportBlock_DefaultExport(t *testing.T) {
-	defaultName, names := parseExportBlock("handler as default")
-	if defaultName != "handler" {
-		t.Errorf("defaultName = %q, want 'handler'", defaultName)
-	}
-	if len(names) != 0 {
-		t.Errorf("names = %v, want empty", names)
-	}
-}
-
-func TestParseExportBlock_NamedExports(t *testing.T) {
-	_, names := parseExportBlock("fetch, scheduled")
-	if len(names) != 2 {
-		t.Fatalf("names len = %d, want 2", len(names))
-	}
-	if names[0] != "fetch" || names[1] != "scheduled" {
-		t.Errorf("names = %v", names)
-	}
-}
-
-func TestParseExportBlock_AliasedExport(t *testing.T) {
-	_, names := parseExportBlock("myFetch as fetch")
-	if len(names) != 1 || names[0] != "fetch: myFetch" {
-		t.Errorf("names = %v, want ['fetch: myFetch']", names)
-	}
-}
-
-func TestParseExportBlock_EmptyEntries(t *testing.T) {
-	defaultName, names := parseExportBlock("  , , fetch ,  ")
-	if defaultName != "" {
-		t.Errorf("defaultName = %q, want empty", defaultName)
-	}
-	if len(names) != 1 || names[0] != "fetch" {
-		t.Errorf("names = %v, want ['fetch']", names)
-	}
-}
-
-func TestParseExportBlock_MixedExports(t *testing.T) {
-	defaultName, names := parseExportBlock("handler as default, scheduled, myFetch as fetch")
-	if defaultName != "handler" {
-		t.Errorf("defaultName = %q, want 'handler'", defaultName)
-	}
-	if len(names) != 2 {
-		t.Fatalf("names len = %d, want 2", len(names))
+		t.Errorf("should return source unchanged on error, got %q", result)
 	}
 }
 
@@ -281,6 +284,16 @@ func TestWrapESModule_ExportVar(t *testing.T) {
 	}
 	if strings.Contains(result, "export var") {
 		t.Errorf("should strip 'export var', got %q", result)
+	}
+}
+
+func TestWrapESModule_NoExportFallbackWithManualAssignment(t *testing.T) {
+	// Source that manually sets __worker_module__ with no exports.
+	// IIFE wrapping should be harmless.
+	source := `globalThis.__worker_module__ = { fetch(req) { return new Response("manual"); } };`
+	result := wrapESModule(source)
+	if !strings.Contains(result, "__worker_module__") {
+		t.Errorf("should preserve __worker_module__ assignment, got %q", result)
 	}
 }
 

@@ -2,10 +2,9 @@ package worker
 
 import (
 	"fmt"
-	"regexp"
-	"strings"
 	"sync"
 
+	"github.com/evanw/esbuild/pkg/api"
 	v8 "github.com/tommie/v8go"
 )
 
@@ -157,77 +156,28 @@ func (p *v8Pool) dispose() {
 	}
 }
 
-// reExportBlock matches an export { ... } block at the end of a script,
-// as produced by esbuild in ESM format.
-var reExportBlock = regexp.MustCompile(`(?s)export\s*\{([^}]+)\}\s*;?\s*$`)
-
-// reExportDefault matches "export default" at the start of a line,
-// avoiding false positives inside string literals or comments.
-var reExportDefault = regexp.MustCompile(`(?m)^export\s+default\s+`)
-
-// reInline matches inline named exports (export function, export const, etc.).
-var reInline = regexp.MustCompile(`export\s+(async\s+function|function|const|let|var|class)\s+(\w+)`)
-
 // wrapESModule transforms an ES module source into a script that assigns
-// exports to globalThis.__worker_module__. Handles multiple patterns:
+// exports to globalThis.__worker_module__. It uses esbuild's Transform API
+// to properly parse the JS AST and wrap the module as an IIFE assigned to
+// globalThis.__worker_module__.
 //
-//  1. export default { fetch(request, env, ctx) { ... } }
-//  2. export { name as default }  (esbuild output)
-//  3. export { fetch, scheduled }  (named exports)
-//  4. export function fetch(...)   (inline named exports)
+// If the source has no exports (already a plain script), the IIFE wrapping
+// is harmless — the global name is set to the IIFE's return value.
+// If esbuild reports errors, the source is returned unchanged so that
+// callers handle V8 compile errors downstream.
 func wrapESModule(source string) string {
-	// Pattern 1: direct "export default ..." at line start
-	if loc := reExportDefault.FindStringIndex(source); loc != nil {
-		return source[:loc[0]] + "globalThis.__worker_module__ = " + source[loc[1]:]
-	}
-
-	// Pattern 2 & 3: export { ... } block (esbuild output style)
-	if m := reExportBlock.FindStringSubmatchIndex(source); m != nil {
-		block := source[m[2]:m[3]]
-		defaultName, namedExports := parseExportBlock(block)
-		result := source[:m[0]]
-
-		if defaultName != "" {
-			result += "globalThis.__worker_module__ = " + defaultName + ";\n"
-		} else if len(namedExports) > 0 {
-			result += "globalThis.__worker_module__ = { " + strings.Join(namedExports, ", ") + " };\n"
-		}
-		return result
-	}
-
-	// Pattern 4: inline named exports (export function, export const, etc.)
-	var exportedNames []string
-	result := reInline.ReplaceAllStringFunc(source, func(match string) string {
-		parts := reInline.FindStringSubmatch(match)
-		exportedNames = append(exportedNames, parts[2])
-		return parts[1] + " " + parts[2]
+	result := api.Transform(source, api.TransformOptions{
+		Format:     api.FormatIIFE,
+		GlobalName: "globalThis.__worker_module__",
+		Target:     api.ESNext,
 	})
-	if len(exportedNames) > 0 {
-		result += "\nglobalThis.__worker_module__ = { " + strings.Join(exportedNames, ", ") + " };\n"
-		return result
+	if len(result.Errors) > 0 {
+		return source
 	}
-
-	// Fallback: return as-is.
-	return source
-}
-
-// parseExportBlock parses the contents of an export { ... } block.
-// Returns the default export name (if any) and a list of named exports.
-func parseExportBlock(block string) (defaultName string, names []string) {
-	for _, entry := range strings.Split(block, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		parts := strings.Fields(entry)
-		switch {
-		case len(parts) == 3 && parts[1] == "as" && parts[2] == "default":
-			defaultName = parts[0]
-		case len(parts) == 3 && parts[1] == "as":
-			names = append(names, parts[2]+": "+parts[0])
-		case len(parts) == 1:
-			names = append(names, parts[0])
-		}
-	}
-	return
+	code := string(result.Code)
+	// esbuild places the default export under a .default property when
+	// converting ESM to IIFE. Unwrap it so callers can access handlers
+	// (fetch, scheduled, etc.) directly on globalThis.__worker_module__.
+	code += "if(globalThis.__worker_module__&&globalThis.__worker_module__.default)globalThis.__worker_module__=globalThis.__worker_module__.default;\n"
+	return code
 }

@@ -65,7 +65,8 @@ func BundleWorkerScript(deployPath string) (string, error) {
 		EntryPoints:   []string{entryPoint},
 		AbsWorkingDir: deployPath,
 		Bundle:        true,
-		Format:        esbuild.FormatESModule,
+		Format:        esbuild.FormatIIFE,
+		GlobalName:    "globalThis.__worker_module__",
 		Write:         false,
 		Platform:      esbuild.PlatformBrowser,
 		Target:        esbuild.ES2022,
@@ -99,7 +100,12 @@ func BundleWorkerScript(deployPath string) (string, error) {
 		return "", fmt.Errorf("bundling produced no output")
 	}
 
-	return string(result.OutputFiles[0].Contents), nil
+	code := string(result.OutputFiles[0].Contents)
+	// esbuild places the default export under a .default property when
+	// converting ESM to IIFE. Unwrap it so callers can access handlers
+	// (fetch, scheduled, etc.) directly on globalThis.__worker_module__.
+	code += "if(globalThis.__worker_module__&&globalThis.__worker_module__.default)globalThis.__worker_module__=globalThis.__worker_module__.default;\n"
+	return code, nil
 }
 
 // needsBundling checks if a script contains import statements that
