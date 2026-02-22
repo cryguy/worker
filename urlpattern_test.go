@@ -260,3 +260,132 @@ func TestURLPattern_DictInput(t *testing.T) {
 		t.Error("should not match different host")
 	}
 }
+
+func TestURLPattern_BaseURL(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const pattern = new URLPattern('/users/:id', 'https://example.com');
+    const result = pattern.exec('https://example.com/users/42');
+    return Response.json({
+      matched: result !== null,
+      id: result ? result.pathname.groups.id : null,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Matched bool   `json:"matched"`
+		ID      string `json:"id"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Matched {
+		t.Error("pattern with baseURL should match")
+	}
+	if data.ID != "42" {
+		t.Errorf("id = %q, want '42'", data.ID)
+	}
+}
+
+func TestURLPattern_PortMatching(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const pattern = new URLPattern({ hostname: 'localhost', port: '8080', pathname: '/*' });
+    return Response.json({
+      matchesPort: pattern.test('http://localhost:8080/test'),
+      noPort: pattern.test('http://localhost/test'),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		MatchesPort bool `json:"matchesPort"`
+		NoPort      bool `json:"noPort"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.MatchesPort {
+		t.Error("should match with correct port")
+	}
+}
+
+func TestURLPattern_ExecMethod(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const pattern = new URLPattern({ pathname: '/items/:id' });
+    const result = pattern.exec('https://example.com/items/abc');
+    return Response.json({
+      hasPathname: result !== null && result.pathname !== undefined,
+      hasHostname: result !== null && result.hostname !== undefined,
+      hasProtocol: result !== null && result.protocol !== undefined,
+      id: result ? result.pathname.groups.id : null,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		HasPathname bool   `json:"hasPathname"`
+		HasHostname bool   `json:"hasHostname"`
+		HasProtocol bool   `json:"hasProtocol"`
+		ID          string `json:"id"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.HasPathname {
+		t.Error("exec result should have pathname")
+	}
+	if data.ID != "abc" {
+		t.Errorf("id = %q, want 'abc'", data.ID)
+	}
+}
+
+func TestURLPattern_InvalidInput(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    // Test with no match
+    const pattern = new URLPattern({ pathname: '/exact' });
+    const result = pattern.exec('https://example.com/different');
+    return Response.json({
+      matched: result !== null,
+      testResult: pattern.test('https://example.com/different'),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Matched    bool `json:"matched"`
+		TestResult bool `json:"testResult"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Matched {
+		t.Error("should not match /different")
+	}
+	if data.TestResult {
+		t.Error("test should return false")
+	}
+}

@@ -52,6 +52,20 @@ func (e *errR2Store) PublicURL(key string) (string, error) {
 	return "", fmt.Errorf("public URL not configured")
 }
 
+// failListR2Store returns errors from List (and Delete) to exercise
+// the error-handling branches in buildStorageBinding.
+type failListR2Store struct {
+	errR2Store
+}
+
+func (f *failListR2Store) Delete(keys []string) error {
+	return fmt.Errorf("delete failed")
+}
+
+func (f *failListR2Store) List(opts R2ListOptions) (*R2ListResult, error) {
+	return nil, fmt.Errorf("list failed")
+}
+
 // nilConfigR2Store simulates a StorageBridge with no client configured.
 // PresignedGetURL returns "storage client not configured".
 type nilConfigR2Store struct{}
@@ -1348,5 +1362,54 @@ func TestStorageBinding_CreateSignedUrl_RequiresArg(t *testing.T) {
 	_, err = awaitValue(ctx, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "requires a key") {
 		t.Fatalf("expected 'requires a key' error, got %v", err)
+	}
+}
+
+func TestStorageBinding_ListErrorPath(t *testing.T) {
+	iso, ctx := newV8TestContext(t)
+
+	bucketVal, err := buildStorageBinding(iso, ctx, &failListR2Store{})
+	if err != nil {
+		t.Fatalf("buildStorageBinding: %v", err)
+	}
+	_ = ctx.Global().Set("__bucket", bucketVal)
+
+	// list() should resolve with an empty result when the store returns an error.
+	result, err := ctx.RunScript("__bucket.list()", "test_list_err.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	val, err := awaitValue(ctx, result, deadline)
+	if err != nil {
+		t.Fatalf("expected list to resolve, got error: %v", err)
+	}
+
+	// The result should be a valid object (empty list fallback).
+	if val.IsNullOrUndefined() {
+		t.Fatal("expected non-null list result")
+	}
+}
+
+func TestStorageBinding_DeleteErrorPath(t *testing.T) {
+	iso, ctx := newV8TestContext(t)
+
+	bucketVal, err := buildStorageBinding(iso, ctx, &failListR2Store{})
+	if err != nil {
+		t.Fatalf("buildStorageBinding: %v", err)
+	}
+	_ = ctx.Global().Set("__bucket", bucketVal)
+
+	// delete() should resolve even when the store returns an error.
+	result, err := ctx.RunScript("__bucket.delete('some-key')", "test_delete_err.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	_, err = awaitValue(ctx, result, deadline)
+	if err != nil {
+		t.Fatalf("expected delete to resolve, got error: %v", err)
 	}
 }

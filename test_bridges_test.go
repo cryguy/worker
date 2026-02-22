@@ -34,18 +34,18 @@ func newMockKVStore() *mockKVStore {
 
 var _ KVStore = (*mockKVStore)(nil)
 
-func (kv *mockKVStore) Get(key string) (string, error) {
+func (kv *mockKVStore) Get(key string) (*string, error) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	e, ok := kv.entries[key]
 	if !ok {
-		return "", nil
+		return nil, nil
 	}
 	if e.ExpiresAt != nil && e.ExpiresAt.Before(time.Now()) {
 		delete(kv.entries, key)
-		return "", nil
+		return nil, nil
 	}
-	return e.Value, nil
+	return &e.Value, nil
 }
 
 func (kv *mockKVStore) GetWithMetadata(key string) (*KVValueWithMetadata, error) {

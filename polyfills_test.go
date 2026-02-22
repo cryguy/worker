@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -112,5 +113,56 @@ func TestPolyfill_IntegrityCheckRejectsTamperedContent(t *testing.T) {
 	actualHash := sha256.Sum256([]byte("not the expected content"))
 	if hex.EncodeToString(actualHash[:]) == polyfillHashes[testURL] {
 		t.Error("hash should not match tampered content")
+	}
+}
+
+func TestDownloadAndExtract_HTTPError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	err := downloadAndExtract(ts.URL+"/test.tgz", t.TempDir())
+	if err == nil {
+		t.Fatal("expected error for HTTP 404")
+	}
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("error = %q, want mention of HTTP 404", err)
+	}
+}
+
+func TestDownloadAndExtract_InvalidGzip(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("this is not gzip data"))
+	}))
+	defer ts.Close()
+
+	err := downloadAndExtract(ts.URL+"/test.tgz", t.TempDir())
+	if err == nil {
+		t.Fatal("expected error for invalid gzip")
+	}
+	if !strings.Contains(err.Error(), "decompressing") {
+		t.Errorf("error = %q, want decompressing error", err)
+	}
+}
+
+func TestDownloadAndExtract_IntegrityCheckFails(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("some content"))
+	}))
+	defer ts.Close()
+
+	// Register a hash for this URL that won't match.
+	polyfillHashes[ts.URL+"/test.tgz"] = "0000000000000000000000000000000000000000000000000000000000000000"
+	defer delete(polyfillHashes, ts.URL+"/test.tgz")
+
+	err := downloadAndExtract(ts.URL+"/test.tgz", t.TempDir())
+	if err == nil {
+		t.Fatal("expected integrity check error")
+	}
+	if !strings.Contains(err.Error(), "integrity check failed") {
+		t.Errorf("error = %q, want integrity check failure", err)
 	}
 }

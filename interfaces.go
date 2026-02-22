@@ -15,7 +15,7 @@ type WorkerDispatcher interface {
 
 // KVStore backs a single KV namespace.
 type KVStore interface {
-	Get(key string) (string, error)
+	Get(key string) (*string, error)
 	GetWithMetadata(key string) (*KVValueWithMetadata, error)
 	Put(key, value string, metadata *string, ttl *int) error
 	Delete(key string) error

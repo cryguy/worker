@@ -3,6 +3,7 @@ package worker
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -400,5 +401,177 @@ func TestQueue_AccessibleFromWorkerEnv(t *testing.T) {
 	}
 	if !data.HasSendBatch {
 		t.Error("env.MY_QUEUE.sendBatch should be a function")
+	}
+}
+
+// failingQueueSender always returns errors.
+type failingQueueSender struct{}
+
+func (f *failingQueueSender) Send(body, contentType string) (string, error) {
+	return "", fmt.Errorf("queue send failed")
+}
+
+func (f *failingQueueSender) SendBatch(msgs []QueueMessageInput) ([]string, error) {
+	return nil, fmt.Errorf("queue sendBatch failed")
+}
+
+func TestQueue_SendErrorPath(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    try {
+      await env.MY_QUEUE.send("hello");
+      return Response.json({ error: false });
+    } catch(e) {
+      return Response.json({ error: true, message: String(e) });
+    }
+  },
+};`
+
+	env := queueEnv(t, &failingQueueSender{})
+	r := execJS(t, e, source, env, getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Error   bool   `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Error {
+		t.Error("expected queue.send to reject on error")
+	}
+	if !strings.Contains(data.Message, "queue send failed") {
+		t.Errorf("error message = %q, want to contain 'queue send failed'", data.Message)
+	}
+}
+
+func TestQueue_SendBatchErrorPath(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    try {
+      await env.MY_QUEUE.sendBatch([{ body: "hello" }]);
+      return Response.json({ error: false });
+    } catch(e) {
+      return Response.json({ error: true, message: String(e) });
+    }
+  },
+};`
+
+	env := queueEnv(t, &failingQueueSender{})
+	r := execJS(t, e, source, env, getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Error   bool   `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Error {
+		t.Error("expected queue.sendBatch to reject on error")
+	}
+	if !strings.Contains(data.Message, "queue sendBatch failed") {
+		t.Errorf("error message = %q, want to contain 'queue sendBatch failed'", data.Message)
+	}
+}
+
+func TestQueue_ContentTypeDefaults(t *testing.T) {
+	e := newTestEngine(t)
+	mock := &mockQueueSender{}
+
+	// Test that sending without contentType defaults to "json"
+	source := `export default {
+  async fetch(request, env) {
+    await env.MY_QUEUE.send("hello");
+    await env.MY_QUEUE.send("world", { contentType: null });
+    await env.MY_QUEUE.send("typed", { contentType: "text" });
+    return Response.json({ ok: true });
+  },
+};`
+
+	env := queueEnv(t, mock)
+	r := execJS(t, e, source, env, getReq("http://localhost/"))
+	assertOK(t, r)
+
+	msgs := mock.Messages()
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgs))
+	}
+	if msgs[0].ContentType != "json" {
+		t.Errorf("msg[0] contentType = %q, want 'json' (default)", msgs[0].ContentType)
+	}
+	if msgs[1].ContentType != "json" {
+		t.Errorf("msg[1] contentType = %q, want 'json' (null defaults to json)", msgs[1].ContentType)
+	}
+	if msgs[2].ContentType != "text" {
+		t.Errorf("msg[2] contentType = %q, want 'text'", msgs[2].ContentType)
+	}
+}
+
+func TestQueue_SendNoArgs(t *testing.T) {
+	e := newTestEngine(t)
+	mock := &mockQueueSender{}
+
+	source := `export default {
+  async fetch(request, env) {
+    try {
+      await env.MY_QUEUE.send();
+      return Response.json({ error: false });
+    } catch(e) {
+      return Response.json({ error: true, message: String(e) });
+    }
+  },
+};`
+
+	env := queueEnv(t, mock)
+	r := execJS(t, e, source, env, getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Error   bool   `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Error {
+		t.Error("expected queue.send() with no args to reject")
+	}
+}
+
+func TestQueue_SendBatchNoArgs(t *testing.T) {
+	e := newTestEngine(t)
+	mock := &mockQueueSender{}
+
+	source := `export default {
+  async fetch(request, env) {
+    try {
+      await env.MY_QUEUE.sendBatch();
+      return Response.json({ error: false });
+    } catch(e) {
+      return Response.json({ error: true, message: String(e) });
+    }
+  },
+};`
+
+	env := queueEnv(t, mock)
+	r := execJS(t, e, source, env, getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Error   bool   `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Error {
+		t.Error("expected queue.sendBatch() with no args to reject")
 	}
 }

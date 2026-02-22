@@ -94,3 +94,51 @@ func TestScheduler_WaitZeroMs(t *testing.T) {
 		t.Error("scheduler.wait(0) should resolve")
 	}
 }
+
+func TestScheduler_WaitNegative(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    await scheduler.wait(-10);
+    return Response.json({ done: true });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Done bool `json:"done"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Done {
+		t.Error("scheduler.wait(-10) should resolve")
+	}
+}
+
+func TestScheduler_WaitNoArgs(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    await scheduler.wait();
+    return Response.json({ done: true });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Done bool `json:"done"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Done {
+		t.Error("scheduler.wait() with no args should resolve")
+	}
+}

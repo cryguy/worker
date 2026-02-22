@@ -89,14 +89,14 @@ func buildKVBinding(iso *v8.Isolate, ctx *v8.Context, store KVStore) (*v8.Value,
 			resolver.Reject(errVal)
 			return resolver.GetPromise().Value
 		}
-		if val == "" {
+		if val == nil {
 			resolver.Resolve(v8.Null(iso))
 			return resolver.GetPromise().Value
 		}
 
 		switch valType {
 		case "json":
-			jsVal, err := ctx.RunScript(fmt.Sprintf("JSON.parse(%q)", val), "kv_get_json.js")
+			jsVal, err := ctx.RunScript(fmt.Sprintf("JSON.parse(%q)", *val), "kv_get_json.js")
 			if err != nil {
 				errVal, _ := v8.NewValue(iso, "KV.get: invalid JSON value")
 				resolver.Reject(errVal)
@@ -104,7 +104,7 @@ func buildKVBinding(iso *v8.Isolate, ctx *v8.Context, store KVStore) (*v8.Value,
 				resolver.Resolve(jsVal)
 			}
 		case "arrayBuffer":
-			strVal, _ := v8.NewValue(iso, val)
+			strVal, _ := v8.NewValue(iso, *val)
 			_ = ctx.Global().Set("__tmp_kv_ab_val", strVal)
 			jsVal, err := ctx.RunScript(`(function() {
 				var s = globalThis.__tmp_kv_ab_val;
@@ -119,7 +119,7 @@ func buildKVBinding(iso *v8.Isolate, ctx *v8.Context, store KVStore) (*v8.Value,
 				resolver.Resolve(jsVal)
 			}
 		case "stream":
-			strVal, _ := v8.NewValue(iso, val)
+			strVal, _ := v8.NewValue(iso, *val)
 			_ = ctx.Global().Set("__tmp_kv_stream_val", strVal)
 			jsVal, err := ctx.RunScript(`(function() {
 				var s = globalThis.__tmp_kv_stream_val;
@@ -140,7 +140,7 @@ func buildKVBinding(iso *v8.Isolate, ctx *v8.Context, store KVStore) (*v8.Value,
 				resolver.Resolve(jsVal)
 			}
 		default: // "text"
-			strVal, _ := v8.NewValue(iso, val)
+			strVal, _ := v8.NewValue(iso, *val)
 			resolver.Resolve(strVal)
 		}
 		return resolver.GetPromise().Value

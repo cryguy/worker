@@ -1268,3 +1268,325 @@ func TestTCPSocket_BufferSizeLimit(t *testing.T) {
 		t.Errorf("maxTCPBufferSize = %d, want 1KB-100MB", maxTCPBufferSize)
 	}
 }
+
+func TestTCPConnect_MissingArgs(t *testing.T) {
+	_, ctx, _ := setupTCPTestContext(t)
+
+	// __tcpConnect with too few arguments should throw
+	result, err := ctx.RunScript(`(function() {
+		try {
+			__tcpConnect("1", "host");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "error:") {
+		t.Errorf("expected error for missing args, got: %s", result.String())
+	}
+}
+
+func TestTCPRead_MissingArgs(t *testing.T) {
+	_, ctx, _ := setupTCPTestContext(t)
+
+	result, err := ctx.RunScript(`(function() {
+		try {
+			__tcpRead("1");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "error:") {
+		t.Errorf("expected error for missing args, got: %s", result.String())
+	}
+}
+
+func TestTCPRead_UnknownSocketID(t *testing.T) {
+	iso, ctx, _ := setupTCPTestContext(t)
+
+	reqID := newRequestState(10, defaultEnv())
+	defer clearRequestState(reqID)
+	reqIDVal, _ := v8.NewValue(iso, strconv.FormatUint(reqID, 10))
+	_ = ctx.Global().Set("__requestID", reqIDVal)
+
+	result, err := ctx.RunScript(fmt.Sprintf(`(function() {
+		try {
+			__tcpRead("%d", "unknown_socket", 4096);
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, reqID), "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "unknown socket") {
+		t.Errorf("expected unknown socket error, got: %s", result.String())
+	}
+}
+
+func TestTCPWrite_MissingArgs(t *testing.T) {
+	_, ctx, _ := setupTCPTestContext(t)
+
+	result, err := ctx.RunScript(`(function() {
+		try {
+			__tcpWrite("1", "sock");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "error:") {
+		t.Errorf("expected error for missing args, got: %s", result.String())
+	}
+}
+
+func TestTCPWrite_UnknownSocketID(t *testing.T) {
+	iso, ctx, _ := setupTCPTestContext(t)
+
+	reqID := newRequestState(10, defaultEnv())
+	defer clearRequestState(reqID)
+	reqIDVal, _ := v8.NewValue(iso, strconv.FormatUint(reqID, 10))
+	_ = ctx.Global().Set("__requestID", reqIDVal)
+
+	result, err := ctx.RunScript(fmt.Sprintf(`(function() {
+		try {
+			__tcpWrite("%d", "unknown_socket", "aGVsbG8=");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, reqID), "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "unknown socket") {
+		t.Errorf("expected unknown socket error, got: %s", result.String())
+	}
+}
+
+func TestTCPClose_MissingArgs(t *testing.T) {
+	_, ctx, _ := setupTCPTestContext(t)
+
+	result, err := ctx.RunScript(`(function() {
+		try {
+			__tcpClose("1");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "error:") {
+		t.Errorf("expected error for missing args, got: %s", result.String())
+	}
+}
+
+func TestTCPClose_UnknownSocketID(t *testing.T) {
+	iso, ctx, _ := setupTCPTestContext(t)
+
+	reqID := newRequestState(10, defaultEnv())
+	defer clearRequestState(reqID)
+	reqIDVal, _ := v8.NewValue(iso, strconv.FormatUint(reqID, 10))
+	_ = ctx.Global().Set("__requestID", reqIDVal)
+
+	result, err := ctx.RunScript(fmt.Sprintf(`(function() {
+		try {
+			__tcpClose("%d", "unknown_socket");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, reqID), "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "unknown socket") {
+		t.Errorf("expected unknown socket error, got: %s", result.String())
+	}
+}
+
+func TestTCPStartTls_MissingArgs(t *testing.T) {
+	_, ctx, _ := setupTCPTestContext(t)
+
+	result, err := ctx.RunScript(`(function() {
+		try {
+			__tcpStartTls("1", "sock");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "error:") {
+		t.Errorf("expected error for missing args, got: %s", result.String())
+	}
+}
+
+func TestTCPSocket_MaxConnectionLimitEnforced(t *testing.T) {
+	disableTCPSSRF(t)
+	iso, ctx, _ := setupTCPTestContext(t)
+
+	reqID := newRequestState(10, defaultEnv())
+	defer clearRequestState(reqID)
+	state := getRequestState(reqID)
+
+	// Pre-fill the tcpSockets map to capacity
+	state.tcpSockets = make(map[string]net.Conn)
+	for i := 0; i < maxTCPSockets; i++ {
+		server, client := net.Pipe()
+		defer server.Close()
+		defer client.Close()
+		state.tcpSockets[fmt.Sprintf("tcp_%d", i)] = client
+	}
+
+	reqIDVal, _ := v8.NewValue(iso, strconv.FormatUint(reqID, 10))
+	_ = ctx.Global().Set("__requestID", reqIDVal)
+
+	result, err := ctx.RunScript(fmt.Sprintf(`(function() {
+		try {
+			__tcpConnect("%d", "8.8.8.8", "80", "off");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, reqID), "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "maximum socket limit") {
+		t.Errorf("expected max socket limit error, got: %s", result.String())
+	}
+}
+
+func TestTCPSocketBuffer_Overflow(t *testing.T) {
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
+
+	buf := &tcpSocketBuffer{conn: client, hasData: make(chan struct{}, 1)}
+	go buf.readLoop()
+
+	// Write more than maxTCPBufferSize in total.
+	// Use a goroutine because net.Pipe Write blocks when readLoop exits.
+	chunk := make([]byte, 64*1024)
+	for i := range chunk {
+		chunk[i] = 'A'
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		totalWritten := 0
+		for totalWritten < maxTCPBufferSize+1 {
+			n, err := server.Write(chunk)
+			if err != nil {
+				break
+			}
+			totalWritten += n
+		}
+	}()
+
+	// Wait for readLoop to detect overflow (poll with timeout).
+	deadline := time.After(5 * time.Second)
+	for {
+		buf.mu.Lock()
+		hasErr := buf.err != nil
+		buf.mu.Unlock()
+		if hasErr {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for buffer overflow")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Close server to unblock the writer goroutine.
+	_ = server.Close()
+	<-done
+
+	buf.mu.Lock()
+	hasErr := buf.err != nil
+	isDone := buf.done
+	buf.mu.Unlock()
+
+	if !hasErr {
+		t.Error("expected buffer overflow error")
+	}
+	if !isDone {
+		t.Error("expected done=true after overflow")
+	}
+}
+
+func TestTCPConnect_InvalidRequestState(t *testing.T) {
+	_, ctx, _ := setupTCPTestContext(t)
+
+	result, err := ctx.RunScript(`(function() {
+		try {
+			__tcpConnect("999999600", "8.8.8.8", "80", "off");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "invalid request state") {
+		t.Errorf("expected invalid request state error, got: %s", result.String())
+	}
+}
+
+func TestTCPRead_InvalidRequestState(t *testing.T) {
+	_, ctx, _ := setupTCPTestContext(t)
+
+	result, err := ctx.RunScript(`(function() {
+		try {
+			__tcpRead("999999601", "tcp_1", 4096);
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "invalid request state") {
+		t.Errorf("expected invalid request state error, got: %s", result.String())
+	}
+}
+
+func TestTCPWrite_InvalidRequestState(t *testing.T) {
+	_, ctx, _ := setupTCPTestContext(t)
+
+	result, err := ctx.RunScript(`(function() {
+		try {
+			__tcpWrite("999999602", "tcp_1", "aGVsbG8=");
+			return "no_error";
+		} catch(e) {
+			return "error:" + String(e);
+		}
+	})()`, "test.js")
+	if err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if !strings.Contains(result.String(), "invalid request state") {
+		t.Errorf("expected invalid request state error, got: %s", result.String())
+	}
+}

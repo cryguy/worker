@@ -18,8 +18,8 @@ func TestKVBridge_PutAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if val != "hello" {
-		t.Errorf("Get = %q, want %q", val, "hello")
+	if val == nil || *val != "hello" {
+		t.Errorf("Get = %v, want %q", val, "hello")
 	}
 }
 
@@ -30,8 +30,8 @@ func TestKVBridge_GetNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if val != "" {
-		t.Errorf("Get = %q, want empty string", val)
+	if val != nil {
+		t.Errorf("Get = %v, want nil", val)
 	}
 }
 
@@ -50,8 +50,8 @@ func TestKVBridge_GetExpired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if val != "" {
-		t.Errorf("Get expired key = %q, want empty", val)
+	if val != nil {
+		t.Errorf("Get expired key = %v, want nil", val)
 	}
 }
 
@@ -70,8 +70,8 @@ func TestKVBridge_Delete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get after delete: %v", err)
 	}
-	if val != "" {
-		t.Errorf("Get after delete = %q, want empty", val)
+	if val != nil {
+		t.Errorf("Get after delete = %v, want nil", val)
 	}
 }
 
@@ -940,8 +940,8 @@ func TestKVBridge_PutOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if val != "v2" {
-		t.Errorf("Get = %q, want %q", val, "v2")
+	if val == nil || *val != "v2" {
+		t.Errorf("Get = %v, want %q", val, "v2")
 	}
 }
 
@@ -1077,8 +1077,8 @@ func TestKVBridge_PutWithTTLZeroNeverExpires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if val != "persistent" {
-		t.Errorf("Get = %q, want %q", val, "persistent")
+	if val == nil || *val != "persistent" {
+		t.Errorf("Get = %v, want %q", val, "persistent")
 	}
 }
 
@@ -1097,16 +1097,16 @@ func TestKVBridge_NamespaceIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("kv1.Get: %v", err)
 	}
-	if val1 != "ns1-value" {
-		t.Errorf("kv1.Get = %q, want %q", val1, "ns1-value")
+	if val1 == nil || *val1 != "ns1-value" {
+		t.Errorf("kv1.Get = %v, want %q", val1, "ns1-value")
 	}
 
 	val2, err := kv2.Get("shared-key")
 	if err != nil {
 		t.Fatalf("kv2.Get: %v", err)
 	}
-	if val2 != "ns2-value" {
-		t.Errorf("kv2.Get = %q, want %q", val2, "ns2-value")
+	if val2 == nil || *val2 != "ns2-value" {
+		t.Errorf("kv2.Get = %v, want %q", val2, "ns2-value")
 	}
 }
 
@@ -1517,5 +1517,49 @@ func TestKV_JSListMetadataNoMeta(t *testing.T) {
 	}
 	if !data.IsAbsent {
 		t.Error("key without metadata should have undefined/null metadata in list()")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bug 1: KV.get() should return empty string, not null, for empty string values
+// ---------------------------------------------------------------------------
+
+func TestKV_JSGetEmptyStringValue(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    await env.MY_KV.put("empty", "");
+    const val = await env.MY_KV.get("empty");
+    return Response.json({
+      isNull: val === null,
+      isEmpty: val === "",
+      isString: typeof val === "string",
+      val: val,
+    });
+  },
+};`
+
+	env := kvEnv(t)
+	r := execJS(t, e, source, env, getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		IsNull   bool   `json:"isNull"`
+		IsEmpty  bool   `json:"isEmpty"`
+		IsString bool   `json:"isString"`
+		Val      string `json:"val"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.IsNull {
+		t.Error("KV.get() for empty string value should NOT return null — Bug 1 regression")
+	}
+	if !data.IsEmpty {
+		t.Errorf("KV.get() for empty string value should return empty string, got %q", data.Val)
+	}
+	if !data.IsString {
+		t.Error("KV.get() for empty string value should return a string type")
 	}
 }

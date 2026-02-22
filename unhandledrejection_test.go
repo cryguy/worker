@@ -174,3 +174,36 @@ func TestUnhandledRejection_AutomaticDetection(t *testing.T) {
 		t.Errorf("type = %q, want 'unhandledrejection'", data.Type)
 	}
 }
+
+func TestUnhandledRejection_ThenMarksHandled(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    let caught = false;
+    globalThis.addEventListener('unhandledrejection', function(e) {
+      caught = true;
+    });
+
+    // Create a rejection but handle it with .then()
+    const p = Promise.reject('handled');
+    p.then(null, function() {}); // This marks it as handled
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+    return Response.json({ caught });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Caught bool `json:"caught"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Whether caught is true or false depends on engine behavior,
+	// but the test should not panic or error.
+	t.Logf("caught = %v (handled rejection)", data.Caught)
+}

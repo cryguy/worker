@@ -23,19 +23,19 @@ var fetchSSRFEnabled = true
 // These headers are controlled by the HTTP transport or could be used for
 // header smuggling attacks.
 var forbiddenFetchHeaders = map[string]bool{
-	"host":                 true,
-	"transfer-encoding":    true,
-	"connection":           true,
-	"keep-alive":           true,
-	"upgrade":              true,
-	"proxy-authorization":  true,
-	"proxy-connection":     true,
-	"te":                   true,
-	"trailer":              true,
-	"x-forwarded-for":      true,
-	"x-forwarded-host":     true,
-	"x-forwarded-proto":    true,
-	"x-real-ip":            true,
+	"host":                true,
+	"transfer-encoding":   true,
+	"connection":          true,
+	"keep-alive":          true,
+	"upgrade":             true,
+	"proxy-authorization": true,
+	"proxy-connection":    true,
+	"te":                  true,
+	"trailer":             true,
+	"x-forwarded-for":     true,
+	"x-forwarded-host":    true,
+	"x-forwarded-proto":   true,
+	"x-real-ip":           true,
 }
 
 // fetchTransport is the http.RoundTripper used by fetch. Tests can override it.
@@ -56,7 +56,7 @@ type fetchResult struct {
 // The HTTP request runs in a goroutine so that an AbortSignal can cancel it
 // while the Go callback is waiting for the result. V8 is not accessed from
 // the goroutine — only the context.CancelFunc is called, which is safe.
-func setupFetch(iso *v8.Isolate, ctx *v8.Context, cfg EngineConfig) error {
+func setupFetch(iso *v8.Isolate, ctx *v8.Context, cfg EngineConfig, el *eventLoop) error {
 	// __fetchAbort(reqID, fetchID) — called from JS abort listener to cancel
 	// an in-flight HTTP request. Safe to call from the JS thread at any time.
 	abortFT := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
@@ -317,120 +317,125 @@ func setupFetch(iso *v8.Isolate, ctx *v8.Context, cfg EngineConfig) error {
 			resp, err := client.Do(httpReq)
 			resultCh <- fetchResult{resp: resp, err: err}
 		}()
-		result := <-resultCh
 
-		// Cleanup: remove cancel from state and run JS listener cleanup.
-		// Note: we check fetchCtx.Err() BEFORE calling fetchCancel() to
-		// distinguish abort-signal cancellation from normal cleanup.
-		abortedBySignal := fetchCtx.Err() != nil
-		removeFetchCancel(reqID, fetchID)
-		fetchCancel()
-		_, _ = ctx.RunScript(`if (typeof globalThis.__tmp_fetch_cleanup === 'function') { globalThis.__tmp_fetch_cleanup(); delete globalThis.__tmp_fetch_cleanup; }`, "fetch_cleanup.js")
+		// Register the pending fetch with the event loop so the result is
+		// resolved on the V8 thread without blocking. This allows timers
+		// and AbortSignal listeners to fire while the HTTP request is in flight.
+		capturedRedirectMode := redirectMode
+		capturedFetchArgs := fetchArgs
+		capturedReqID := reqID
+		capturedFetchID := fetchID
+		capturedFetchCtx := fetchCtx
+		capturedFetchCancel := fetchCancel
 
-		resp, err := result.resp, result.err
-		if err != nil {
-			// For redirect mode "error", reject with a TypeError (check
-			// before abort so redirect errors aren't misattributed).
-			if redirectMode == "error" {
-				typeErr, _ := ctx.RunScript(
-					`new TypeError("fetch failed: redirect mode is 'error'")`,
-					"fetch_redirect_err.js")
-				resolver.Reject(typeErr)
-				return resolver.GetPromise().Value
-			}
-			// If the context was cancelled by the abort signal, reject with
-			// a DOMException AbortError to match the Web Fetch specification.
-			if abortedBySignal {
-				abortErr, _ := ctx.RunScript(
-					`new DOMException("The operation was aborted.", "AbortError")`,
-					"fetch_abort_inflight.js")
-				resolver.Reject(abortErr)
-				return resolver.GetPromise().Value
-			}
-			errVal, _ := v8.NewValue(iso, fmt.Sprintf("fetch: %s", err.Error()))
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
-		}
-		defer func() { _ = resp.Body.Close() }()
+		el.addPendingFetch(&pendingFetch{
+			resultCh: resultCh,
+			callback: func(result fetchResult) {
+				// Cleanup: remove cancel from state and run JS listener cleanup.
+				abortedBySignal := capturedFetchCtx.Err() != nil
+				removeFetchCancel(capturedReqID, capturedFetchID)
+				capturedFetchCancel()
+				_, _ = ctx.RunScript(`if (typeof globalThis.__tmp_fetch_cleanup === 'function') { globalThis.__tmp_fetch_cleanup(); delete globalThis.__tmp_fetch_cleanup; }`, "fetch_cleanup.js")
 
-		limitedReader := io.LimitReader(resp.Body, maxBytes+1)
-		respBody, err := io.ReadAll(limitedReader)
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, fmt.Sprintf("fetch: reading body: %s", err.Error()))
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
-		}
-		if int64(len(respBody)) > maxBytes {
-			respBody = respBody[:maxBytes]
-		}
-
-		// Build response headers as JSON.
-		respHeaders := make(map[string]string)
-		for k, vals := range resp.Header {
-			respHeaders[strings.ToLower(k)] = strings.Join(vals, ", ")
-		}
-		headersJSON, _ := json.Marshal(respHeaders)
-
-		// Determine the final URL — for "follow" mode this is the URL after redirects.
-		finalURL := fetchArgs.URL
-		if resp.Request != nil && resp.Request.URL != nil {
-			finalURL = resp.Request.URL.String()
-		}
-		redirected := finalURL != fetchArgs.URL
-
-		// Base64-encode the response body to preserve binary data integrity.
-		bodyB64 := base64.StdEncoding.EncodeToString(respBody)
-		bodyVal, _ := v8.NewValue(iso, bodyB64)
-		_ = ctx.Global().Set("__tmp_fetch_resp_body", bodyVal)
-		statusVal, _ := v8.NewValue(iso, int32(resp.StatusCode))
-		_ = ctx.Global().Set("__tmp_fetch_resp_status", statusVal)
-		statusTextVal, _ := v8.NewValue(iso, resp.Status)
-		_ = ctx.Global().Set("__tmp_fetch_resp_statusText", statusTextVal)
-		headersJSONVal, _ := v8.NewValue(iso, string(headersJSON))
-		_ = ctx.Global().Set("__tmp_fetch_resp_headers", headersJSONVal)
-		fetchURLVal, _ := v8.NewValue(iso, finalURL)
-		_ = ctx.Global().Set("__tmp_fetch_resp_url", fetchURLVal)
-		redirectedVal, _ := v8.NewValue(iso, redirected)
-		_ = ctx.Global().Set("__tmp_fetch_resp_redirected", redirectedVal)
-
-		jsResp, err := ctx.RunScript(`(function() {
-			var b64Body = globalThis.__tmp_fetch_resp_body;
-			var status = globalThis.__tmp_fetch_resp_status;
-			var statusText = globalThis.__tmp_fetch_resp_statusText;
-			var hdrs = JSON.parse(globalThis.__tmp_fetch_resp_headers);
-			var url = globalThis.__tmp_fetch_resp_url;
-			var redirected = globalThis.__tmp_fetch_resp_redirected;
-			delete globalThis.__tmp_fetch_resp_body;
-			delete globalThis.__tmp_fetch_resp_status;
-			delete globalThis.__tmp_fetch_resp_statusText;
-			delete globalThis.__tmp_fetch_resp_headers;
-			delete globalThis.__tmp_fetch_resp_url;
-			delete globalThis.__tmp_fetch_resp_redirected;
-			var body = null;
-			if (b64Body && b64Body.length > 0) {
-				var buf = __b64ToBuffer(b64Body);
-				var ct = (hdrs['content-type'] || '').toLowerCase();
-				if (ct.indexOf('text/') === 0 || ct.indexOf('application/json') !== -1 ||
-				    ct.indexOf('application/xml') !== -1 || ct.indexOf('application/javascript') !== -1 ||
-				    ct.indexOf('application/x-www-form-urlencoded') !== -1) {
-					body = new TextDecoder().decode(buf);
-				} else {
-					body = buf;
+				resp, err := result.resp, result.err
+				if err != nil {
+					if capturedRedirectMode == "error" {
+						typeErr, _ := ctx.RunScript(
+							`new TypeError("fetch failed: redirect mode is 'error'")`,
+							"fetch_redirect_err.js")
+						resolver.Reject(typeErr)
+						return
+					}
+					if abortedBySignal {
+						abortErr, _ := ctx.RunScript(
+							`new DOMException("The operation was aborted.", "AbortError")`,
+							"fetch_abort_inflight.js")
+						resolver.Reject(abortErr)
+						return
+					}
+					errVal, _ := v8.NewValue(iso, fmt.Sprintf("fetch: %s", err.Error()))
+					resolver.Reject(errVal)
+					return
 				}
-			}
-			var r = new Response(body, {status: status, statusText: statusText, headers: hdrs, url: url});
-			if (redirected) {
-				Object.defineProperty(r, 'redirected', {value: true, writable: false});
-			}
-			return r;
-		})()`, "fetch_response.js")
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, fmt.Sprintf("fetch: building response: %s", err.Error()))
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
-		}
+				defer func() { _ = resp.Body.Close() }()
 
-		resolver.Resolve(jsResp)
+				limitedReader := io.LimitReader(resp.Body, maxBytes+1)
+				respBody, err := io.ReadAll(limitedReader)
+				if err != nil {
+					errVal, _ := v8.NewValue(iso, fmt.Sprintf("fetch: reading body: %s", err.Error()))
+					resolver.Reject(errVal)
+					return
+				}
+				if int64(len(respBody)) > maxBytes {
+					respBody = respBody[:maxBytes]
+				}
+
+				respHeaders := make(map[string]string)
+				for k, vals := range resp.Header {
+					respHeaders[strings.ToLower(k)] = strings.Join(vals, ", ")
+				}
+				headersJSON, _ := json.Marshal(respHeaders)
+
+				finalURL := capturedFetchArgs.URL
+				if resp.Request != nil && resp.Request.URL != nil {
+					finalURL = resp.Request.URL.String()
+				}
+				redirected := finalURL != capturedFetchArgs.URL
+
+				bodyB64 := base64.StdEncoding.EncodeToString(respBody)
+				bodyVal, _ := v8.NewValue(iso, bodyB64)
+				_ = ctx.Global().Set("__tmp_fetch_resp_body", bodyVal)
+				statusVal, _ := v8.NewValue(iso, int32(resp.StatusCode))
+				_ = ctx.Global().Set("__tmp_fetch_resp_status", statusVal)
+				statusTextVal, _ := v8.NewValue(iso, resp.Status)
+				_ = ctx.Global().Set("__tmp_fetch_resp_statusText", statusTextVal)
+				headersJSONVal, _ := v8.NewValue(iso, string(headersJSON))
+				_ = ctx.Global().Set("__tmp_fetch_resp_headers", headersJSONVal)
+				fetchURLVal, _ := v8.NewValue(iso, finalURL)
+				_ = ctx.Global().Set("__tmp_fetch_resp_url", fetchURLVal)
+				redirectedVal, _ := v8.NewValue(iso, redirected)
+				_ = ctx.Global().Set("__tmp_fetch_resp_redirected", redirectedVal)
+
+				jsResp, err := ctx.RunScript(`(function() {
+					var b64Body = globalThis.__tmp_fetch_resp_body;
+					var status = globalThis.__tmp_fetch_resp_status;
+					var statusText = globalThis.__tmp_fetch_resp_statusText;
+					var hdrs = JSON.parse(globalThis.__tmp_fetch_resp_headers);
+					var url = globalThis.__tmp_fetch_resp_url;
+					var redirected = globalThis.__tmp_fetch_resp_redirected;
+					delete globalThis.__tmp_fetch_resp_body;
+					delete globalThis.__tmp_fetch_resp_status;
+					delete globalThis.__tmp_fetch_resp_statusText;
+					delete globalThis.__tmp_fetch_resp_headers;
+					delete globalThis.__tmp_fetch_resp_url;
+					delete globalThis.__tmp_fetch_resp_redirected;
+					var body = null;
+					if (b64Body && b64Body.length > 0) {
+						var buf = __b64ToBuffer(b64Body);
+						var ct = (hdrs['content-type'] || '').toLowerCase();
+						if (ct.indexOf('text/') === 0 || ct.indexOf('application/json') !== -1 ||
+						    ct.indexOf('application/xml') !== -1 || ct.indexOf('application/javascript') !== -1 ||
+						    ct.indexOf('application/x-www-form-urlencoded') !== -1) {
+							body = new TextDecoder().decode(buf);
+						} else {
+							body = buf;
+						}
+					}
+					var r = new Response(body, {status: status, statusText: statusText, headers: hdrs, url: url});
+					if (redirected) {
+						Object.defineProperty(r, 'redirected', {value: true, writable: false});
+					}
+					return r;
+				})()`, "fetch_response.js")
+				if err != nil {
+					errVal, _ := v8.NewValue(iso, fmt.Sprintf("fetch: building response: %s", err.Error()))
+					resolver.Reject(errVal)
+					return
+				}
+
+				resolver.Resolve(jsResp)
+			},
+		})
 		return resolver.GetPromise().Value
 	})
 

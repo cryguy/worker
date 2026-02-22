@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsPrivateIP(t *testing.T) {
@@ -776,5 +777,66 @@ func TestFetch_BinaryBody(t *testing.T) {
 		if receivedBody[i] != b {
 			t.Errorf("byte[%d] = 0x%02X, want 0x%02X", i, receivedBody[i], b)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bug 2: AbortSignal.timeout should abort a slow fetch
+// ---------------------------------------------------------------------------
+
+func TestFetch_AbortSignalTimeout(t *testing.T) {
+	disableFetchSSRF(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate a slow server — sleep 5 seconds.
+		time.Sleep(5 * time.Second)
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = fmt.Fprint(w, "too late")
+	}))
+	defer srv.Close()
+
+	e := newTestEngine(t)
+
+	source := fmt.Sprintf(`export default {
+  async fetch(request, env) {
+    const start = Date.now();
+    try {
+      await fetch("%s/slow", {signal: AbortSignal.timeout(100)});
+      return new Response(JSON.stringify({
+        aborted: false,
+        elapsed: Date.now() - start
+      }), {headers: {"content-type": "application/json"}});
+    } catch(e) {
+      return new Response(JSON.stringify({
+        aborted: true,
+        name: e.name || "Error",
+        message: e.message,
+        elapsed: Date.now() - start
+      }), {headers: {"content-type": "application/json"}});
+    }
+  },
+};`, srv.URL)
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Aborted bool   `json:"aborted"`
+		Name    string `json:"name"`
+		Message string `json:"message"`
+		Elapsed int    `json:"elapsed"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Aborted {
+		t.Fatal("expected fetch to be aborted by AbortSignal.timeout")
+	}
+	if data.Name != "TimeoutError" && data.Name != "AbortError" {
+		t.Errorf("error name = %q, want TimeoutError or AbortError", data.Name)
+	}
+	// Should abort well before 5s — allow generous margin (2s) for CI.
+	if data.Elapsed > 2000 {
+		t.Errorf("elapsed = %dms, expected abort within ~2000ms", data.Elapsed)
 	}
 }

@@ -1684,3 +1684,200 @@ func TestStreams_WritableStreamReady(t *testing.T) {
 		t.Error("writer.ready should resolve to undefined")
 	}
 }
+
+func TestStreams_ControllerError(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue("before");
+        controller.error(new Error("test error"));
+      }
+    });
+
+    const reader = stream.getReader();
+    const first = await reader.read();
+    let errorMsg = null;
+    try {
+      await reader.read();
+    } catch(e) {
+      errorMsg = e.message || String(e);
+    }
+    return Response.json({
+      firstValue: first.value,
+      errorMsg: errorMsg,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		FirstValue string `json:"firstValue"`
+		ErrorMsg   string `json:"errorMsg"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.FirstValue != "before" {
+		t.Errorf("firstValue = %q, want 'before'", data.FirstValue)
+	}
+	if data.ErrorMsg == "" {
+		t.Error("expected error from errored stream")
+	}
+}
+
+func TestStreams_WritableStreamAbortViaWriter(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    let abortReason = null;
+    const stream = new WritableStream({
+      write(chunk) {},
+      abort(reason) {
+        abortReason = reason;
+      }
+    });
+
+    const writer = stream.getWriter();
+    await writer.abort("test abort");
+    return Response.json({ aborted: abortReason !== null });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Aborted bool `json:"aborted"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Aborted {
+		t.Error("writable stream abort callback should have been called")
+	}
+}
+
+func TestStreams_TransformStreamPassthrough(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const transform = new TransformStream({
+      transform(chunk, controller) {
+        controller.enqueue(chunk.toUpperCase());
+      }
+    });
+
+    const writer = transform.writable.getWriter();
+    writer.write("hello");
+    writer.write("world");
+    writer.close();
+
+    const reader = transform.readable.getReader();
+    const chunks = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    return Response.json({ result: chunks.join(" ") });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Result != "HELLO WORLD" {
+		t.Errorf("result = %q, want 'HELLO WORLD'", data.Result)
+	}
+}
+
+func TestStreams_ReadableStreamCancelViaReader(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    let cancelReason = null;
+    const stream = new ReadableStream({
+      cancel(reason) {
+        cancelReason = reason;
+      }
+    });
+
+    const reader = stream.getReader();
+    await reader.cancel("done reading");
+    return Response.json({ cancelled: cancelReason !== null });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Cancelled bool `json:"cancelled"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Cancelled {
+		t.Error("cancel callback should have been called")
+	}
+}
+
+func TestStreams_PipeThroughTransformStream(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const input = new ReadableStream({
+      start(controller) {
+        controller.enqueue("a");
+        controller.enqueue("b");
+        controller.enqueue("c");
+        controller.close();
+      }
+    });
+
+    const transform = new TransformStream({
+      transform(chunk, controller) {
+        controller.enqueue(chunk + "!");
+      }
+    });
+
+    const output = input.pipeThrough(transform);
+    const reader = output.getReader();
+    const chunks = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    return Response.json({ result: chunks });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result []string `json:"result"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(data.Result) != 3 || data.Result[0] != "a!" || data.Result[1] != "b!" || data.Result[2] != "c!" {
+		t.Errorf("result = %v, want [a!, b!, c!]", data.Result)
+	}
+}

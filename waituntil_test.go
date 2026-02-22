@@ -183,7 +183,7 @@ func TestWaitUntil_WithKVWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("KV get: %v", err)
 	}
-	if val != "bg_value" {
-		t.Errorf("KV value = %q, want 'bg_value'", val)
+	if val == nil || *val != "bg_value" {
+		t.Errorf("KV value = %v, want 'bg_value'", val)
 	}
 }

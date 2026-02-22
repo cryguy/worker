@@ -380,3 +380,140 @@ func TestTextStreams_RoundTrip(t *testing.T) {
 		t.Errorf("result = %q, want %q", data.Result, "RoundTrip")
 	}
 }
+
+func TestTextDecoderStream_CustomLabel(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const stream = new TextDecoderStream("utf-8");
+    return Response.json({ encoding: stream.encoding });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Encoding string `json:"encoding"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Encoding != "utf-8" {
+		t.Errorf("encoding = %q, want 'utf-8'", data.Encoding)
+	}
+}
+
+func TestTextDecoderStream_EmptyChunks(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const stream = new TextDecoderStream();
+    const writer = stream.writable.getWriter();
+    writer.write(new Uint8Array(0));
+    writer.write(new TextEncoder().encode("hello"));
+    writer.close();
+
+    const reader = stream.readable.getReader();
+    const chunks = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    return Response.json({ result: chunks.join(''), count: chunks.length });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result string `json:"result"`
+		Count  int    `json:"count"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Result != "hello" {
+		t.Errorf("result = %q, want 'hello'", data.Result)
+	}
+}
+
+func TestTextDecoderStream_ArrayBufferInput(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const stream = new TextDecoderStream();
+    const writer = stream.writable.getWriter();
+    var buf = new ArrayBuffer(5);
+    var view = new Uint8Array(buf);
+    view[0] = 72; view[1] = 101; view[2] = 108; view[3] = 108; view[4] = 111;
+    writer.write(buf);
+    writer.close();
+
+    const reader = stream.readable.getReader();
+    const { value } = await reader.read();
+    return Response.json({ result: value });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Result != "Hello" {
+		t.Errorf("result = %q, want 'Hello'", data.Result)
+	}
+}
+
+func TestTextEncoderStream_EmptyString(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const stream = new TextEncoderStream();
+    const writer = stream.writable.getWriter();
+    writer.write("");
+    writer.write("hi");
+    writer.close();
+
+    const reader = stream.readable.getReader();
+    const chunks = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value.length);
+    }
+    return Response.json({ chunkLengths: chunks });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		ChunkLengths []int `json:"chunkLengths"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// At minimum, the "hi" chunk should produce bytes
+	found := false
+	for _, l := range data.ChunkLengths {
+		if l > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected at least one non-empty chunk")
+	}
+}

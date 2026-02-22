@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"context"
+	"strings"
 	"testing"
 )
 
@@ -198,7 +200,7 @@ func TestCryptoHashFromAlgo(t *testing.T) {
 		algo string
 		want int // crypto.Hash value (0 means unsupported)
 	}{
-		{"SHA-1", 3},   // crypto.SHA1 = 3
+		{"SHA-1", 3}, // crypto.SHA1 = 3
 		{"sha-1", 3},
 		{"SHA-256", 5}, // crypto.SHA256 = 5
 		{"sha256", 5},
@@ -396,5 +398,179 @@ func TestNormalizeAlgo(t *testing.T) {
 				t.Errorf("normalizeAlgo(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+// Fetch cancel subsystem tests
+
+func TestRegisterFetchCancel(t *testing.T) {
+	id := newRequestState(10, nil)
+	defer clearRequestState(id)
+
+	called := false
+	_, cancel := context.WithCancel(context.Background())
+	fetchID := registerFetchCancel(id, cancel)
+	if fetchID == "" {
+		t.Fatal("registerFetchCancel returned empty string")
+	}
+
+	state := getRequestState(id)
+	if state.fetchCancels == nil || len(state.fetchCancels) == 0 {
+		t.Fatal("fetchCancels map should be populated")
+	}
+	_ = called // avoid unused
+}
+
+func TestRegisterFetchCancel_NonexistentRequest(t *testing.T) {
+	fetchID := registerFetchCancel(999999800, func() {})
+	if fetchID != "" {
+		t.Errorf("expected empty string for nonexistent request, got %q", fetchID)
+	}
+}
+
+func TestRemoveFetchCancel(t *testing.T) {
+	id := newRequestState(10, nil)
+	defer clearRequestState(id)
+
+	cancel := func() {}
+	fetchID := registerFetchCancel(id, cancel)
+
+	got := removeFetchCancel(id, fetchID)
+	if got == nil {
+		t.Fatal("removeFetchCancel should return the cancel func")
+	}
+
+	// Second remove returns nil
+	got2 := removeFetchCancel(id, fetchID)
+	if got2 != nil {
+		t.Error("second removeFetchCancel should return nil")
+	}
+}
+
+func TestRemoveFetchCancel_NonexistentRequest(t *testing.T) {
+	got := removeFetchCancel(999999801, "1")
+	if got != nil {
+		t.Error("expected nil for nonexistent request")
+	}
+}
+
+func TestCallFetchCancel(t *testing.T) {
+	id := newRequestState(10, nil)
+	defer clearRequestState(id)
+
+	called := false
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = ctx
+	fetchID := registerFetchCancel(id, cancel)
+
+	// Wrap to detect the call - we use a real context cancel
+	// and check ctx.Err() after
+	callFetchCancel(id, fetchID)
+
+	// The cancel function was called, so ctx should be done
+	if ctx.Err() == nil {
+		t.Error("expected context to be cancelled after callFetchCancel")
+	}
+	_ = called
+}
+
+func TestCallFetchCancel_NonexistentDoesNotPanic(t *testing.T) {
+	// Should not panic for invalid reqID/fetchID
+	callFetchCancel(999999802, "nonexistent")
+}
+
+func TestCallFetchCancel_RemovesAfterCalling(t *testing.T) {
+	id := newRequestState(10, nil)
+	defer clearRequestState(id)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = ctx
+	fetchID := registerFetchCancel(id, cancel)
+
+	callFetchCancel(id, fetchID)
+	// Second call should be no-op (already removed)
+	callFetchCancel(id, fetchID) // should not panic
+}
+
+func TestRegisterFetchCancel_IncrementingIDs(t *testing.T) {
+	id := newRequestState(10, nil)
+	defer clearRequestState(id)
+
+	id1 := registerFetchCancel(id, func() {})
+	id2 := registerFetchCancel(id, func() {})
+	id3 := registerFetchCancel(id, func() {})
+
+	if id1 == id2 || id2 == id3 || id1 == id3 {
+		t.Errorf("expected unique IDs, got %q, %q, %q", id1, id2, id3)
+	}
+}
+
+// Log truncation tests
+
+func TestAddLog_MaxEntries(t *testing.T) {
+	id := newRequestState(10, nil)
+	defer clearRequestState(id)
+
+	// Add more than maxLogEntries
+	for i := 0; i < maxLogEntries+100; i++ {
+		addLog(id, "log", "msg")
+	}
+
+	state := getRequestState(id)
+	if len(state.logs) != maxLogEntries {
+		t.Errorf("log count = %d, want %d (maxLogEntries)", len(state.logs), maxLogEntries)
+	}
+}
+
+func TestAddLog_MessageTruncation(t *testing.T) {
+	id := newRequestState(10, nil)
+	defer clearRequestState(id)
+
+	longMsg := strings.Repeat("x", maxLogMessageSize+500)
+	addLog(id, "log", longMsg)
+
+	state := getRequestState(id)
+	if len(state.logs) != 1 {
+		t.Fatal("expected 1 log entry")
+	}
+	msg := state.logs[0].Message
+	if len(msg) <= maxLogMessageSize {
+		t.Errorf("message length = %d, expected > %d (includes truncation suffix)", len(msg), maxLogMessageSize)
+	}
+	if !strings.HasSuffix(msg, "...(truncated)") {
+		t.Errorf("message should end with '...(truncated)', got suffix: %q", msg[len(msg)-20:])
+	}
+}
+
+// clearRequestState cleanup tests
+
+func TestClearRequestState_CleanupFetchCancels(t *testing.T) {
+	id := newRequestState(10, nil)
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	registerFetchCancel(id, cancel1)
+	registerFetchCancel(id, cancel2)
+
+	clearRequestState(id)
+
+	// Both contexts should have been cancelled
+	if ctx1.Err() == nil {
+		t.Error("ctx1 should be cancelled after clearRequestState")
+	}
+	if ctx2.Err() == nil {
+		t.Error("ctx2 should be cancelled after clearRequestState")
+	}
+}
+
+func TestClearRequestState_CleanupFetchCancels_NilMap(t *testing.T) {
+	// A request with no fetchCancels should not panic on clear
+	id := newRequestState(10, nil)
+	state := clearRequestState(id)
+	if state == nil {
+		t.Fatal("clearRequestState returned nil")
+	}
+	if state.fetchCancels != nil {
+		t.Error("fetchCancels should be nil")
 	}
 }

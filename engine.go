@@ -176,8 +176,8 @@ func (e *Engine) getOrCreatePool(siteID string, deployKey string) (*v8Pool, erro
 		// Console extensions: time, count, assert, table, trace, group
 		setupConsoleExt,
 		// Fetch: Go-backed fetch() with SSRF protection
-		func(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-			return setupFetch(iso, ctx, cfg)
+		func(iso *v8.Isolate, ctx *v8.Context, el *eventLoop) error {
+			return setupFetch(iso, ctx, cfg, el)
 		},
 		// BYOB Reader: ReadableStreamBYOBReader, ReadableByteStreamController
 		setupBYOBReader,

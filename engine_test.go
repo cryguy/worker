@@ -76,8 +76,8 @@ func TestPoolModuleFlow(t *testing.T) {
 	pool, err := newV8Pool(cfg.PoolSize, source, []setupFunc{
 		setupWebAPIs,
 		setupConsole,
-		func(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-			return setupFetch(iso, ctx, cfg)
+		func(iso *v8.Isolate, ctx *v8.Context, el *eventLoop) error {
+			return setupFetch(iso, ctx, cfg, el)
 		},
 	}, cfg.MemoryLimitMB)
 	if err != nil {
@@ -194,9 +194,7 @@ func TestEngine_MaxResponseBytes(t *testing.T) {
 	}
 }
 
-
 // BuildEnvFromDB tests have been moved to internal/workeradapter/ where the function is now defined.
-
 
 func TestEngine_EnsureSource_FromCache(t *testing.T) {
 	e := newTestEngine(t)
@@ -369,6 +367,31 @@ func TestEngine_ExecuteScheduled_Success(t *testing.T) {
 	}
 	if len(result.Logs) == 0 {
 		t.Error("expected logs from scheduled handler")
+	}
+}
+
+func TestEngine_ExecuteScheduled_NilEnv(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch() { return new Response("ok"); },
+  scheduled(event, env, ctx) {
+    console.log("scheduled ran");
+  },
+};`
+	siteID := "test-sched-nilenv"
+	deployKey := "deploy1"
+
+	if _, err := e.CompileAndCache(siteID, deployKey, source); err != nil {
+		t.Fatalf("CompileAndCache: %v", err)
+	}
+
+	result := e.ExecuteScheduled(siteID, deployKey, nil, "*/5 * * * *")
+	if result.Error == nil {
+		t.Fatal("ExecuteScheduled should fail with nil env")
+	}
+	if !strings.Contains(result.Error.Error(), "env must not be nil") {
+		t.Errorf("error = %q, should mention 'env must not be nil'", result.Error)
 	}
 }
 
@@ -1902,6 +1925,27 @@ func TestEngine_Execute_AssetsFetchNoArgs(t *testing.T) {
 	}
 }
 
+func TestEngine_Execute_NilEnv(t *testing.T) {
+	e := newTestEngine(t)
+
+	r := e.Execute("some-site", "deploy1", nil, getReq("http://localhost/"))
+	if r.Error == nil {
+		t.Fatal("expected error for nil env")
+	}
+	if r.Duration == 0 {
+		t.Error("duration should be set even on error")
+	}
+}
+
+func TestEngine_Execute_NonExistentSite(t *testing.T) {
+	e := newTestEngine(t)
+
+	r := e.Execute("nonexistent", "deploy1", defaultEnv(), getReq("http://localhost/"))
+	if r.Error == nil {
+		t.Fatal("expected error for non-existent site")
+	}
+}
+
 func TestEngine_Execute_NilEnvMaps(t *testing.T) {
 	e := newTestEngine(t)
 
@@ -2400,6 +2444,31 @@ func TestEngine_ExecuteTail_RejectedPromise(t *testing.T) {
 	result := e.ExecuteTail(siteID, deployKey, defaultEnv(), events)
 	if result.Error == nil {
 		t.Fatal("ExecuteTail should fail on rejected promise")
+	}
+}
+
+func TestEngine_ExecuteTail_NilEnv(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch() { return new Response("ok"); },
+  tail(events) {
+    console.log("tail ran");
+  },
+};`
+	siteID := "test-tail-nilenv"
+	deployKey := "d1"
+	if _, err := e.CompileAndCache(siteID, deployKey, source); err != nil {
+		t.Fatalf("CompileAndCache: %v", err)
+	}
+
+	events := []TailEvent{{ScriptName: "w.js", Outcome: "ok"}}
+	result := e.ExecuteTail(siteID, deployKey, nil, events)
+	if result.Error == nil {
+		t.Fatal("ExecuteTail should fail with nil env")
+	}
+	if !strings.Contains(result.Error.Error(), "env must not be nil") {
+		t.Errorf("error = %q, should mention 'env must not be nil'", result.Error)
 	}
 }
 

@@ -54,6 +54,8 @@ class URL {
 		this.hash = parsed.hash;
 		this.origin = parsed.origin;
 		this.host = parsed.host;
+		this.username = parsed.username || '';
+		this.password = parsed.password || '';
 		this.searchParams = new URLSearchParams(this.search);
 		this.searchParams._url = this;
 	}
@@ -71,7 +73,7 @@ class URLSearchParams {
 			if (s) {
 				for (const pair of s.split('&')) {
 					const [k, ...rest] = pair.split('=');
-					this._entries.push([decodeURIComponent(k), decodeURIComponent(rest.join('='))]);
+					this._entries.push([decodeURIComponent(k.replace(/\+/g, '%20')), decodeURIComponent(rest.join('=').replace(/\+/g, '%20'))]);
 				}
 			}
 		}
@@ -97,7 +99,7 @@ class Request {
 			this.headers = new Headers(input.headers);
 			this._body = input._body;
 		} else {
-			this.url = String(input);
+			try { this.url = new URL(String(input)).href; } catch(e) { this.url = String(input); }
 			this.method = (init.method || 'GET').toUpperCase();
 			this.headers = new Headers(init.headers);
 			this._body = init.body !== undefined ? init.body : null;
@@ -384,6 +386,8 @@ type urlParsed struct {
 	Hash     string `json:"hash"`
 	Origin   string `json:"origin"`
 	Host     string `json:"host"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 func parseURL(rawURL, base string) (*urlParsed, error) {
@@ -428,16 +432,36 @@ func parseURL(rawURL, base string) (*urlParsed, error) {
 		hash = "#" + u.Fragment
 	}
 
+	var username, password string
+	if u.User != nil {
+		username = u.User.Username()
+		password, _ = u.User.Password()
+	}
+
+	pathname := u.Path
+	if pathname == "" {
+		pathname = "/"
+	}
+
+	// Build href from components so it reflects the normalized pathname.
+	userInfo := ""
+	if u.User != nil {
+		userInfo = u.User.String() + "@"
+	}
+	href := protocol + "//" + userInfo + host + pathname + search + hash
+
 	return &urlParsed{
-		Href:     u.String(),
+		Href:     href,
 		Protocol: protocol,
 		Hostname: hostname,
 		Port:     port,
-		Pathname: u.Path,
+		Pathname: pathname,
 		Search:   search,
 		Hash:     hash,
 		Origin:   origin,
 		Host:     host,
+		Username: username,
+		Password: password,
 	}, nil
 }
 

@@ -53,10 +53,10 @@ func TestParseURL(t *testing.T) {
 		{
 			name:     "simple https",
 			rawURL:   "https://test.com",
-			href:     "https://test.com",
+			href:     "https://test.com/",
 			protocol: "https:",
 			hostname: "test.com",
-			pathname: "",
+			pathname: "/",
 		},
 	}
 
@@ -1752,5 +1752,254 @@ func TestURL_CanParse(t *testing.T) {
 	// undefined coerces to string "undefined" which has no scheme, so should be false
 	if data.UndefinedArg {
 		t.Error("URL.canParse(undefined) should be false")
+	}
+}
+
+func TestHeaders_FromHeadersInstance(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const h1 = new Headers({ "x-one": "1", "x-two": "2" });
+    const h2 = new Headers(h1);
+    return Response.json({
+      one: h2.get("x-one"),
+      two: h2.get("x-two"),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		One string `json:"one"`
+		Two string `json:"two"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.One != "1" {
+		t.Errorf("x-one = %q, want '1'", data.One)
+	}
+	if data.Two != "2" {
+		t.Errorf("x-two = %q, want '2'", data.Two)
+	}
+}
+
+func TestURLSearchParams_ForEach(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const url = new URL("http://localhost/?a=1&b=2&c=3");
+    const pairs = [];
+    url.searchParams.forEach(function(value, key) {
+      pairs.push(key + "=" + value);
+    });
+    return Response.json({ pairs: pairs.sort() });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Pairs []string `json:"pairs"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(data.Pairs) != 3 {
+		t.Fatalf("expected 3 pairs, got %d", len(data.Pairs))
+	}
+	if data.Pairs[0] != "a=1" || data.Pairs[1] != "b=2" || data.Pairs[2] != "c=3" {
+		t.Errorf("pairs = %v", data.Pairs)
+	}
+}
+
+func TestRequest_BodyUsed(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const req = new Request("http://localhost/", {
+      method: "POST",
+      body: "hello",
+    });
+    const beforeUsed = req.bodyUsed;
+    const reader = req.body.getReader();
+    const afterUsed = req.bodyUsed;
+    const { value } = await reader.read();
+    return Response.json({ beforeUsed, afterUsed });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		BeforeUsed bool `json:"beforeUsed"`
+		AfterUsed  bool `json:"afterUsed"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.BeforeUsed {
+		t.Error("bodyUsed should be false before consuming")
+	}
+	if !data.AfterUsed {
+		t.Error("bodyUsed should be true after consuming")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bug 3: URLSearchParams should decode + as space
+// ---------------------------------------------------------------------------
+
+func TestURLSearchParams_PlusDecodedAsSpace(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const url = new URL("https://example.com/search?q=hello+world&tag=foo+bar+baz");
+    return Response.json({
+      q: url.searchParams.get("q"),
+      tag: url.searchParams.get("tag"),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Q   string `json:"q"`
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Q != "hello world" {
+		t.Errorf("q = %q, want %q", data.Q, "hello world")
+	}
+	if data.Tag != "foo bar baz" {
+		t.Errorf("tag = %q, want %q", data.Tag, "foo bar baz")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bug 5: URL should expose username and password
+// ---------------------------------------------------------------------------
+
+func TestURL_UsernamePassword(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const url = new URL("https://user:pass@example.com:8443/path?q=1#frag");
+    const noAuth = new URL("https://example.com/path");
+    return Response.json({
+      username: url.username,
+      password: url.password,
+      noAuthUser: noAuth.username,
+      noAuthPass: noAuth.password,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		NoAuthUser string `json:"noAuthUser"`
+		NoAuthPass string `json:"noAuthPass"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Username != "user" {
+		t.Errorf("username = %q, want %q", data.Username, "user")
+	}
+	if data.Password != "pass" {
+		t.Errorf("password = %q, want %q", data.Password, "pass")
+	}
+	if data.NoAuthUser != "" {
+		t.Errorf("noAuthUser = %q, want empty", data.NoAuthUser)
+	}
+	if data.NoAuthPass != "" {
+		t.Errorf("noAuthPass = %q, want empty", data.NoAuthPass)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bug 4: Request URL should be normalized, empty pathname should be "/"
+// ---------------------------------------------------------------------------
+
+func TestRequest_URLNormalized(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const r1 = new Request("https://example.com");
+    const r2 = new Request("https://example.com/path?q=1");
+    return Response.json({
+      url1: r1.url,
+      url2: r2.url,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		URL1 string `json:"url1"`
+		URL2 string `json:"url2"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.URL1 != "https://example.com/" {
+		t.Errorf("url1 = %q, want %q", data.URL1, "https://example.com/")
+	}
+	if data.URL2 != "https://example.com/path?q=1" {
+		t.Errorf("url2 = %q, want %q", data.URL2, "https://example.com/path?q=1")
+	}
+}
+
+func TestRequest_ArrayBuffer(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const req = new Request("http://localhost/", {
+      method: "POST",
+      body: "hello",
+    });
+    const buf = await req.arrayBuffer();
+    const view = new Uint8Array(buf);
+    const text = new TextDecoder().decode(view);
+    return Response.json({ text, length: buf.byteLength });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Text   string `json:"text"`
+		Length int    `json:"length"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Text != "hello" {
+		t.Errorf("text = %q, want 'hello'", data.Text)
+	}
+	if data.Length != 5 {
+		t.Errorf("length = %d, want 5", data.Length)
 	}
 }
