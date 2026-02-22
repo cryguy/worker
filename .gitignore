@@ -22,3 +22,8 @@ go.work.sum
 
 # Runtime data (downloaded at startup)
 data/
+
+
+# misc
+.omc
+nul
