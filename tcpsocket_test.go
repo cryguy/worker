@@ -247,7 +247,11 @@ func TestTCPCheckSSRFDirect(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		_, err := ssrfSafeTCPDial(context.Background(), tt.hostname, "80")
+		// Use a short deadline: blocked cases fail immediately via SSRF check,
+		// non-blocked cases only need to verify the error isn't "private".
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_, err := ssrfSafeTCPDial(ctx, tt.hostname, "80")
+		cancel()
 		if tt.blocked && err == nil {
 			t.Errorf("ssrfSafeTCPDial(%q) should have been blocked but was allowed", tt.hostname)
 		}
@@ -605,7 +609,9 @@ func TestTCPSocketSSRFBlocksAllPrivateRangesExpanded(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		_, err := ssrfSafeTCPDial(context.Background(), tt.hostname, "80")
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_, err := ssrfSafeTCPDial(ctx, tt.hostname, "80")
+		cancel()
 		if tt.blocked && err == nil {
 			t.Errorf("ssrfSafeTCPDial(%q) should be blocked but was allowed", tt.hostname)
 		}

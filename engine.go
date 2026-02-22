@@ -51,6 +51,7 @@ type Engine struct {
 	sources      sync.Map // poolKey -> string (JS source)
 	config       EngineConfig
 	sourceLoader SourceLoader
+	poolMu       sync.Mutex // serializes pool creation/replacement
 }
 
 // NewEngine creates an Engine with the given configuration and source loader.
@@ -106,7 +107,19 @@ func (e *Engine) CompileAndCache(siteID string, deployKey string, source string)
 func (e *Engine) getOrCreatePool(siteID string, deployKey string) (*v8Pool, error) {
 	key := poolKey{SiteID: siteID, DeployKey: deployKey}
 
-	// Check for a valid existing pool.
+	// Fast path: valid pool exists (lock-free).
+	if val, ok := e.pools.Load(key); ok {
+		sp := val.(*sitePool)
+		if sp.isValid() {
+			return sp.pool, nil
+		}
+	}
+
+	// Slow path: serialize creation/replacement.
+	e.poolMu.Lock()
+	defer e.poolMu.Unlock()
+
+	// Double-check after acquiring lock.
 	if val, ok := e.pools.Load(key); ok {
 		sp := val.(*sitePool)
 		if sp.isValid() {
@@ -223,7 +236,9 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 	}
 
 	// Set dispatcher and site ID so buildEnvObject can wire up service bindings.
-	env.Dispatcher = e
+	if env.Dispatcher == nil {
+		env.Dispatcher = e
+	}
 	if env.SiteID == "" {
 		env.SiteID = siteID
 	}
@@ -470,7 +485,9 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *Env, cro
 		return result
 	}
 
-	env.Dispatcher = e
+	if env.Dispatcher == nil {
+		env.Dispatcher = e
+	}
 	if env.SiteID == "" {
 		env.SiteID = siteID
 	}
@@ -663,7 +680,9 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 		return result
 	}
 
-	env.Dispatcher = e
+	if env.Dispatcher == nil {
+		env.Dispatcher = e
+	}
 	if env.SiteID == "" {
 		env.SiteID = siteID
 	}

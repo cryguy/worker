@@ -97,6 +97,7 @@ func (el *eventLoop) drainPendingFetches(ctx *v8.Context) bool {
 	}
 	// Snapshot the current list; we'll rebuild it without completed entries.
 	pending := el.pendingFetches
+	el.pendingFetches = nil // clear before releasing lock
 	el.mu.Unlock()
 
 	var remaining []*pendingFetch

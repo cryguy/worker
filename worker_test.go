@@ -1176,6 +1176,8 @@ func TestPool_Concurrency(t *testing.T) {
 	}
 
 	env := defaultEnv()
+	env.Dispatcher = e
+	env.SiteID = siteID
 	var wg sync.WaitGroup
 	errors := make(chan error, 20)
 
@@ -1217,6 +1219,8 @@ func TestPool_Exhaustion(t *testing.T) {
 	}
 
 	env := defaultEnv()
+	env.Dispatcher = e
+	env.SiteID = siteID
 	var wg sync.WaitGroup
 	results := make(chan *WorkerResult, 10)
 
