@@ -2,6 +2,8 @@ package worker
 
 import (
 	"time"
+
+	v8 "github.com/tommie/v8go"
 )
 
 // WorkerRequest represents an incoming HTTP request to a worker.
@@ -27,6 +29,9 @@ type WorkerResult struct {
 	Error     error
 	Duration  time.Duration
 	WebSocket *WebSocketHandler // non-nil for WebSocket upgrade responses
+	// Data holds the JSON-serialized return value from ExecuteFunction.
+	// It is empty for Execute/ExecuteScheduled/ExecuteTail calls.
+	Data string
 }
 
 // LogEntry is a single console.log/warn/error captured from a worker.
@@ -45,6 +50,12 @@ type TailEvent struct {
 	Timestamp  time.Time  `json:"timestamp"`
 }
 
+// EnvBindingFunc creates a JS value to be set on the worker's env object.
+// It receives the V8 isolate and context for the current execution.
+// Downstream users can use this to register custom bindings (objects, functions,
+// etc.) that their worker scripts can access via env.<name>.
+type EnvBindingFunc func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error)
+
 // Env holds all bindings passed to the worker as the second argument.
 type Env struct {
 	Vars    map[string]string
@@ -58,6 +69,11 @@ type Env struct {
 	D1Bindings      map[string]string // binding name -> database ID
 	DurableObjects  map[string]DurableObjectStore
 	ServiceBindings map[string]ServiceBindingConfig
+
+	// CustomBindings allows downstream users to add arbitrary bindings
+	// to the env object. Each function is called per-request and its
+	// returned V8 value is set on env under the map key name.
+	CustomBindings map[string]EnvBindingFunc
 
 	// D1 configuration
 	D1DataDir string

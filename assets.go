@@ -239,6 +239,18 @@ func buildEnvObject(iso *v8.Isolate, ctx *v8.Context, env *Env, reqID uint64) (*
 		_ = envObj.Set("ASSETS", assetsVal)
 	}
 
+	// Custom bindings — downstream users can inject arbitrary V8 values.
+	if env.CustomBindings != nil {
+		for name, bindFn := range env.CustomBindings {
+			val, err := bindFn(iso, ctx)
+			if err != nil {
+				closeD1Bridges()
+				return nil, fmt.Errorf("building custom binding %q: %w", name, err)
+			}
+			_ = envObj.Set(name, val)
+		}
+	}
+
 	return envObj.Value, nil
 }
 

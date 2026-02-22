@@ -867,6 +867,227 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 	return result
 }
 
+// ExecuteFunction calls an arbitrary named function on the worker module
+// with the given env and optional JSON-serializable arguments.
+// The function signature in JS is: fnName(env, ...args)
+// The return value is JSON-serialized into result.Data.
+func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnName string, args ...any) (result *WorkerResult) {
+	start := time.Now()
+	result = &WorkerResult{}
+
+	if env == nil {
+		result.Error = fmt.Errorf("env must not be nil for site %s", siteID)
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	if env.Dispatcher == nil {
+		env.Dispatcher = e
+	}
+	if env.SiteID == "" {
+		env.SiteID = siteID
+	}
+
+	if err := e.EnsureSource(siteID, deployKey); err != nil {
+		result.Error = err
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	pool, err := e.getOrCreatePool(siteID, deployKey)
+	if err != nil {
+		result.Error = err
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	w, err := pool.get()
+	if err != nil {
+		result.Error = fmt.Errorf("acquiring worker from pool: %w", err)
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	var timedOut atomic.Bool
+	timeout := time.Duration(e.config.ExecutionTimeout) * time.Millisecond
+	watchdog := time.AfterFunc(timeout, func() {
+		timedOut.Store(true)
+		w.iso.TerminateExecution()
+	})
+
+	var panicked bool
+	defer func() {
+		stopped := watchdog.Stop()
+		if r := recover(); r != nil {
+			panicked = true
+			if timedOut.Load() {
+				result.Error = fmt.Errorf("worker execution timed out (limit: %v)", timeout)
+			} else {
+				result.Error = fmt.Errorf("worker panic: %v", r)
+			}
+		}
+		result.Duration = time.Since(start)
+		if stopped && !timedOut.Load() && !panicked {
+			pool.put(w)
+		} else {
+			log.Printf("worker: discarding worker for site %s deploy %s (timed out or panicked)", siteID, deployKey)
+			w.ctx.Close()
+			w.iso.Dispose()
+			key := poolKey{SiteID: siteID, DeployKey: deployKey}
+			if val, ok := e.pools.Load(key); ok {
+				sp := val.(*sitePool)
+				sp.markInvalid()
+			}
+		}
+	}()
+
+	iso := w.iso
+	ctx := w.ctx
+
+	reqID := newRequestState(e.config.MaxFetchRequests, env)
+	reqIDVal, _ := v8.NewValue(iso, strconv.FormatUint(reqID, 10))
+	if err := ctx.Global().Set("__requestID", reqIDVal); err != nil {
+		clearRequestState(reqID)
+		result.Error = fmt.Errorf("setting request ID: %w", err)
+		return result
+	}
+
+	jsEnv, err := buildEnvObject(iso, ctx, env, reqID)
+	if err != nil {
+		state := clearRequestState(reqID)
+		if state != nil {
+			result.Logs = state.logs
+		}
+		result.Error = fmt.Errorf("building JS env: %w", err)
+		return result
+	}
+
+	// Look up the named function on the module.
+	moduleVal, err := ctx.Global().Get("__worker_module__")
+	if err != nil || moduleVal.IsUndefined() || moduleVal.IsNull() {
+		state := clearRequestState(reqID)
+		if state != nil {
+			result.Logs = state.logs
+		}
+		result.Error = fmt.Errorf("worker module has no default export")
+		return result
+	}
+
+	moduleObj, err := moduleVal.AsObject()
+	if err != nil {
+		state := clearRequestState(reqID)
+		if state != nil {
+			result.Logs = state.logs
+		}
+		result.Error = fmt.Errorf("worker module is not an object: %w", err)
+		return result
+	}
+
+	fnVal, err := moduleObj.Get(fnName)
+	if err != nil || fnVal.IsUndefined() {
+		state := clearRequestState(reqID)
+		if state != nil {
+			result.Logs = state.logs
+		}
+		result.Error = fmt.Errorf("worker module has no %q function", fnName)
+		return result
+	}
+
+	fn, err := fnVal.AsFunction()
+	if err != nil {
+		state := clearRequestState(reqID)
+		if state != nil {
+			result.Logs = state.logs
+		}
+		result.Error = fmt.Errorf("worker %q is not a function: %w", fnName, err)
+		return result
+	}
+
+	// Build the call arguments: env first, then any extra args.
+	callArgs := []v8.Valuer{jsEnv}
+	for i, arg := range args {
+		argJSON, err := json.Marshal(arg)
+		if err != nil {
+			state := clearRequestState(reqID)
+			if state != nil {
+				result.Logs = state.logs
+			}
+			result.Error = fmt.Errorf("marshaling argument %d: %w", i, err)
+			return result
+		}
+		argScript := fmt.Sprintf(`JSON.parse(%q)`, string(argJSON))
+		jsArg, err := ctx.RunScript(argScript, fmt.Sprintf("arg_%d.js", i))
+		if err != nil {
+			state := clearRequestState(reqID)
+			if state != nil {
+				result.Logs = state.logs
+			}
+			result.Error = fmt.Errorf("creating JS argument %d: %w", i, err)
+			return result
+		}
+		callArgs = append(callArgs, jsArg)
+	}
+
+	fnResult, err := fn.Call(moduleObj, callArgs...)
+	if err != nil {
+		state := clearRequestState(reqID)
+		if state != nil {
+			result.Logs = state.logs
+		}
+		if timedOut.Load() {
+			result.Error = fmt.Errorf("worker execution timed out (limit: %v)", timeout)
+		} else {
+			result.Error = fmt.Errorf("invoking worker %q: %w", fnName, err)
+		}
+		return result
+	}
+
+	// Pump microtasks and drain event loop.
+	ctx.PerformMicrotaskCheckpoint()
+	deadline := start.Add(timeout)
+	if w.eventLoop.hasPending() {
+		w.eventLoop.drain(iso, ctx, deadline)
+	}
+
+	// Await the result if it's a Promise.
+	fnResult, err = awaitValue(ctx, fnResult, deadline)
+	if err != nil {
+		state := clearRequestState(reqID)
+		if state != nil {
+			result.Logs = state.logs
+		}
+		result.Error = fmt.Errorf("awaiting worker %q: %w", fnName, err)
+		return result
+	}
+
+	// Drain waitUntil promises.
+	drainWaitUntil(ctx, deadline)
+
+	// Serialize the return value to JSON.
+	if fnResult == nil || fnResult.IsUndefined() || fnResult.IsNull() {
+		result.Data = "null"
+	} else {
+		_ = ctx.Global().Set("__fn_result", fnResult)
+		jsonVal, err := ctx.RunScript(`JSON.stringify(globalThis.__fn_result)`, "serialize_result.js")
+		_, _ = ctx.RunScript(`delete globalThis.__fn_result`, "cleanup_result.js")
+		if err != nil {
+			state := clearRequestState(reqID)
+			if state != nil {
+				result.Logs = state.logs
+			}
+			result.Error = fmt.Errorf("serializing return value: %w", err)
+			return result
+		}
+		result.Data = jsonVal.String()
+	}
+
+	state := clearRequestState(reqID)
+	if state != nil {
+		result.Logs = state.logs
+	}
+	return result
+}
+
 // InvalidatePool marks the pool for the given site/deploy as invalid.
 // The next Execute call will create a fresh pool.
 func (e *Engine) InvalidatePool(siteID string, deployKey string) {
@@ -960,4 +1181,11 @@ func awaitValue(ctx *v8.Context, val *v8.Value, deadline time.Time) (*v8.Value, 
 func newJSObject(iso *v8.Isolate, ctx *v8.Context) (*v8.Object, error) {
 	tmpl := v8.NewObjectTemplate(iso)
 	return tmpl.NewInstance(ctx)
+}
+
+// NewJSObject creates a new empty JavaScript object. This is the exported
+// version of newJSObject, intended for use by downstream users building
+// custom env bindings via EnvBindingFunc.
+func NewJSObject(iso *v8.Isolate, ctx *v8.Context) (*v8.Object, error) {
+	return newJSObject(iso, ctx)
 }
