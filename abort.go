@@ -3,12 +3,11 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
-// abortJS defines EventTarget, Event, AbortSignal, and AbortController as
-// pure JS polyfills. No Go backing is needed since these are purely
-// in-memory event-driven constructs.
+// abortJS defines EventTarget, Event, AbortSignal, AbortController,
+// DOMException, ScheduledEvent, and CustomEvent as pure JS polyfills.
 const abortJS = `
 class Event {
 	constructor(type, options) {
@@ -97,7 +96,6 @@ class AbortController {
 	}
 }
 
-// DOMException polyfill (minimal).
 if (typeof DOMException === 'undefined') {
 	globalThis.DOMException = class DOMException extends Error {
 		constructor(message, name) {
@@ -157,8 +155,8 @@ globalThis.CustomEvent = CustomEvent;
 `
 
 // setupAbort evaluates the AbortController/AbortSignal polyfills.
-func setupAbort(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(abortJS, "abort.js"); err != nil {
+func setupAbort(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, abortJS); err != nil {
 		return fmt.Errorf("evaluating abort.js: %w", err)
 	}
 	return nil

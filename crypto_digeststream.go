@@ -9,7 +9,7 @@ import (
 	"hash"
 	"strconv"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // digestStreamJS defines the DigestStream class, a Cloudflare Workers-compatible
@@ -116,24 +116,19 @@ func newDigestHash(algo string) (hash.Hash, error) {
 
 // setupDigestStream registers Go-backed helpers for DigestStream and evaluates
 // the JS wrapper.
-func setupDigestStream(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupDigestStream(vm *quickjs.VM, _ *eventLoop) error {
 	// __cryptoDigestStreamCreate(requestID, algorithm) -> streamID string
-	_ = ctx.Global().Set("__cryptoDigestStreamCreate", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("__cryptoDigestStreamCreate", 2).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		algo := args[1].String()
+	registerGoFunc(vm, "__cryptoDigestStreamCreate", func(reqIDStr, algo string) (string, error) {
+		reqID, _ := strconv.ParseUint(reqIDStr, 10, 64)
 
 		h, err := newDigestHash(algo)
 		if err != nil {
-			return throwError(iso, err.Error())
+			return "", err
 		}
 
 		state := getRequestState(reqID)
 		if state == nil {
-			return throwError(iso, "DigestStream: invalid request state")
+			return "", fmt.Errorf("DigestStream: invalid request state")
 		}
 
 		if state.digestStreams == nil {
@@ -143,69 +138,54 @@ func setupDigestStream(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		streamID := strconv.FormatInt(state.nextDigestID, 10)
 		state.digestStreams[streamID] = h
 
-		val, _ := v8.NewValue(iso, streamID)
-		return val
-	}).GetFunction(ctx))
+		return streamID, nil
+	}, false)
 
 	// __cryptoDigestStreamWrite(requestID, streamID, base64data)
-	_ = ctx.Global().Set("__cryptoDigestStreamWrite", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, errMissingArg("__cryptoDigestStreamWrite", 3).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		streamID := args[1].String()
-		dataB64 := args[2].String()
+	registerGoFunc(vm, "__cryptoDigestStreamWrite", func(reqIDStr, streamID, dataB64 string) error {
+		reqID, _ := strconv.ParseUint(reqIDStr, 10, 64)
 
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "DigestStream write: invalid base64")
+			return fmt.Errorf("DigestStream write: invalid base64")
 		}
 
 		state := getRequestState(reqID)
 		if state == nil || state.digestStreams == nil {
-			return throwError(iso, "DigestStream write: invalid state")
+			return fmt.Errorf("DigestStream write: invalid state")
 		}
 
 		h, ok := state.digestStreams[streamID]
 		if !ok {
-			return throwError(iso, "DigestStream write: unknown stream")
+			return fmt.Errorf("DigestStream write: unknown stream")
 		}
 
 		h.Write(data)
-
-		undef, _ := v8.NewValue(iso, true)
-		return undef
-	}).GetFunction(ctx))
+		return nil
+	}, false)
 
 	// __cryptoDigestStreamFinish(requestID, streamID) -> base64 hash
-	_ = ctx.Global().Set("__cryptoDigestStreamFinish", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("__cryptoDigestStreamFinish", 2).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		streamID := args[1].String()
+	registerGoFunc(vm, "__cryptoDigestStreamFinish", func(reqIDStr, streamID string) (string, error) {
+		reqID, _ := strconv.ParseUint(reqIDStr, 10, 64)
 
 		state := getRequestState(reqID)
 		if state == nil || state.digestStreams == nil {
-			return throwError(iso, "DigestStream finish: invalid state")
+			return "", fmt.Errorf("DigestStream finish: invalid state")
 		}
 
 		h, ok := state.digestStreams[streamID]
 		if !ok {
-			return throwError(iso, "DigestStream finish: unknown stream")
+			return "", fmt.Errorf("DigestStream finish: unknown stream")
 		}
 
 		result := h.Sum(nil)
 		delete(state.digestStreams, streamID)
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(result))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(result), nil
+	}, false)
 
 	// Evaluate the JS wrapper.
-	if _, err := ctx.RunScript(digestStreamJS, "crypto_digeststream.js"); err != nil {
+	if err := evalDiscard(vm, digestStreamJS); err != nil {
 		return fmt.Errorf("evaluating crypto_digeststream.js: %w", err)
 	}
 

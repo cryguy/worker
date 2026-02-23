@@ -7,12 +7,11 @@ import (
 	"net/url"
 	"strings"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // webAPIsJS defines the Web API classes (Headers, Request, Response, URL,
-// URLSearchParams, TextEncoder, TextDecoder) in JavaScript. Go-backed helpers like __parseURL
-// are registered separately and called from inside these classes.
+// URLSearchParams, TextEncoder, TextDecoder) in JavaScript.
 const webAPIsJS = `
 class Headers {
 	constructor(init) {
@@ -61,7 +60,18 @@ class URL {
 	}
 	toString() { return this.href; }
 	static canParse(url, base) {
-		try { new URL(url, base); return true; } catch { return false; }
+		try {
+			if (url === null || url === undefined) {
+				url = String(url);
+			}
+			if (base !== undefined && base !== null) {
+				base = String(base);
+			}
+			new URL(url, base);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 }
 
@@ -274,8 +284,37 @@ globalThis.Request = Request;
 globalThis.Response = Response;
 `
 
+// bufferSourceJS provides __bufferSourceToB64 and __b64ToBuffer helpers.
+const bufferSourceJS = `
+globalThis.__bufferSourceToB64 = function(data) {
+	var bytes;
+	if (data instanceof ArrayBuffer) {
+		bytes = new Uint8Array(data);
+	} else if (ArrayBuffer.isView(data)) {
+		bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+	} else if (typeof data === 'string') {
+		return btoa(data);
+	} else {
+		bytes = new Uint8Array(data);
+	}
+	var binary = '';
+	for (var i = 0; i < bytes.length; i++) {
+		binary += String.fromCharCode(bytes[i]);
+	}
+	return btoa(binary);
+};
+
+globalThis.__b64ToBuffer = function(b64) {
+	var binary = atob(b64);
+	var bytes = new Uint8Array(binary.length);
+	for (var i = 0; i < binary.length; i++) {
+		bytes[i] = binary.charCodeAt(i);
+	}
+	return bytes.buffer;
+};
+`
+
 // urlSearchParamsExtJS patches URLSearchParams with mutation methods and URL sync.
-// Must be evaluated after webAPIsJS so that URLSearchParams and URL are defined.
 const urlSearchParamsExtJS = `
 (function() {
 var USP = URLSearchParams.prototype;
@@ -317,7 +356,6 @@ USP.append = function(name, value) {
 	this._sync();
 };
 
-// Override delete to support sync
 var origDelete = USP['delete'];
 USP['delete'] = function(name) {
 	this._entries = this._entries.filter(function(e) { return e[0] !== name; });
@@ -333,46 +371,33 @@ USP.sort = function() {
 `
 
 // setupURLSearchParamsExt evaluates the URLSearchParams extension polyfill.
-func setupURLSearchParamsExt(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(urlSearchParamsExtJS, "urlsearchparams_ext.js"); err != nil {
-		return fmt.Errorf("evaluating urlsearchparams_ext.js: %w", err)
-	}
-	return nil
+func setupURLSearchParamsExt(vm *quickjs.VM, _ *eventLoop) error {
+	return evalDiscard(vm, urlSearchParamsExtJS)
 }
 
 // setupWebAPIs registers Go-backed helpers and evaluates the JS class
 // definitions that form the Web API surface available to workers.
-func setupWebAPIs(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupWebAPIs(vm *quickjs.VM, _ *eventLoop) error {
 	// Register Go-backed URL parser.
-	ft := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 1 {
-			val, _ := v8.NewValue(iso, `{"error":"URL constructor requires at least 1 argument"}`)
-			return val
-		}
-
-		rawURL := args[0].String()
-		var base string
-		if len(args) > 1 {
-			base = args[1].String()
-		}
-
+	registerGoFunc(vm, "__parseURL", func(rawURL, base string) (string, error) {
 		parsed, err := parseURL(rawURL, base)
 		if err != nil {
-			errJSON := fmt.Sprintf(`{"error":%q}`, err.Error())
-			val, _ := v8.NewValue(iso, errJSON)
-			return val
+			return fmt.Sprintf(`{"error":%q}`, err.Error()), nil
 		}
-
 		data, _ := json.Marshal(parsed)
-		val, _ := v8.NewValue(iso, string(data))
-		return val
-	})
-	_ = ctx.Global().Set("__parseURL", ft.GetFunction(ctx))
+		return string(data), nil
+	}, false)
 
 	// Evaluate the JS class definitions.
-	_, err := ctx.RunScript(webAPIsJS, "webapi.js")
-	return err
+	if err := evalDiscard(vm, webAPIsJS); err != nil {
+		return fmt.Errorf("evaluating webapi.js: %w", err)
+	}
+
+	// Evaluate __bufferSourceToB64 and __b64ToBuffer helpers
+	// (these depend on btoa/atob, so must come after encoding setup,
+	// but we install them here so they're available early — they'll
+	// work once btoa/atob are set up by setupEncoding).
+	return evalDiscard(vm, bufferSourceJS)
 }
 
 // urlParsed is the JSON structure returned by __parseURL.
@@ -443,7 +468,6 @@ func parseURL(rawURL, base string) (*urlParsed, error) {
 		pathname = "/"
 	}
 
-	// Build href from components so it reflects the normalized pathname.
 	userInfo := ""
 	if u.User != nil {
 		userInfo = u.User.String() + "@"
@@ -466,26 +490,21 @@ func parseURL(rawURL, base string) (*urlParsed, error) {
 }
 
 // goRequestToJS converts a Go WorkerRequest into a JS Request object.
-func goRequestToJS(iso *v8.Isolate, ctx *v8.Context, req *WorkerRequest) (*v8.Value, error) {
-	// Lowercase headers for the JS Headers constructor.
+// Sets the result as globalThis.__req.
+func goRequestToJS(vm *quickjs.VM, req *WorkerRequest) error {
 	lowerHeaders := make(map[string]string, len(req.Headers))
 	for k, v := range req.Headers {
 		lowerHeaders[strings.ToLower(k)] = v
 	}
 	headersJSON, _ := json.Marshal(lowerHeaders)
 
-	// Set temporary globals for the constructor call.
-	urlVal, _ := v8.NewValue(iso, req.URL)
-	_ = ctx.Global().Set("__tmp_url", urlVal)
-	methodVal, _ := v8.NewValue(iso, req.Method)
-	_ = ctx.Global().Set("__tmp_method", methodVal)
-	headersStr, _ := v8.NewValue(iso, string(headersJSON))
-	_ = ctx.Global().Set("__tmp_headers_json", headersStr)
+	_ = setGlobal(vm, "__tmp_url", req.URL)
+	_ = setGlobal(vm, "__tmp_method", req.Method)
+	_ = setGlobal(vm, "__tmp_headers_json", string(headersJSON))
 
 	var bodyScript string
 	if len(req.Body) > 0 {
-		bodyVal, _ := v8.NewValue(iso, string(req.Body))
-		_ = ctx.Global().Set("__tmp_body", bodyVal)
+		_ = setGlobal(vm, "__tmp_body", string(req.Body))
 		bodyScript = "init.body = globalThis.__tmp_body;"
 	}
 
@@ -495,28 +514,22 @@ func goRequestToJS(iso *v8.Isolate, ctx *v8.Context, req *WorkerRequest) (*v8.Va
 			headers: JSON.parse(globalThis.__tmp_headers_json),
 		};
 		%s
-		var req = new Request(globalThis.__tmp_url, init);
+		globalThis.__req = new Request(globalThis.__tmp_url, init);
 		delete globalThis.__tmp_url;
 		delete globalThis.__tmp_method;
 		delete globalThis.__tmp_headers_json;
 		delete globalThis.__tmp_body;
-		return req;
 	})()`, bodyScript)
 
-	return ctx.RunScript(script, "goRequestToJS.js")
+	return evalDiscard(vm, script)
 }
 
-// jsResponseToGo extracts a Go WorkerResponse from a JS Response value.
-func jsResponseToGo(ctx *v8.Context, val *v8.Value) (*WorkerResponse, error) {
-	if val == nil || val.IsNull() || val.IsUndefined() {
-		return nil, fmt.Errorf("worker returned null/undefined instead of Response")
-	}
-
-	// Use JS to extract all response data as JSON in one call.
-	_ = ctx.Global().Set("__tmp_resp", val)
-	result, err := ctx.RunScript(`(function() {
-		var r = globalThis.__tmp_resp;
-		delete globalThis.__tmp_resp;
+// jsResponseToGo extracts a Go WorkerResponse from the JS Response in globalThis.__result.
+func jsResponseToGo(vm *quickjs.VM) (*WorkerResponse, error) {
+	resultJSON, err := evalString(vm, `(function() {
+		var r = globalThis.__result;
+		delete globalThis.__result;
+		if (r === null || r === undefined) return JSON.stringify({error: "null response"});
 		var headers = {};
 		if (r.headers && r.headers._map) {
 			var m = r.headers._map;
@@ -573,7 +586,7 @@ func jsResponseToGo(ctx *v8.Context, val *v8.Value) (*WorkerResponse, error) {
 			bodyIsBase64: bodyIsBase64,
 			hasWebSocket: hasWebSocket,
 		});
-	})()`, "jsResponseToGo.js")
+	})()`)
 	if err != nil {
 		return nil, fmt.Errorf("extracting response: %w", err)
 	}
@@ -584,9 +597,13 @@ func jsResponseToGo(ctx *v8.Context, val *v8.Value) (*WorkerResponse, error) {
 		Body         string            `json:"body"`
 		BodyIsBase64 bool              `json:"bodyIsBase64"`
 		HasWebSocket bool              `json:"hasWebSocket"`
+		Error        string            `json:"error"`
 	}
-	if err := json.Unmarshal([]byte(result.String()), &resp); err != nil {
+	if err := json.Unmarshal([]byte(resultJSON), &resp); err != nil {
 		return nil, fmt.Errorf("parsing response JSON: %w", err)
+	}
+	if resp.Error != "" {
+		return nil, fmt.Errorf("worker returned %s instead of Response", resp.Error)
 	}
 
 	var body []byte

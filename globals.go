@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // globalsJS defines pure-JS polyfills for simple global APIs.
@@ -39,27 +39,17 @@ globalThis.structuredClone = (function() {
 		if (type === 'function') throw cloneError('value could not be cloned');
 		if (type === 'symbol') throw cloneError('value could not be cloned');
 
-		// value is an object from here on
 		if (typeof WeakMap !== 'undefined' && value instanceof WeakMap) throw cloneError('WeakMap cannot be cloned');
 		if (typeof WeakSet !== 'undefined' && value instanceof WeakSet) throw cloneError('WeakSet cannot be cloned');
 		if (typeof Promise !== 'undefined' && value instanceof Promise) throw cloneError('Promise cannot be cloned');
 
-		// Circular reference detection
 		if (seen.has(value)) throw cloneError('value could not be cloned: circular reference');
 		seen.set(value, true);
 
-		// Date
 		if (value instanceof Date) return new Date(value.getTime());
-
-		// RegExp
 		if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+		if (value instanceof ArrayBuffer) { return value.slice(0); }
 
-		// ArrayBuffer
-		if (value instanceof ArrayBuffer) {
-			return value.slice(0);
-		}
-
-		// TypedArrays
 		for (var ti = 0; ti < TYPED_ARRAY_CONSTRUCTORS.length; ti++) {
 			var TA = TYPED_ARRAY_CONSTRUCTORS[ti];
 			if (value instanceof TA) {
@@ -68,13 +58,11 @@ globalThis.structuredClone = (function() {
 			}
 		}
 
-		// DataView
 		if (typeof DataView !== 'undefined' && value instanceof DataView) {
 			var dvBuf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
 			return new DataView(dvBuf);
 		}
 
-		// Map
 		if (typeof Map !== 'undefined' && value instanceof Map) {
 			var clonedMap = new Map();
 			value.forEach(function(v, k) {
@@ -83,7 +71,6 @@ globalThis.structuredClone = (function() {
 			return clonedMap;
 		}
 
-		// Set
 		if (typeof Set !== 'undefined' && value instanceof Set) {
 			var clonedSet = new Set();
 			value.forEach(function(v) {
@@ -92,7 +79,6 @@ globalThis.structuredClone = (function() {
 			return clonedSet;
 		}
 
-		// Array
 		if (Array.isArray(value)) {
 			var arr = new Array(value.length);
 			for (var i = 0; i < value.length; i++) {
@@ -101,7 +87,6 @@ globalThis.structuredClone = (function() {
 			return arr;
 		}
 
-		// Plain object
 		var result = {};
 		var keys = Object.keys(value);
 		for (var j = 0; j < keys.length; j++) {
@@ -130,7 +115,7 @@ Object.defineProperty(globalThis, 'navigator', {
 				body = String(data);
 			}
 			try {
-				return __sendBeacon(url, body, ct);
+				return !!__sendBeacon(url, body, ct);
 			} catch(e) {
 				return false;
 			}
@@ -141,27 +126,20 @@ Object.defineProperty(globalThis, 'navigator', {
 });
 `
 
+// waitUntilJS provides ctx.waitUntil support and the drainWaitUntil mechanism.
+const waitUntilJS = `
+globalThis.__waitUntilPromises = [];
+`
+
 // setupGlobals registers structuredClone, performance.now(), navigator,
 // queueMicrotask, and the Event/EventTarget base classes.
-func setupGlobals(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupGlobals(vm *quickjs.VM, _ *eventLoop) error {
 	// __sendBeacon: Go-backed fire-and-forget POST with SSRF protection.
-	beaconFT := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			val, _ := v8.NewValue(iso, false)
-			return val
-		}
-		targetURL := args[0].String()
-		body := args[1].String()
-		contentType := args[2].String()
-
-		// SSRF pre-check (same as fetch.go).
+	registerGoFunc(vm, "__sendBeacon", func(targetURL, body, contentType string) (int, error) {
 		if isPrivateHostname(targetURL) {
-			val, _ := v8.NewValue(iso, false)
-			return val
+			return 0, nil
 		}
 
-		// Fire-and-forget in a goroutine.
 		go func() {
 			httpReq, err := http.NewRequest("POST", targetURL, strings.NewReader(body))
 			if err != nil {
@@ -181,37 +159,34 @@ func setupGlobals(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			_ = resp.Body.Close()
 		}()
 
-		val, _ := v8.NewValue(iso, true)
-		return val
-	})
-	_ = ctx.Global().Set("__sendBeacon", beaconFT.GetFunction(ctx))
+		return 1, nil
+	}, false)
+
+	// __performanceNow: Go-backed high-resolution timer.
+	startTime := time.Now()
+	registerGoFunc(vm, "__performanceNow", func() float64 {
+		return float64(time.Since(startTime).Nanoseconds()) / 1e6
+	}, false)
 
 	// Evaluate pure-JS polyfills.
-	if _, err := ctx.RunScript(globalsJS, "globals.js"); err != nil {
+	if err := evalDiscard(vm, globalsJS); err != nil {
 		return fmt.Errorf("evaluating globals.js: %w", err)
 	}
 
-	// performance.now() - Go-backed for high-resolution timing.
-	startTime := time.Now()
-	perf, err := newJSObject(iso, ctx)
-	if err != nil {
-		return fmt.Errorf("creating performance object: %w", err)
+	// Set up performance object with Go-backed now().
+	if err := evalDiscard(vm, `
+		globalThis.performance = {
+			now: function() { return __performanceNow(); }
+		};
+	`); err != nil {
+		return fmt.Errorf("setting up performance: %w", err)
 	}
 
-	ft := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		elapsed := time.Since(startTime)
-		ms := float64(elapsed.Nanoseconds()) / 1e6
-		val, _ := v8.NewValue(iso, ms)
-		return val
-	})
-	_ = perf.Set("now", ft.GetFunction(ctx))
-	_ = ctx.Global().Set("performance", perf)
-
-	return nil
+	// Set up waitUntil tracking.
+	return evalDiscard(vm, waitUntilJS)
 }
 
 // reportErrorJS defines ErrorEvent and reportError.
-// Must be evaluated AFTER setupAbort (which defines Event and EventTarget on globalThis).
 const reportErrorJS = `
 class ErrorEvent extends Event {
 	constructor(type, init) {
@@ -235,10 +210,8 @@ globalThis.reportError = function(error) {
 `
 
 // setupReportError evaluates the reportError/ErrorEvent polyfill.
-// Must be called AFTER setupAbort so Event and EventTarget exist.
-func setupReportError(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	// Ensure globalThis is an EventTarget.
-	if _, err := ctx.RunScript(`
+func setupReportError(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, `
 		if (typeof globalThis.addEventListener !== 'function') {
 			var __gt = new EventTarget();
 			globalThis.addEventListener = __gt.addEventListener.bind(__gt);
@@ -246,13 +219,55 @@ func setupReportError(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			globalThis.dispatchEvent = __gt.dispatchEvent.bind(__gt);
 			globalThis._listeners = __gt._listeners;
 		}
-	`, "globalthis_eventtarget.js"); err != nil {
+	`); err != nil {
 		return fmt.Errorf("setting up globalThis as EventTarget: %w", err)
 	}
-	if _, err := ctx.RunScript(reportErrorJS, "report_error.js"); err != nil {
-		return fmt.Errorf("evaluating report_error.js: %w", err)
+	return evalDiscard(vm, reportErrorJS)
+}
+
+// buildExecContext constructs the JS execution context {waitUntil, passThroughOnException}.
+// Sets the result as globalThis.__ctx.
+func buildExecContext(vm *quickjs.VM) error {
+	return evalDiscard(vm, `
+		globalThis.__waitUntilPromises = [];
+		globalThis.__ctx = {
+			waitUntil: function(promise) {
+				globalThis.__waitUntilPromises.push(Promise.resolve(promise));
+			},
+			passThroughOnException: function() {}
+		};
+	`)
+}
+
+// drainWaitUntil drains any promises registered via ctx.waitUntil().
+func drainWaitUntil(vm *quickjs.VM, deadline time.Time) {
+	// Set up await for all waitUntil promises.
+	_ = evalDiscard(vm, `
+		if (globalThis.__waitUntilPromises && globalThis.__waitUntilPromises.length > 0) {
+			globalThis.__waitUntilSettled = false;
+			Promise.allSettled(globalThis.__waitUntilPromises).then(function() {
+				globalThis.__waitUntilSettled = true;
+			});
+			globalThis.__waitUntilPromises = [];
+		} else {
+			globalThis.__waitUntilSettled = true;
+		}
+	`)
+
+	// Pump microtasks until settled or deadline.
+	for {
+		settled, _ := evalBool(vm, "!!globalThis.__waitUntilSettled")
+		if settled {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		executePendingJobs(vm)
+		time.Sleep(1 * time.Millisecond)
 	}
-	return nil
+
+	_ = evalDiscard(vm, "delete globalThis.__waitUntilSettled;")
 }
 
 // errMissingArg returns a formatted error for functions called with too few arguments.

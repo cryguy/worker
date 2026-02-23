@@ -7,7 +7,7 @@ import (
 	"hash"
 	"math"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // hkdfDeriveBits implements HKDF (RFC 5869) Extract+Expand.
@@ -125,66 +125,52 @@ subtle.deriveKey = async function(algorithm, baseKey, derivedKeyAlgorithm, extra
 
 // setupCryptoDerive registers HKDF and PBKDF2 deriveBits/deriveKey.
 // Must run after setupCryptoExt.
-func setupCryptoDerive(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	_ = ctx.Global().Set("__cryptoDeriveBits", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 7 {
-			return throwError(iso, "deriveBits requires 7 argument(s)")
-		}
-		algoName := args[0].String()
-		keyID := args[1].Integer()
-		lengthBits := int(args[2].Int32())
-		hashName := args[3].String()
-		saltB64 := args[4].String()
-		infoB64 := args[5].String()
-		iterations := int(args[6].Int32())
-
-		reqID := getReqIDFromJS(ctx)
+func setupCryptoDerive(vm *quickjs.VM, _ *eventLoop) error {
+	registerGoFunc(vm, "__cryptoDeriveBits", func(algoName string, keyID int, lengthBits int, hashName, saltB64, infoB64 string, iterations int) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "deriveBits: key not found")
+			return "", fmt.Errorf("deriveBits: key not found")
 		}
 
 		hashFn := hashFuncFromAlgo(hashName)
 		if hashFn == nil {
-			return throwError(iso, fmt.Sprintf("deriveBits: unsupported hash %q", hashName))
+			return "", fmt.Errorf("deriveBits: unsupported hash %q", hashName)
 		}
 
 		switch normalizeAlgo(algoName) {
 		case "HKDF":
 			salt, err := base64.StdEncoding.DecodeString(saltB64)
 			if err != nil {
-				return throwError(iso, "deriveBits: invalid salt base64")
+				return "", fmt.Errorf("deriveBits: invalid salt base64")
 			}
 			infoBytes, err := base64.StdEncoding.DecodeString(infoB64)
 			if err != nil {
-				return throwError(iso, "deriveBits: invalid info base64")
+				return "", fmt.Errorf("deriveBits: invalid info base64")
 			}
 			result, err := hkdfDeriveBits(hashFn, entry.data, salt, infoBytes, lengthBits)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("deriveBits: %s", err.Error()))
+				return "", fmt.Errorf("deriveBits: %s", err.Error())
 			}
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(result))
-			return val
+			return base64.StdEncoding.EncodeToString(result), nil
 
 		case "PBKDF2":
 			salt, err := base64.StdEncoding.DecodeString(saltB64)
 			if err != nil {
-				return throwError(iso, "deriveBits: invalid salt base64")
+				return "", fmt.Errorf("deriveBits: invalid salt base64")
 			}
 			result, err := pbkdf2DeriveBits(hashFn, entry.data, salt, iterations, lengthBits)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("deriveBits: %s", err.Error()))
+				return "", fmt.Errorf("deriveBits: %s", err.Error())
 			}
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(result))
-			return val
+			return base64.StdEncoding.EncodeToString(result), nil
 
 		default:
-			return throwError(iso, fmt.Sprintf("deriveBits: unsupported algorithm %q", algoName))
+			return "", fmt.Errorf("deriveBits: unsupported algorithm %q", algoName)
 		}
-	}).GetFunction(ctx))
+	}, false)
 
-	if _, err := ctx.RunScript(cryptoDeriveJS, "crypto_derive.js"); err != nil {
+	if err := evalDiscard(vm, cryptoDeriveJS); err != nil {
 		return fmt.Errorf("evaluating crypto_derive.js: %w", err)
 	}
 	return nil

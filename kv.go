@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strconv"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // KVValueWithMetadata holds a value and its associated metadata.
@@ -46,342 +46,154 @@ func encodeCursor(offset int) string {
 	return base64.StdEncoding.EncodeToString([]byte(strconv.Itoa(offset)))
 }
 
-// buildKVBinding creates a JS object with async get/put/delete/list methods
-// backed by the given KVStore.
-//
-// All operations run synchronously on the JS thread. SQLite queries are fast
-// local I/O, so synchronous execution within a PromiseResolver is fine.
-func buildKVBinding(iso *v8.Isolate, ctx *v8.Context, store KVStore) (*v8.Value, error) {
-	kv, err := newJSObject(iso, ctx)
-	if err != nil {
-		return nil, fmt.Errorf("creating KV object: %w", err)
-	}
-
-	// get(key, options?) -> Promise<string|object|ArrayBuffer|ReadableStream|null>
-	// options.type: "text" (default), "json", "arrayBuffer", "stream"
-	_ = kv.Set("get", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "KV.get requires a key argument")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+// setupKV registers global Go functions for KV namespace operations.
+// The actual KV binding objects are built in buildEnvObject via JS wrappers.
+func setupKV(vm *quickjs.VM, el *eventLoop) error {
+	// __kv_get(reqIDStr, bindingName, key, valType) -> JSON string or "null"
+	err := registerGoFunc(vm, "__kv_get", func(reqIDStr, bindingName, key, valType string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.KV == nil {
+			return "null", nil
 		}
-		key := args[0].String()
-
-		// Parse optional type from second argument.
-		valType := "text"
-		if len(args) > 1 && args[1].IsObject() {
-			_ = ctx.Global().Set("__tmp_kv_get_opts", args[1])
-			optsResult, err := ctx.RunScript(`(function() {
-				var o = globalThis.__tmp_kv_get_opts;
-				delete globalThis.__tmp_kv_get_opts;
-				return o.type !== undefined && o.type !== null ? String(o.type) : "text";
-			})()`, "kv_get_opts.js")
-			if err == nil {
-				valType = optsResult.String()
-			}
+		store, ok := state.env.KV[bindingName]
+		if !ok {
+			return "null", nil
 		}
 
 		val, err := store.Get(key)
 		if err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+			return "", err
 		}
 		if val == nil {
-			resolver.Resolve(v8.Null(iso))
-			return resolver.GetPromise().Value
+			return "null", nil
 		}
 
-		switch valType {
-		case "json":
-			jsVal, err := ctx.RunScript(fmt.Sprintf("JSON.parse(%q)", *val), "kv_get_json.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, "KV.get: invalid JSON value")
-				resolver.Reject(errVal)
-			} else {
-				resolver.Resolve(jsVal)
-			}
-		case "arrayBuffer":
-			strVal, _ := v8.NewValue(iso, *val)
-			_ = ctx.Global().Set("__tmp_kv_ab_val", strVal)
-			jsVal, err := ctx.RunScript(`(function() {
-				var s = globalThis.__tmp_kv_ab_val;
-				delete globalThis.__tmp_kv_ab_val;
-				var enc = new TextEncoder();
-				return enc.encode(s).buffer;
-			})()`, "kv_get_arraybuffer.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, "KV.get: failed to create ArrayBuffer")
-				resolver.Reject(errVal)
-			} else {
-				resolver.Resolve(jsVal)
-			}
-		case "stream":
-			strVal, _ := v8.NewValue(iso, *val)
-			_ = ctx.Global().Set("__tmp_kv_stream_val", strVal)
-			jsVal, err := ctx.RunScript(`(function() {
-				var s = globalThis.__tmp_kv_stream_val;
-				delete globalThis.__tmp_kv_stream_val;
-				var enc = new TextEncoder();
-				var bytes = enc.encode(s);
-				return new ReadableStream({
-					start(controller) {
-						controller.enqueue(bytes);
-						controller.close();
-					}
-				});
-			})()`, "kv_get_stream.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, "KV.get: failed to create ReadableStream")
-				resolver.Reject(errVal)
-			} else {
-				resolver.Resolve(jsVal)
-			}
-		default: // "text"
-			strVal, _ := v8.NewValue(iso, *val)
-			resolver.Resolve(strVal)
-		}
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
+		result := map[string]interface{}{"value": *val}
+		data, _ := json.Marshal(result)
+		return string(data), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __kv_get: %w", err)
+	}
 
-	// getWithMetadata(key, options?) -> Promise<{value, metadata}>
-	_ = kv.Set("getWithMetadata", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "KV.getWithMetadata requires a key argument")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+	// __kv_get_with_metadata(reqIDStr, bindingName, key, valType) -> JSON string
+	err = registerGoFunc(vm, "__kv_get_with_metadata", func(reqIDStr, bindingName, key, valType string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.KV == nil {
+			return `{"value":null,"metadata":null}`, nil
 		}
-		key := args[0].String()
-
-		// Parse optional type from second argument.
-		valType := "text"
-		if len(args) > 1 && args[1].IsObject() {
-			_ = ctx.Global().Set("__tmp_kv_gwm_opts", args[1])
-			optsResult, err := ctx.RunScript(`(function() {
-				var o = globalThis.__tmp_kv_gwm_opts;
-				delete globalThis.__tmp_kv_gwm_opts;
-				return o.type !== undefined && o.type !== null ? String(o.type) : "text";
-			})()`, "kv_gwm_opts.js")
-			if err == nil {
-				valType = optsResult.String()
-			}
+		store, ok := state.env.KV[bindingName]
+		if !ok {
+			return `{"value":null,"metadata":null}`, nil
 		}
 
 		result, err := store.GetWithMetadata(key)
 		if err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+			return "", err
 		}
 		if result == nil {
-			// Return {value: null, metadata: null}
-			jsVal, _ := ctx.RunScript(`({value: null, metadata: null})`, "kv_gwm_null.js")
-			resolver.Resolve(jsVal)
-			return resolver.GetPromise().Value
+			return `{"value":null,"metadata":null}`, nil
 		}
 
-		// Build metadata JS value — metadata is stored as JSON, so embed it
-		// as raw JS to return the parsed object (Cloudflare KV behavior).
-		var metaJSON string
-		if result.Metadata != nil {
-			if json.Valid([]byte(*result.Metadata)) {
-				metaJSON = *result.Metadata
-			} else {
-				metaJSON = fmt.Sprintf("%q", *result.Metadata)
-			}
-		} else {
-			metaJSON = "null"
+		response := map[string]interface{}{
+			"value":    result.Value,
+			"metadata": result.Metadata,
 		}
+		data, _ := json.Marshal(response)
+		return string(data), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __kv_get_with_metadata: %w", err)
+	}
 
-		switch valType {
-		case "json":
-			// Safe metadata interpolation: use temp global instead of string formatting.
-			metaVal, _ := v8.NewValue(iso, metaJSON)
-			_ = ctx.Global().Set("__tmp_kv_meta", metaVal)
-			jsVal, err := ctx.RunScript(fmt.Sprintf(`(function() {
-				var m = JSON.parse(globalThis.__tmp_kv_meta);
-				delete globalThis.__tmp_kv_meta;
-				return {value: JSON.parse(%q), metadata: m};
-			})()`, result.Value), "kv_gwm_json.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, "KV.getWithMetadata: invalid JSON value")
-				resolver.Reject(errVal)
-			} else {
-				resolver.Resolve(jsVal)
-			}
-		case "arrayBuffer":
-			strVal, _ := v8.NewValue(iso, result.Value)
-			_ = ctx.Global().Set("__tmp_kv_gwm_ab", strVal)
-			// Safe metadata interpolation: use temp global instead of string formatting.
-			metaVal, _ := v8.NewValue(iso, metaJSON)
-			_ = ctx.Global().Set("__tmp_kv_meta", metaVal)
-			jsVal, err := ctx.RunScript(`(function() {
-				var s = globalThis.__tmp_kv_gwm_ab;
-				delete globalThis.__tmp_kv_gwm_ab;
-				var m = JSON.parse(globalThis.__tmp_kv_meta);
-				delete globalThis.__tmp_kv_meta;
-				var enc = new TextEncoder();
-				return {value: enc.encode(s).buffer, metadata: m};
-			})()`, "kv_gwm_arraybuffer.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, "KV.getWithMetadata: failed to create ArrayBuffer")
-				resolver.Reject(errVal)
-			} else {
-				resolver.Resolve(jsVal)
-			}
-		case "stream":
-			strVal, _ := v8.NewValue(iso, result.Value)
-			_ = ctx.Global().Set("__tmp_kv_gwm_stream", strVal)
-			// Safe metadata interpolation: use temp global instead of string formatting.
-			metaVal, _ := v8.NewValue(iso, metaJSON)
-			_ = ctx.Global().Set("__tmp_kv_meta", metaVal)
-			jsVal, err := ctx.RunScript(`(function() {
-				var s = globalThis.__tmp_kv_gwm_stream;
-				delete globalThis.__tmp_kv_gwm_stream;
-				var m = JSON.parse(globalThis.__tmp_kv_meta);
-				delete globalThis.__tmp_kv_meta;
-				var enc = new TextEncoder();
-				var bytes = enc.encode(s);
-				var stream = new ReadableStream({
-					start(controller) {
-						controller.enqueue(bytes);
-						controller.close();
-					}
-				});
-				return {value: stream, metadata: m};
-			})()`, "kv_gwm_stream.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, "KV.getWithMetadata: failed to create ReadableStream")
-				resolver.Reject(errVal)
-			} else {
-				resolver.Resolve(jsVal)
-			}
-		default: // "text"
-			// Safe metadata interpolation: use temp global instead of string formatting.
-			metaVal, _ := v8.NewValue(iso, metaJSON)
-			_ = ctx.Global().Set("__tmp_kv_meta", metaVal)
-			jsVal, err := ctx.RunScript(fmt.Sprintf(`(function() {
-				var m = JSON.parse(globalThis.__tmp_kv_meta);
-				delete globalThis.__tmp_kv_meta;
-				return {value: %q, metadata: m};
-			})()`, result.Value), "kv_gwm_text.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-			} else {
-				resolver.Resolve(jsVal)
-			}
+	// __kv_put(reqIDStr, bindingName, key, value, optsJSON) -> "" or error
+	err = registerGoFunc(vm, "__kv_put", func(reqIDStr, bindingName, key, value, optsJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.KV == nil {
+			return "", fmt.Errorf("KV not available")
 		}
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
-
-	// put(key, value, options?) -> Promise<void>
-	_ = kv.Set("put", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) < 2 {
-			errVal, _ := v8.NewValue(iso, "KV.put requires key and value arguments")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+		store, ok := state.env.KV[bindingName]
+		if !ok {
+			return "", fmt.Errorf("KV binding %q not found", bindingName)
 		}
-		key := args[0].String()
-		value := args[1].String()
 
 		var metadata *string
 		var ttl *int
-		if len(args) > 2 && args[2].IsObject() {
-			// Extract options via JS to avoid complex property iteration.
-			_ = ctx.Global().Set("__tmp_kv_opts", args[2])
-			optsResult, err := ctx.RunScript(`(function() {
-				var o = globalThis.__tmp_kv_opts;
-				delete globalThis.__tmp_kv_opts;
-				return JSON.stringify({
-					metadata: o.metadata !== undefined && o.metadata !== null ? JSON.stringify(o.metadata) : null,
-					expirationTtl: o.expirationTtl !== undefined && o.expirationTtl !== null ? Number(o.expirationTtl) : null,
-				});
-			})()`, "kv_opts.js")
-			if err == nil {
-				var opts struct {
-					Metadata      *string `json:"metadata"`
-					ExpirationTtl *int    `json:"expirationTtl"`
-				}
-				if json.Unmarshal([]byte(optsResult.String()), &opts) == nil {
-					metadata = opts.Metadata
-					ttl = opts.ExpirationTtl
-				}
+		if optsJSON != "" && optsJSON != "{}" {
+			var opts struct {
+				Metadata      *string `json:"metadata"`
+				ExpirationTtl *int    `json:"expirationTtl"`
+			}
+			if err := json.Unmarshal([]byte(optsJSON), &opts); err == nil {
+				metadata = opts.Metadata
+				ttl = opts.ExpirationTtl
 			}
 		}
 
 		if err := store.Put(key, value, metadata, ttl); err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+			return "", err
 		}
-		resolver.Resolve(v8.Undefined(iso))
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
+		return "", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __kv_put: %w", err)
+	}
 
-	// delete(key) -> Promise<void>
-	_ = kv.Set("delete", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "KV.delete requires a key argument")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+	// __kv_delete(reqIDStr, bindingName, key) -> "" or error
+	err = registerGoFunc(vm, "__kv_delete", func(reqIDStr, bindingName, key string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.KV == nil {
+			return "", fmt.Errorf("KV not available")
 		}
-		key := args[0].String()
+		store, ok := state.env.KV[bindingName]
+		if !ok {
+			return "", fmt.Errorf("KV binding %q not found", bindingName)
+		}
+
 		if err := store.Delete(key); err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+			return "", err
 		}
-		resolver.Resolve(v8.Undefined(iso))
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
+		return "", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __kv_delete: %w", err)
+	}
 
-	// list(options?) -> Promise<{keys: [{name, metadata?}], list_complete, cursor?}>
-	_ = kv.Set("list", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
+	// __kv_list(reqIDStr, bindingName, optsJSON) -> JSON result
+	err = registerGoFunc(vm, "__kv_list", func(reqIDStr, bindingName, optsJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.KV == nil {
+			return "", fmt.Errorf("KV not available")
+		}
+		store, ok := state.env.KV[bindingName]
+		if !ok {
+			return "", fmt.Errorf("KV binding %q not found", bindingName)
+		}
 
 		var prefix string
 		var cursor string
 		limit := 1000
-		if len(args) > 0 && args[0].IsObject() {
-			_ = ctx.Global().Set("__tmp_kv_list_opts", args[0])
-			optsResult, err := ctx.RunScript(`(function() {
-				var o = globalThis.__tmp_kv_list_opts;
-				delete globalThis.__tmp_kv_list_opts;
-				return JSON.stringify({
-					prefix: o.prefix !== undefined && o.prefix !== null ? String(o.prefix) : "",
-					limit: o.limit !== undefined && o.limit !== null ? Number(o.limit) : 1000,
-					cursor: o.cursor !== undefined && o.cursor !== null ? String(o.cursor) : "",
-				});
-			})()`, "kv_list_opts.js")
-			if err == nil {
-				var opts struct {
-					Prefix string `json:"prefix"`
-					Limit  int    `json:"limit"`
-					Cursor string `json:"cursor"`
-				}
-				if json.Unmarshal([]byte(optsResult.String()), &opts) == nil {
-					prefix = opts.Prefix
-					limit = opts.Limit
-					cursor = opts.Cursor
-				}
+		if optsJSON != "" && optsJSON != "{}" {
+			var opts struct {
+				Prefix string `json:"prefix"`
+				Limit  int    `json:"limit"`
+				Cursor string `json:"cursor"`
+			}
+			if err := json.Unmarshal([]byte(optsJSON), &opts); err == nil {
+				prefix = opts.Prefix
+				limit = opts.Limit
+				cursor = opts.Cursor
 			}
 		}
 
 		listResult, err := store.List(prefix, limit, cursor)
 		if err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+			return "", err
 		}
 
 		result := map[string]interface{}{
@@ -393,16 +205,11 @@ func buildKVBinding(iso *v8.Isolate, ctx *v8.Context, store KVStore) (*v8.Value,
 		}
 
 		data, _ := json.Marshal(result)
-		// Parse JSON into a JS object.
-		jsResult, err := ctx.RunScript(fmt.Sprintf("JSON.parse(%q)", string(data)), "kv_list_result.js")
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
-		}
-		resolver.Resolve(jsResult)
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
+		return string(data), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __kv_list: %w", err)
+	}
 
-	return kv.Value, nil
+	return nil
 }

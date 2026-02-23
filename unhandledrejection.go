@@ -3,7 +3,7 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // unhandledRejectionJS provides a best-effort polyfill for unhandled promise
@@ -88,8 +88,8 @@ globalThis.PromiseRejectionEvent = PromiseRejectionEvent;
 
 // setupUnhandledRejection registers PromiseRejectionEvent and best-effort
 // unhandled rejection tracking on globalThis.
-func setupUnhandledRejection(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(unhandledRejectionJS, "unhandledrejection.js"); err != nil {
+func setupUnhandledRejection(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, unhandledRejectionJS); err != nil {
 		return fmt.Errorf("evaluating unhandledrejection.js: %w", err)
 	}
 	return nil

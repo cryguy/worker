@@ -5,20 +5,15 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
-	"strconv"
 	"time"
 
 	"github.com/coder/websocket"
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
+// maxWSMessageBytes is defined in engine.go
+
 // webSocketJS defines the WebSocket and WebSocketPair classes available to workers.
-// This follows the Cloudflare Workers WebSocket API:
-//   - WebSocketPair() creates two linked WebSocket objects
-//   - server.accept() marks the server socket as ready
-//   - server.addEventListener('message'|'close'|'error', handler)
-//   - server.send(data) sends data to the client
-//   - Response with status 101 and webSocket property triggers upgrade
 const webSocketJS = `
 (function() {
 
@@ -41,7 +36,6 @@ class WebSocket {
 		if (this._readyState !== 1) {
 			throw new DOMException('WebSocket is not open', 'InvalidStateError');
 		}
-		// In-process pair: deliver directly to peer via microtask queue
 		if (!this._isHTTPBridged && this._peer && this._peer._readyState < 2) {
 			var peer = this._peer;
 			var evt;
@@ -58,22 +52,21 @@ class WebSocket {
 			});
 			return;
 		}
-		// HTTP bridge path
+		var reqID = String(globalThis.__requestID);
 		if (typeof data === 'string') {
-			__wsSend(data, false);
+			__wsSend(reqID, data, false);
 		} else if (data instanceof ArrayBuffer) {
-			__wsSend(__bufferSourceToB64(data), true);
+			__wsSend(reqID, __bufferSourceToB64(data), true);
 		} else if (ArrayBuffer.isView(data)) {
-			__wsSend(__bufferSourceToB64(data), true);
+			__wsSend(reqID, __bufferSourceToB64(data), true);
 		} else {
-			__wsSend(String(data), false);
+			__wsSend(reqID, String(data), false);
 		}
 	}
 
 	close(code, reason) {
 		if (this._readyState >= 2) return;
 		this._readyState = 2;
-		// Notify peer for in-process pairs
 		if (!this._isHTTPBridged && this._peer && this._peer._readyState < 2) {
 			var peer = this._peer;
 			var closeCode = code || 1000;
@@ -83,9 +76,9 @@ class WebSocket {
 				peer._dispatch('close', { code: closeCode, reason: closeReason, wasClean: true });
 			});
 		}
-		// HTTP bridge path
 		if (this._isHTTPBridged) {
-			__wsClose(code || 1000, reason || '');
+			var reqID = String(globalThis.__requestID);
+			__wsClose(reqID, code || 1000, reason || '');
 		}
 		this._readyState = 3;
 		this._dispatch('close', { code: code || 1000, reason: reason || '', wasClean: true });
@@ -147,31 +140,19 @@ globalThis.WebSocketPair = WebSocketPair;
 
 // setupWebSocket registers the WebSocket/WebSocketPair JS classes and the
 // Go-backed __wsSend/__wsClose functions that bridge to the HTTP WebSocket.
-func setupWebSocket(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	// __wsSend(data, isBinary) — sends a message to the HTTP WebSocket client.
-	// If isBinary is true, data is base64-encoded and sent as a binary message.
-	sendFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 1 {
-			return nil
-		}
-		data := args[0].String()
-		isBinary := len(args) >= 2 && args[1].Boolean()
-
-		reqIDVal, err := info.Context().Global().Get("__requestID")
-		if err != nil {
-			return nil
-		}
-		reqID, _ := strconv.ParseUint(reqIDVal.String(), 10, 64)
+func setupWebSocket(vm *quickjs.VM, _ *eventLoop) error {
+	// __wsSend(reqIDStr, data, isBinary) — sends a message to the HTTP WebSocket client.
+	registerGoFunc(vm, "__wsSend", func(reqIDStr, data string, isBinary bool) {
+		reqID := parseReqID(reqIDStr)
 		state := getRequestState(reqID)
 		if state == nil || state.wsConn == nil {
-			return nil
+			return
 		}
 
 		state.wsMu.Lock()
 		defer state.wsMu.Unlock()
 		if state.wsClosed {
-			return nil
+			return
 		}
 
 		writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -181,7 +162,7 @@ func setupWebSocket(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			decoded, decErr := base64.StdEncoding.DecodeString(data)
 			if decErr != nil {
 				log.Printf("worker: ws send base64 decode error: %v", decErr)
-				return nil
+				return
 			}
 			if writeErr := state.wsConn.Write(writeCtx, websocket.MessageBinary, decoded); writeErr != nil {
 				log.Printf("worker: ws send error: %v", writeErr)
@@ -191,48 +172,25 @@ func setupWebSocket(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 				log.Printf("worker: ws send error: %v", writeErr)
 			}
 		}
-		return nil
-	})
-	if err := ctx.Global().Set("__wsSend", sendFn.GetFunction(ctx)); err != nil {
-		return fmt.Errorf("setting __wsSend: %w", err)
-	}
+	}, false)
 
-	// __wsClose(code, reason) — closes the HTTP WebSocket connection.
-	closeFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		code := websocket.StatusNormalClosure
-		reason := ""
-		if len(args) >= 1 {
-			code = websocket.StatusCode(args[0].Int32())
-		}
-		if len(args) >= 2 {
-			reason = args[1].String()
-		}
-
-		reqIDVal, err := info.Context().Global().Get("__requestID")
-		if err != nil {
-			return nil
-		}
-		reqID, _ := strconv.ParseUint(reqIDVal.String(), 10, 64)
+	// __wsClose(reqIDStr, code, reason) — closes the HTTP WebSocket connection.
+	registerGoFunc(vm, "__wsClose", func(reqIDStr string, code int, reason string) {
+		reqID := parseReqID(reqIDStr)
 		state := getRequestState(reqID)
 		if state == nil || state.wsConn == nil {
-			return nil
+			return
 		}
 
 		state.wsMu.Lock()
 		defer state.wsMu.Unlock()
 		if !state.wsClosed {
 			state.wsClosed = true
-			_ = state.wsConn.Close(code, reason)
+			_ = state.wsConn.Close(websocket.StatusCode(code), reason)
 		}
-		return nil
-	})
-	if err := ctx.Global().Set("__wsClose", closeFn.GetFunction(ctx)); err != nil {
-		return fmt.Errorf("setting __wsClose: %w", err)
-	}
+	}, false)
 
-	// Evaluate the JS class definitions.
-	if _, err := ctx.RunScript(webSocketJS, "websocket.js"); err != nil {
+	if err := evalDiscard(vm, webSocketJS); err != nil {
 		return fmt.Errorf("evaluating websocket.js: %w", err)
 	}
 	return nil
@@ -241,27 +199,36 @@ func setupWebSocket(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 // WebSocketHandler holds references needed for WebSocket bridging after
 // the initial fetch handler returns a 101 response with a webSocket.
 type WebSocketHandler struct {
-	worker  *v8Worker
-	pool    *v8Pool
+	worker  *qjsWorker
+	pool    *qjsPool
 	reqID   uint64
 	timeout time.Duration
 }
 
+// wsMessage holds a single WebSocket message read from the HTTP connection.
+type wsMessage struct {
+	typ  websocket.MessageType
+	data []byte
+}
+
 // Bridge starts the WebSocket message bridge between the HTTP connection
-// and the V8 worker. This method blocks until the WebSocket connection closes
-// or the timeout is reached. The worker is returned to the pool when done.
+// and the quickjs worker. This method blocks until the WebSocket connection
+// closes or the timeout is reached. The worker is returned to the pool when done.
 func (wsh *WebSocketHandler) Bridge(ctx context.Context, httpConn *websocket.Conn) {
+	vm := wsh.worker.vm
+
 	defer func() {
 		// Dispatch close event to the server WebSocket.
-		_, _ = wsh.worker.ctx.RunScript(`
+		_ = evalDiscard(vm, `
 			if (globalThis.__ws_active_server) {
 				globalThis.__ws_active_server._dispatch('close', {
 					code: 1000, reason: '', wasClean: true
 				});
 				delete globalThis.__ws_active_server;
 			}
-		`, "ws_cleanup.js")
-		wsh.worker.ctx.PerformMicrotaskCheckpoint()
+		`)
+		// Microtask checkpoint.
+		executePendingJobs(vm)
 
 		// Clean up request state and return worker to pool.
 		clearRequestState(wsh.reqID)
@@ -273,10 +240,6 @@ func (wsh *WebSocketHandler) Bridge(ctx context.Context, httpConn *websocket.Con
 		return
 	}
 	state.wsConn = httpConn
-
-	w := wsh.worker
-	iso := w.iso
-	v8ctx := w.ctx
 
 	// Apply message size limit.
 	httpConn.SetReadLimit(maxWSMessageBytes)
@@ -298,57 +261,40 @@ func (wsh *WebSocketHandler) Bridge(ctx context.Context, httpConn *websocket.Con
 		}
 	}()
 
-	// Connection-level timeout.
 	connDeadline := time.After(wsh.timeout)
-
-	// Ping ticker to detect dead connections.
 	pingTicker := time.NewTicker(30 * time.Second)
 	defer pingTicker.Stop()
 
-	// Event pump on the V8 goroutine.
 	for {
 		select {
 		case msg, ok := <-incoming:
 			if !ok {
-				return // connection closed
+				return
 			}
-			// Dispatch message to the server WebSocket's handlers.
 			if msg.typ == websocket.MessageBinary {
-				// Binary message: base64-encode and convert to ArrayBuffer in JS.
 				b64 := base64.StdEncoding.EncodeToString(msg.data)
-				b64Val, _ := v8.NewValue(iso, b64)
-				_ = v8ctx.Global().Set("__ws_incoming_data", b64Val)
-				_, _ = v8ctx.RunScript(`
-					(function() {
-						var b64 = globalThis.__ws_incoming_data;
-						delete globalThis.__ws_incoming_data;
-						var binary = __b64ToBuffer(b64);
-						if (globalThis.__ws_active_server) {
-							globalThis.__ws_active_server._dispatch('message', { data: binary });
-						}
-					})();
-				`, "ws_dispatch_binary.js")
+				js := fmt.Sprintf(`(function() {
+					var b64 = %s;
+					var binary = __b64ToBuffer(b64);
+					if (globalThis.__ws_active_server) {
+						globalThis.__ws_active_server._dispatch('message', { data: binary });
+					}
+				})();`, jsEscape(b64))
+				_ = evalDiscard(vm, js)
 			} else {
-				// Text message: dispatch as string.
-				dataStr := string(msg.data)
-				dataVal, _ := v8.NewValue(iso, dataStr)
-				_ = v8ctx.Global().Set("__ws_incoming_data", dataVal)
-				_, _ = v8ctx.RunScript(`
-					(function() {
-						var data = globalThis.__ws_incoming_data;
-						delete globalThis.__ws_incoming_data;
-						if (globalThis.__ws_active_server) {
-							globalThis.__ws_active_server._dispatch('message', { data: data });
-						}
-					})();
-				`, "ws_dispatch.js")
+				js := fmt.Sprintf(`(function() {
+					var data = %s;
+					if (globalThis.__ws_active_server) {
+						globalThis.__ws_active_server._dispatch('message', { data: data });
+					}
+				})();`, jsEscape(string(msg.data)))
+				_ = evalDiscard(vm, js)
 			}
-			v8ctx.PerformMicrotaskCheckpoint()
+			executePendingJobs(vm)
 
-			// Fire any pending timers (for setTimeout in WS handlers).
-			if w.eventLoop.hasPending() {
+			if wsh.worker.eventLoop.hasPending() {
 				deadline := time.Now().Add(50 * time.Millisecond)
-				w.eventLoop.drain(iso, v8ctx, deadline)
+				wsh.worker.eventLoop.drain(vm, deadline)
 			}
 
 		case <-pingTicker.C:
@@ -356,7 +302,7 @@ func (wsh *WebSocketHandler) Bridge(ctx context.Context, httpConn *websocket.Con
 			err := httpConn.Ping(pingCtx)
 			cancel()
 			if err != nil {
-				return // connection dead, release worker
+				return
 			}
 
 		case <-connDeadline:
@@ -366,9 +312,4 @@ func (wsh *WebSocketHandler) Bridge(ctx context.Context, httpConn *websocket.Con
 			return
 		}
 	}
-}
-
-type wsMessage struct {
-	typ  websocket.MessageType
-	data []byte
 }

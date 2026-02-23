@@ -3,7 +3,7 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // textStreamsJS implements TextEncoderStream, TextDecoderStream, and
@@ -73,8 +73,8 @@ globalThis.IdentityTransformStream = IdentityTransformStream;
 
 // setupTextStreams evaluates the text stream polyfills.
 // Must run after setupStreams and setupWebAPIs (for TextEncoder/TextDecoder).
-func setupTextStreams(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(textStreamsJS, "textstreams.js"); err != nil {
+func setupTextStreams(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, textStreamsJS); err != nil {
 		return fmt.Errorf("evaluating textstreams.js: %w", err)
 	}
 	return nil

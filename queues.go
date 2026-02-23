@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // QueueMessageInput is the Go representation of a batch send item.
@@ -13,92 +13,54 @@ type QueueMessageInput struct {
 	ContentType string
 }
 
-// buildQueueBinding creates a JS object with async send/sendBatch methods
-// backed by the given QueueSender.
-func buildQueueBinding(iso *v8.Isolate, ctx *v8.Context, sender QueueSender) (*v8.Value, error) {
-	qObj, err := newJSObject(iso, ctx)
-	if err != nil {
-		return nil, fmt.Errorf("creating Queue object: %w", err)
-	}
-
-	// send(body, options?) -> Promise<void>
-	_ = qObj.Set("send", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "Queue.send requires a body argument")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+// setupQueues registers global Go functions for Queue operations.
+func setupQueues(vm *quickjs.VM, el *eventLoop) error {
+	// __queue_send(reqIDStr, bindingName, body, contentType) -> "" or error
+	err := registerGoFunc(vm, "__queue_send", func(reqIDStr, bindingName, body, contentType string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.Queues == nil {
+			return "", fmt.Errorf("Queues not available")
 		}
-
-		body := args[0].String()
-		contentType := "json"
-
-		if len(args) > 1 && args[1].IsObject() {
-			_ = ctx.Global().Set("__tmp_queue_opts", args[1])
-			optsResult, err := ctx.RunScript(`(function() {
-				var o = globalThis.__tmp_queue_opts;
-				delete globalThis.__tmp_queue_opts;
-				return o.contentType !== undefined && o.contentType !== null ? String(o.contentType) : "json";
-			})()`, "queue_opts.js")
-			if err == nil {
-				contentType = optsResult.String()
-			}
+		sender, ok := state.env.Queues[bindingName]
+		if !ok {
+			return "", fmt.Errorf("Queue binding %q not found", bindingName)
 		}
 
 		if _, err := sender.Send(body, contentType); err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+			return "", err
 		}
-		resolver.Resolve(v8.Undefined(iso))
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
+		return "", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __queue_send: %w", err)
+	}
 
-	// sendBatch(messages) -> Promise<void>
-	_ = qObj.Set("sendBatch", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "Queue.sendBatch requires a messages argument")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+	// __queue_send_batch(reqIDStr, bindingName, messagesJSON) -> "" or error
+	err = registerGoFunc(vm, "__queue_send_batch", func(reqIDStr, bindingName, messagesJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.Queues == nil {
+			return "", fmt.Errorf("Queues not available")
 		}
-
-		// Extract messages array via JS JSON serialization.
-		_ = ctx.Global().Set("__tmp_queue_batch", args[0])
-		batchResult, err := ctx.RunScript(`(function() {
-			var msgs = globalThis.__tmp_queue_batch;
-			delete globalThis.__tmp_queue_batch;
-			if (!Array.isArray(msgs)) return JSON.stringify([]);
-			return JSON.stringify(msgs.map(function(m) {
-				return {
-					body: typeof m.body === 'string' ? m.body : JSON.stringify(m.body),
-					contentType: m.contentType || "json"
-				};
-			}));
-		})()`, "queue_batch.js")
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "failed to parse batch messages: "+err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+		sender, ok := state.env.Queues[bindingName]
+		if !ok {
+			return "", fmt.Errorf("Queue binding %q not found", bindingName)
 		}
 
 		var inputs []QueueMessageInput
-		if err := json.Unmarshal([]byte(batchResult.String()), &inputs); err != nil {
-			errVal, _ := v8.NewValue(iso, "failed to unmarshal batch messages: "+err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+		if err := json.Unmarshal([]byte(messagesJSON), &inputs); err != nil {
+			return "", fmt.Errorf("invalid messages JSON: %w", err)
 		}
 
 		if _, err := sender.SendBatch(inputs); err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+			return "", err
 		}
-		resolver.Resolve(v8.Undefined(iso))
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
+		return "", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __queue_send_batch: %w", err)
+	}
 
-	return qObj.Value, nil
+	return nil
 }

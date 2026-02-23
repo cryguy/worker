@@ -3,7 +3,7 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // byobReaderJS adds ReadableStreamBYOBReader and ReadableByteStreamController
@@ -195,8 +195,8 @@ globalThis.ReadableByteStreamController = ReadableByteStreamController;
 
 // setupBYOBReader registers ReadableStreamBYOBReader and
 // ReadableByteStreamController, monkey-patching the existing ReadableStream.
-func setupBYOBReader(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(byobReaderJS, "byob_reader.js"); err != nil {
+func setupBYOBReader(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, byobReaderJS); err != nil {
 		return fmt.Errorf("evaluating byob_reader.js: %w", err)
 	}
 	return nil

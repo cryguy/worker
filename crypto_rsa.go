@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"math/big"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // cryptoHashFromAlgo returns the crypto.Hash for the given algorithm name.
@@ -107,7 +107,7 @@ subtle.verify = async function(algorithm, key, signature, data) {
 	if (algo.name === 'RSASSA-PKCS1-v1_5' || algo.name === 'RSA-PSS') {
 		var hashName = key.algorithm.hash ? (typeof key.algorithm.hash === 'string' ? key.algorithm.hash : key.algorithm.hash.name) : '';
 		var saltLength = algo.saltLength || 0;
-		return __cryptoVerifyRSA(algo.name, key._id, __bufferSourceToB64(signature), __bufferSourceToB64(data), hashName, saltLength);
+		return !!__cryptoVerifyRSA(algo.name, key._id, __bufferSourceToB64(signature), __bufferSourceToB64(data), hashName, saltLength);
 	}
 	return _prevVerify.call(this, algorithm, key, signature, data);
 };
@@ -213,38 +213,28 @@ subtle.generateKey = async function(algorithm, extractable, usages) {
 
 // setupCryptoRSA registers RSA Go functions and evaluates the JS patches.
 // Must run after setupCryptoExt.
-func setupCryptoRSA(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupCryptoRSA(vm *quickjs.VM, _ *eventLoop) error {
 	// __cryptoSignRSA(algoName, keyID, dataB64, hashAlgo, saltLength) -> sigB64
-	_ = ctx.Global().Set("__cryptoSignRSA", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 5 {
-			return throwError(iso, "signRSA requires 5 argument(s)")
-		}
-		algoName := args[0].String()
-		keyID := args[1].Integer()
-		dataB64 := args[2].String()
-		hashAlgo := args[3].String()
-		saltLength := int(args[4].Int32())
-
+	registerGoFunc(vm, "__cryptoSignRSA", func(algoName string, keyID int, dataB64, hashAlgo string, saltLength int) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "signRSA: invalid base64")
+			return "", fmt.Errorf("signRSA: invalid base64")
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "signRSA: key not found")
+			return "", fmt.Errorf("signRSA: key not found")
 		}
 
 		privKey, ok := entry.ecKey.(*rsa.PrivateKey)
 		if !ok {
-			return throwError(iso, "signRSA: key is not an RSA private key")
+			return "", fmt.Errorf("signRSA: key is not an RSA private key")
 		}
 
 		ch := cryptoHashFromAlgo(hashAlgo)
 		if ch == 0 {
-			return throwError(iso, fmt.Sprintf("signRSA: unsupported hash %q", hashAlgo))
+			return "", fmt.Errorf("signRSA: unsupported hash %q", hashAlgo)
 		}
 		hashFn := hashFuncFromAlgo(hashAlgo)
 		h := hashFn()
@@ -262,42 +252,30 @@ func setupCryptoRSA(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			}
 			sig, err = rsa.SignPSS(rand.Reader, privKey, ch, digest, opts)
 		default:
-			return throwError(iso, fmt.Sprintf("signRSA: unsupported algorithm %q", algoName))
+			return "", fmt.Errorf("signRSA: unsupported algorithm %q", algoName)
 		}
 
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("signRSA: %s", err.Error()))
+			return "", fmt.Errorf("signRSA: %s", err.Error())
 		}
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(sig))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(sig), nil
+	}, false)
 
 	// __cryptoVerifyRSA(algoName, keyID, sigB64, dataB64, hashAlgo, saltLength) -> bool
-	_ = ctx.Global().Set("__cryptoVerifyRSA", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 6 {
-			return throwError(iso, "verifyRSA requires 6 argument(s)")
-		}
-		algoName := args[0].String()
-		keyID := args[1].Integer()
-		sigB64 := args[2].String()
-		dataB64 := args[3].String()
-		hashAlgo := args[4].String()
-		saltLength := int(args[5].Int32())
-
+	registerGoFunc(vm, "__cryptoVerifyRSA", func(algoName string, keyID int, sigB64, dataB64, hashAlgo string, saltLength int) (int, error) {
 		sig, err := base64.StdEncoding.DecodeString(sigB64)
 		if err != nil {
-			return throwError(iso, "verifyRSA: invalid signature base64")
+			return 0, fmt.Errorf("verifyRSA: invalid signature base64")
 		}
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "verifyRSA: invalid data base64")
+			return 0, fmt.Errorf("verifyRSA: invalid data base64")
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "verifyRSA: key not found")
+			return 0, fmt.Errorf("verifyRSA: key not found")
 		}
 
 		var pubKey *rsa.PublicKey
@@ -307,12 +285,12 @@ func setupCryptoRSA(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		case *rsa.PrivateKey:
 			pubKey = &k.PublicKey
 		default:
-			return throwError(iso, "verifyRSA: key is not an RSA key")
+			return 0, fmt.Errorf("verifyRSA: key is not an RSA key")
 		}
 
 		ch := cryptoHashFromAlgo(hashAlgo)
 		if ch == 0 {
-			return throwError(iso, fmt.Sprintf("verifyRSA: unsupported hash %q", hashAlgo))
+			return 0, fmt.Errorf("verifyRSA: unsupported hash %q", hashAlgo)
 		}
 		hashFn := hashFuncFromAlgo(hashAlgo)
 		h := hashFn()
@@ -329,40 +307,31 @@ func setupCryptoRSA(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			}
 			err = rsa.VerifyPSS(pubKey, ch, digest, sig, opts)
 		default:
-			return throwError(iso, fmt.Sprintf("verifyRSA: unsupported algorithm %q", algoName))
+			return 0, fmt.Errorf("verifyRSA: unsupported algorithm %q", algoName)
 		}
 
-		val, _ := v8.NewValue(iso, err == nil)
-		return val
-	}).GetFunction(ctx))
+		return boolToInt(err == nil), nil
+	}, false)
 
 	// __cryptoEncryptRSA(keyID, dataB64, labelB64) -> ctB64
-	_ = ctx.Global().Set("__cryptoEncryptRSA", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "encryptRSA requires 3 argument(s)")
-		}
-		keyID := args[0].Integer()
-		dataB64 := args[1].String()
-		labelB64 := args[2].String()
-
+	registerGoFunc(vm, "__cryptoEncryptRSA", func(keyID int, dataB64, labelB64 string) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "encryptRSA: invalid base64")
+			return "", fmt.Errorf("encryptRSA: invalid base64")
 		}
 
 		var label []byte
 		if labelB64 != "" {
 			label, err = base64.StdEncoding.DecodeString(labelB64)
 			if err != nil {
-				return throwError(iso, "encryptRSA: invalid label base64")
+				return "", fmt.Errorf("encryptRSA: invalid label base64")
 			}
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "encryptRSA: key not found")
+			return "", fmt.Errorf("encryptRSA: key not found")
 		}
 
 		var pubKey *rsa.PublicKey
@@ -372,7 +341,7 @@ func setupCryptoRSA(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		case *rsa.PrivateKey:
 			pubKey = &k.PublicKey
 		default:
-			return throwError(iso, "encryptRSA: key is not an RSA key")
+			return "", fmt.Errorf("encryptRSA: key is not an RSA key")
 		}
 
 		hashAlgo := entry.hashAlgo
@@ -381,49 +350,40 @@ func setupCryptoRSA(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		}
 		hashFn := hashFuncFromAlgo(hashAlgo)
 		if hashFn == nil {
-			return throwError(iso, fmt.Sprintf("encryptRSA: unsupported hash %q", hashAlgo))
+			return "", fmt.Errorf("encryptRSA: unsupported hash %q", hashAlgo)
 		}
 
 		ct, err := rsa.EncryptOAEP(hashFn(), rand.Reader, pubKey, data, label)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("encryptRSA: %s", err.Error()))
+			return "", fmt.Errorf("encryptRSA: %s", err.Error())
 		}
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(ct))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(ct), nil
+	}, false)
 
 	// __cryptoDecryptRSA(keyID, ctB64, labelB64) -> ptB64
-	_ = ctx.Global().Set("__cryptoDecryptRSA", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "decryptRSA requires 3 argument(s)")
-		}
-		keyID := args[0].Integer()
-		ctB64 := args[1].String()
-		labelB64 := args[2].String()
-
+	registerGoFunc(vm, "__cryptoDecryptRSA", func(keyID int, ctB64, labelB64 string) (string, error) {
 		ct, err := base64.StdEncoding.DecodeString(ctB64)
 		if err != nil {
-			return throwError(iso, "decryptRSA: invalid base64")
+			return "", fmt.Errorf("decryptRSA: invalid base64")
 		}
 
 		var label []byte
 		if labelB64 != "" {
 			label, err = base64.StdEncoding.DecodeString(labelB64)
 			if err != nil {
-				return throwError(iso, "decryptRSA: invalid label base64")
+				return "", fmt.Errorf("decryptRSA: invalid label base64")
 			}
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "decryptRSA: key not found")
+			return "", fmt.Errorf("decryptRSA: key not found")
 		}
 
 		privKey, ok := entry.ecKey.(*rsa.PrivateKey)
 		if !ok {
-			return throwError(iso, "decryptRSA: key is not an RSA private key")
+			return "", fmt.Errorf("decryptRSA: key is not an RSA private key")
 		}
 
 		hashAlgo := entry.hashAlgo
@@ -432,33 +392,21 @@ func setupCryptoRSA(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		}
 		hashFn := hashFuncFromAlgo(hashAlgo)
 		if hashFn == nil {
-			return throwError(iso, fmt.Sprintf("decryptRSA: unsupported hash %q", hashAlgo))
+			return "", fmt.Errorf("decryptRSA: unsupported hash %q", hashAlgo)
 		}
 
 		pt, err := rsa.DecryptOAEP(hashFn(), rand.Reader, privKey, ct, label)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("decryptRSA: %s", err.Error()))
+			return "", fmt.Errorf("decryptRSA: %s", err.Error())
 		}
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(pt))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(pt), nil
+	}, false)
 
 	// __cryptoGenerateKeyRSA(algoName, modulusLength, hashAlgo, publicExponent, extractable) -> JSON
-	_ = ctx.Global().Set("__cryptoGenerateKeyRSA", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 5 {
-			return throwError(iso, "generateKeyRSA requires 5 argument(s)")
-		}
-		algoName := args[0].String()
-		modulusLength := int(args[1].Int32())
-		hashAlgo := args[2].String()
-		pubExp := int(args[3].Int32())
-		extractableVal := args[4].Boolean()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoGenerateKeyRSA", func(algoName string, modulusLength int, hashAlgo string, pubExp int, extractableVal bool) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		if pubExp == 0 {
@@ -467,19 +415,16 @@ func setupCryptoRSA(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 
 		// Reject non-standard exponents (H10 security fix)
 		if pubExp != 65537 {
-			val, _ := v8.NewValue(iso, `{"error":"only publicExponent 65537 is supported"}`)
-			return val
+			return `{"error":"only publicExponent 65537 is supported"}`, nil
 		}
 
 		if modulusLength != 2048 && modulusLength != 3072 && modulusLength != 4096 {
-			val, _ := v8.NewValue(iso, `{"error":"modulusLength must be 2048, 3072, or 4096"}`)
-			return val
+			return `{"error":"modulusLength must be 2048, 3072, or 4096"}`, nil
 		}
 
 		privKey, err := rsa.GenerateKey(rand.Reader, modulusLength)
 		if err != nil {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()))
-			return val
+			return fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()), nil
 		}
 
 		privID := importCryptoKeyFull(reqID, &cryptoKeyEntry{
@@ -491,109 +436,82 @@ func setupCryptoRSA(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			keyType: "public", ecKey: &privKey.PublicKey, extractable: extractableVal,
 		})
 
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID))
-		return val
-	}).GetFunction(ctx))
+		return fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID), nil
+	}, false)
 
 	// __cryptoImportKeyRSA(format, dataStr, algoName, hashAlgo, extractable) -> JSON
-	_ = ctx.Global().Set("__cryptoImportKeyRSA", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 5 {
-			return throwError(iso, "importKeyRSA requires 5 argument(s)")
-		}
-		format := args[0].String()
-		dataStr := args[1].String()
-		algoName := args[2].String()
-		hashAlgo := args[3].String()
-		extractableVal := args[4].Boolean()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoImportKeyRSA", func(format, dataStr, algoName, hashAlgo string, extractableVal bool) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		switch format {
 		case "jwk":
-			return importRSAJWK(iso, reqID, dataStr, algoName, hashAlgo, extractableVal)
+			return importRSAJWK(reqID, dataStr, algoName, hashAlgo, extractableVal)
 		case "spki":
-			return importRSASPKI(iso, reqID, dataStr, algoName, hashAlgo, extractableVal)
+			return importRSASPKI(reqID, dataStr, algoName, hashAlgo, extractableVal)
 		case "pkcs8":
-			return importRSAPKCS8(iso, reqID, dataStr, algoName, hashAlgo, extractableVal)
+			return importRSAPKCS8(reqID, dataStr, algoName, hashAlgo, extractableVal)
 		default:
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"unsupported format %q for RSA"}`, format))
-			return val
+			return fmt.Sprintf(`{"error":"unsupported format %q for RSA"}`, format), nil
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// __cryptoExportKeyRSA(keyID, format, algoName, hashAlgo) -> base64 or JSON string
-	_ = ctx.Global().Set("__cryptoExportKeyRSA", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "exportKeyRSA requires 4 argument(s)")
-		}
-		keyID := args[0].Integer()
-		format := args[1].String()
-		algoName := args[2].String()
-		hashAlgo := args[3].String()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoExportKeyRSA", func(keyID int, format, algoName, hashAlgo string) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "exportKeyRSA: key not found")
+			return "", fmt.Errorf("exportKeyRSA: key not found")
 		}
 		if !entry.extractable {
-			return throwError(iso, "exportKey: key is not extractable")
+			return "", fmt.Errorf("exportKey: key is not extractable")
 		}
 
 		switch format {
 		case "jwk":
-			return exportRSAJWK(iso, entry, algoName, hashAlgo)
+			return exportRSAJWK(entry, algoName, hashAlgo)
 		case "spki":
-			return exportRSASPKI(iso, entry)
+			return exportRSASPKI(entry)
 		case "pkcs8":
-			return exportRSAPKCS8(iso, entry)
+			return exportRSAPKCS8(entry)
 		default:
-			return throwError(iso, fmt.Sprintf("exportKeyRSA: unsupported format %q", format))
+			return "", fmt.Errorf("exportKeyRSA: unsupported format %q", format)
 		}
-	}).GetFunction(ctx))
+	}, false)
 
-	if _, err := ctx.RunScript(cryptoRSAJS, "crypto_rsa.js"); err != nil {
+	if err := evalDiscard(vm, cryptoRSAJS); err != nil {
 		return fmt.Errorf("evaluating crypto_rsa.js: %w", err)
 	}
 	return nil
 }
 
 // importRSAJWK imports an RSA key from JWK format.
-func importRSAJWK(iso *v8.Isolate, reqID uint64, jwkJSON, algoName, hashAlgo string, extractable bool) *v8.Value {
+func importRSAJWK(reqID uint64, jwkJSON, algoName, hashAlgo string, extractable bool) (string, error) {
 	var jwk map[string]interface{}
 	if err := json.Unmarshal([]byte(jwkJSON), &jwk); err != nil {
-		val, _ := v8.NewValue(iso, `{"error":"invalid JWK JSON"}`)
-		return val
+		return `{"error":"invalid JWK JSON"}`, nil
 	}
 
 	kty, _ := jwk["kty"].(string)
 	if kty != "RSA" {
-		val, _ := v8.NewValue(iso, `{"error":"JWK kty must be RSA"}`)
-		return val
+		return `{"error":"JWK kty must be RSA"}`, nil
 	}
 
 	// Decode n and e (required for both public and private keys)
 	nB64, _ := jwk["n"].(string)
 	eB64, _ := jwk["e"].(string)
 	if nB64 == "" || eB64 == "" {
-		val, _ := v8.NewValue(iso, `{"error":"JWK missing required n or e field"}`)
-		return val
+		return `{"error":"JWK missing required n or e field"}`, nil
 	}
 	nBytes, err := base64.RawURLEncoding.DecodeString(nB64)
 	if err != nil {
-		val, _ := v8.NewValue(iso, `{"error":"invalid JWK n value"}`)
-		return val
+		return `{"error":"invalid JWK n value"}`, nil
 	}
 	eBytes, err := base64.RawURLEncoding.DecodeString(eB64)
 	if err != nil {
-		val, _ := v8.NewValue(iso, `{"error":"invalid JWK e value"}`)
-		return val
+		return `{"error":"invalid JWK e value"}`, nil
 	}
 
 	n := new(big.Int).SetBytes(nBytes)
@@ -606,8 +524,7 @@ func importRSAJWK(iso *v8.Isolate, reqID uint64, jwkJSON, algoName, hashAlgo str
 	if hasD && dB64 != "" {
 		dBytes, err := base64.RawURLEncoding.DecodeString(dB64)
 		if err != nil {
-			val, _ := v8.NewValue(iso, `{"error":"invalid JWK d value"}`)
-			return val
+			return `{"error":"invalid JWK d value"}`, nil
 		}
 		privKey := &rsa.PrivateKey{
 			PublicKey: *pubKey,
@@ -633,84 +550,74 @@ func importRSAJWK(iso *v8.Isolate, reqID uint64, jwkJSON, algoName, hashAlgo str
 			algoName: normalizeAlgo(algoName), hashAlgo: hashAlgo,
 			keyType: "private", ecKey: privKey, extractable: extractable,
 		})
-		val, _ := v8.NewValue(iso, fmt.Sprintf(
+		return fmt.Sprintf(
 			`{"keyId":%d,"keyType":"private","modulusLength":%d,"publicExponent":%d}`,
-			id, pubKey.N.BitLen(), e))
-		return val
+			id, pubKey.N.BitLen(), e), nil
 	}
 
 	id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 		algoName: normalizeAlgo(algoName), hashAlgo: hashAlgo,
 		keyType: "public", ecKey: pubKey, extractable: extractable,
 	})
-	val, _ := v8.NewValue(iso, fmt.Sprintf(
+	return fmt.Sprintf(
 		`{"keyId":%d,"keyType":"public","modulusLength":%d,"publicExponent":%d}`,
-		id, pubKey.N.BitLen(), e))
-	return val
+		id, pubKey.N.BitLen(), e), nil
 }
 
 // importRSASPKI imports an RSA public key from SPKI (DER) format.
-func importRSASPKI(iso *v8.Isolate, reqID uint64, dataB64, algoName, hashAlgo string, extractable bool) *v8.Value {
+func importRSASPKI(reqID uint64, dataB64, algoName, hashAlgo string, extractable bool) (string, error) {
 	derBytes, err := base64.StdEncoding.DecodeString(dataB64)
 	if err != nil {
-		val, _ := v8.NewValue(iso, `{"error":"invalid base64"}`)
-		return val
+		return `{"error":"invalid base64"}`, nil
 	}
 
 	pub, err := x509.ParsePKIXPublicKey(derBytes)
 	if err != nil {
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"invalid SPKI: %s"}`, err.Error()))
-		return val
+		return fmt.Sprintf(`{"error":"invalid SPKI: %s"}`, err.Error()), nil
 	}
 
 	rsaPub, ok := pub.(*rsa.PublicKey)
 	if !ok {
-		val, _ := v8.NewValue(iso, `{"error":"SPKI key is not RSA"}`)
-		return val
+		return `{"error":"SPKI key is not RSA"}`, nil
 	}
 
 	id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 		algoName: normalizeAlgo(algoName), hashAlgo: hashAlgo,
 		keyType: "public", ecKey: rsaPub, extractable: extractable,
 	})
-	val, _ := v8.NewValue(iso, fmt.Sprintf(
+	return fmt.Sprintf(
 		`{"keyId":%d,"keyType":"public","modulusLength":%d,"publicExponent":%d}`,
-		id, rsaPub.N.BitLen(), rsaPub.E))
-	return val
+		id, rsaPub.N.BitLen(), rsaPub.E), nil
 }
 
 // importRSAPKCS8 imports an RSA private key from PKCS#8 (DER) format.
-func importRSAPKCS8(iso *v8.Isolate, reqID uint64, dataB64, algoName, hashAlgo string, extractable bool) *v8.Value {
+func importRSAPKCS8(reqID uint64, dataB64, algoName, hashAlgo string, extractable bool) (string, error) {
 	derBytes, err := base64.StdEncoding.DecodeString(dataB64)
 	if err != nil {
-		val, _ := v8.NewValue(iso, `{"error":"invalid base64"}`)
-		return val
+		return `{"error":"invalid base64"}`, nil
 	}
 
 	key, err := x509.ParsePKCS8PrivateKey(derBytes)
 	if err != nil {
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"invalid PKCS8: %s"}`, err.Error()))
-		return val
+		return fmt.Sprintf(`{"error":"invalid PKCS8: %s"}`, err.Error()), nil
 	}
 
 	rsaKey, ok := key.(*rsa.PrivateKey)
 	if !ok {
-		val, _ := v8.NewValue(iso, `{"error":"PKCS8 key is not RSA"}`)
-		return val
+		return `{"error":"PKCS8 key is not RSA"}`, nil
 	}
 
 	id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 		algoName: normalizeAlgo(algoName), hashAlgo: hashAlgo,
 		keyType: "private", ecKey: rsaKey, extractable: extractable,
 	})
-	val, _ := v8.NewValue(iso, fmt.Sprintf(
+	return fmt.Sprintf(
 		`{"keyId":%d,"keyType":"private","modulusLength":%d,"publicExponent":%d}`,
-		id, rsaKey.PublicKey.N.BitLen(), rsaKey.PublicKey.E))
-	return val
+		id, rsaKey.PublicKey.N.BitLen(), rsaKey.PublicKey.E), nil
 }
 
 // exportRSAJWK exports an RSA key to JWK format.
-func exportRSAJWK(iso *v8.Isolate, entry *cryptoKeyEntry, algoName, hashAlgo string) *v8.Value {
+func exportRSAJWK(entry *cryptoKeyEntry, algoName, hashAlgo string) (string, error) {
 	jwk := map[string]interface{}{"kty": "RSA"}
 
 	alg := rsaJWKAlg(algoName, hashAlgo)
@@ -738,16 +645,15 @@ func exportRSAJWK(iso *v8.Isolate, entry *cryptoKeyEntry, algoName, hashAlgo str
 		}
 		jwk["key_ops"] = []string{"sign", "decrypt"}
 	default:
-		return throwError(iso, "exportKeyRSA: not an RSA key")
+		return "", fmt.Errorf("exportKeyRSA: not an RSA key")
 	}
 
 	data, _ := json.Marshal(jwk)
-	val, _ := v8.NewValue(iso, string(data))
-	return val
+	return string(data), nil
 }
 
 // exportRSASPKI exports an RSA public key to SPKI (DER) format.
-func exportRSASPKI(iso *v8.Isolate, entry *cryptoKeyEntry) *v8.Value {
+func exportRSASPKI(entry *cryptoKeyEntry) (string, error) {
 	var pubKey *rsa.PublicKey
 	switch k := entry.ecKey.(type) {
 	case *rsa.PublicKey:
@@ -755,28 +661,26 @@ func exportRSASPKI(iso *v8.Isolate, entry *cryptoKeyEntry) *v8.Value {
 	case *rsa.PrivateKey:
 		pubKey = &k.PublicKey
 	default:
-		return throwError(iso, "exportKeyRSA: not an RSA key")
+		return "", fmt.Errorf("exportKeyRSA: not an RSA key")
 	}
 
 	derBytes, err := x509.MarshalPKIXPublicKey(pubKey)
 	if err != nil {
-		return throwError(iso, fmt.Sprintf("exportKeyRSA: %s", err.Error()))
+		return "", fmt.Errorf("exportKeyRSA: %s", err.Error())
 	}
-	val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(derBytes))
-	return val
+	return base64.StdEncoding.EncodeToString(derBytes), nil
 }
 
 // exportRSAPKCS8 exports an RSA private key to PKCS#8 (DER) format.
-func exportRSAPKCS8(iso *v8.Isolate, entry *cryptoKeyEntry) *v8.Value {
+func exportRSAPKCS8(entry *cryptoKeyEntry) (string, error) {
 	privKey, ok := entry.ecKey.(*rsa.PrivateKey)
 	if !ok {
-		return throwError(iso, "exportKeyRSA: not an RSA private key")
+		return "", fmt.Errorf("exportKeyRSA: not an RSA private key")
 	}
 
 	derBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
 	if err != nil {
-		return throwError(iso, fmt.Sprintf("exportKeyRSA: %s", err.Error()))
+		return "", fmt.Errorf("exportKeyRSA: %s", err.Error())
 	}
-	val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(derBytes))
-	return val
+	return base64.StdEncoding.EncodeToString(derBytes), nil
 }

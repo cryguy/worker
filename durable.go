@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // KVPair represents an ordered key-value pair returned by List.
@@ -34,428 +34,241 @@ func durableObjectUniqueID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// buildDurableObjectBinding creates a DurableObjectNamespace JS object with
-// idFromName, idFromString, newUniqueId, and get methods.
-func buildDurableObjectBinding(iso *v8.Isolate, ctx *v8.Context, store DurableObjectStore, namespace string) (*v8.Value, error) {
-	ns, err := newJSObject(iso, ctx)
+// setupDurableObjects registers global Go functions for Durable Object operations.
+func setupDurableObjects(vm *quickjs.VM, el *eventLoop) error {
+	// __do_id_from_name(namespace, name) -> hex ID
+	err := registerGoFunc(vm, "__do_id_from_name", func(namespace, name string) (string, error) {
+		return durableObjectID(namespace, name), nil
+	}, false)
 	if err != nil {
-		return nil, fmt.Errorf("creating DO namespace object: %w", err)
+		return fmt.Errorf("registering __do_id_from_name: %w", err)
 	}
 
-	// Helper: build a DurableObjectId JS object from a hex string.
-	buildIdObject := func(hexID string) (*v8.Object, error) {
-		idObj, err := newJSObject(iso, ctx)
-		if err != nil {
-			return nil, err
-		}
-		hexVal, _ := v8.NewValue(iso, hexID)
-		_ = idObj.Set("_hex", hexVal)
-
-		_ = idObj.Set("toString", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-			self := info.This()
-			h, _ := self.Get("_hex")
-			return h
-		}).GetFunction(ctx))
-
-		_ = idObj.Set("equals", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-			args := info.Args()
-			if len(args) == 0 {
-				val, _ := v8.NewValue(iso, false)
-				return val
-			}
-			self := info.This()
-			selfHex, _ := self.Get("_hex")
-			otherObj := args[0].Object()
-			if otherObj == nil {
-				val, _ := v8.NewValue(iso, false)
-				return val
-			}
-			otherHex, err := otherObj.Get("_hex")
-			if err != nil {
-				val, _ := v8.NewValue(iso, false)
-				return val
-			}
-			val, _ := v8.NewValue(iso, selfHex.String() == otherHex.String())
-			return val
-		}).GetFunction(ctx))
-
-		return idObj, nil
-	}
-
-	// Helper: build a DurableObjectStub from an id object.
-	buildStub := func(hexID string, idObj *v8.Object) (*v8.Object, error) {
-		stub, err := newJSObject(iso, ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		_ = stub.Set("id", idObj)
-
-		// stub.fetch() returns Response("ok")
-		_ = stub.Set("fetch", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-			resolver, _ := v8.NewPromiseResolver(ctx)
-			resp, err := ctx.RunScript(`new Response("ok")`, "do_stub_fetch.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			resolver.Resolve(resp)
-			return resolver.GetPromise().Value
-		}).GetFunction(ctx))
-
-		// Build storage object
-		storage, err := buildDurableObjectStorage(iso, ctx, store, namespace, hexID)
-		if err != nil {
-			return nil, err
-		}
-		_ = stub.Set("storage", storage)
-
-		return stub, nil
-	}
-
-	// namespace.idFromName(name) -> DurableObjectId
-	_ = ns.Set("idFromName", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		name := args[0].String()
-		hexID := durableObjectID(namespace, name)
-		idObj, err := buildIdObject(hexID)
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		return idObj.Value
-	}).GetFunction(ctx))
-
-	// namespace.idFromString(hex) -> DurableObjectId
-	_ = ns.Set("idFromString", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		hexID := args[0].String()
-		idObj, err := buildIdObject(hexID)
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		return idObj.Value
-	}).GetFunction(ctx))
-
-	// namespace.newUniqueId() -> DurableObjectId
-	_ = ns.Set("newUniqueId", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		hexID, err := durableObjectUniqueID()
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		idObj, err := buildIdObject(hexID)
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		return idObj.Value
-	}).GetFunction(ctx))
-
-	// namespace.get(id) -> DurableObjectStub
-	_ = ns.Set("get", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		idObj := args[0].Object()
-		if idObj == nil {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		hexVal, err := idObj.Get("_hex")
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		hexID := hexVal.String()
-		stub, err := buildStub(hexID, idObj)
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "")
-			return errVal
-		}
-		return stub.Value
-	}).GetFunction(ctx))
-
-	return ns.Value, nil
-}
-
-// buildDurableObjectStorage creates the storage object with get/put/delete/deleteAll/list.
-func buildDurableObjectStorage(iso *v8.Isolate, ctx *v8.Context, store DurableObjectStore, namespace, objectID string) (*v8.Object, error) {
-	stor, err := newJSObject(iso, ctx)
+	// __do_unique_id() -> random hex ID
+	err = registerGoFunc(vm, "__do_unique_id", func() (string, error) {
+		return durableObjectUniqueID()
+	}, false)
 	if err != nil {
-		return nil, fmt.Errorf("creating DO storage object: %w", err)
+		return fmt.Errorf("registering __do_unique_id: %w", err)
 	}
 
-	// storage.get(key) or storage.get([keys]) -> Promise
-	_ = stor.Set("get", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "storage.get requires a key argument")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+	// __do_storage_get(reqIDStr, namespace, objectID, key) -> JSON value or "null"
+	err = registerGoFunc(vm, "__do_storage_get", func(reqIDStr, namespace, objectID, key string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.DurableObjects == nil {
+			return "null", nil
+		}
+		store, ok := state.env.DurableObjects[namespace]
+		if !ok {
+			return "null", nil
 		}
 
-		arg := args[0]
-		if arg.IsArray() {
-			// Extract keys via JS
-			_ = ctx.Global().Set("__tmp_do_keys", arg)
-			keysResult, err := ctx.RunScript(`(function() {
-				var a = globalThis.__tmp_do_keys;
-				delete globalThis.__tmp_do_keys;
-				return JSON.stringify(Array.from(a));
-			})()`, "do_get_keys.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			var keys []string
-			_ = json.Unmarshal([]byte(keysResult.String()), &keys)
-			result, err := store.GetMulti(namespace, objectID, keys)
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			// Return as a Map via JS
-			data, _ := json.Marshal(result)
-			jsResult, err := ctx.RunScript(fmt.Sprintf(`(function() {
-				var obj = JSON.parse(%q);
-				var m = new Map();
-				for (var k in obj) { m.set(k, JSON.parse(obj[k])); }
-				return m;
-			})()`, string(data)), "do_get_multi_result.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			resolver.Resolve(jsResult)
-		} else {
-			key := arg.String()
-			val, err := store.Get(namespace, objectID, key)
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			if val == "" {
-				resolver.Resolve(v8.Null(iso))
-			} else {
-				// Parse stored JSON value back to JS value via JSON.parse
-				jsVal, err := ctx.RunScript(fmt.Sprintf("JSON.parse(%q)", val), "do_get_val.js")
-				if err != nil {
-					// If not valid JSON, return as string
-					strVal, _ := v8.NewValue(iso, val)
-					resolver.Resolve(strVal)
-				} else {
-					resolver.Resolve(jsVal)
-				}
-			}
+		val, err := store.Get(namespace, objectID, key)
+		if err != nil {
+			return "", err
 		}
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
+		if val == "" {
+			return "null", nil
+		}
+		return val, nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __do_storage_get: %w", err)
+	}
 
-	// storage.put(key, value) or storage.put(entries) -> Promise
-	_ = stor.Set("put", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "storage.put requires arguments")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+	// __do_storage_get_multi(reqIDStr, namespace, objectID, keysJSON) -> JSON map
+	err = registerGoFunc(vm, "__do_storage_get_multi", func(reqIDStr, namespace, objectID, keysJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.DurableObjects == nil {
+			return "{}", nil
+		}
+		store, ok := state.env.DurableObjects[namespace]
+		if !ok {
+			return "{}", nil
 		}
 
-		if len(args) >= 2 {
-			// storage.put(key, value)
-			key := args[0].String()
-			// Serialize value to JSON via JS
-			_ = ctx.Global().Set("__tmp_do_put_val", args[1])
-			jsonResult, err := ctx.RunScript(`(function() {
-				var v = globalThis.__tmp_do_put_val;
-				delete globalThis.__tmp_do_put_val;
-				return JSON.stringify(v);
-			})()`, "do_put_serialize.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			valueJSON := jsonResult.String()
-			if err := store.Put(namespace, objectID, key, valueJSON); err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			resolver.Resolve(v8.Undefined(iso))
-		} else if args[0].IsObject() {
-			// storage.put(entries) - entries is an object {key: value, ...}
-			_ = ctx.Global().Set("__tmp_do_put_entries", args[0])
-			entriesResult, err := ctx.RunScript(`(function() {
-				var o = globalThis.__tmp_do_put_entries;
-				delete globalThis.__tmp_do_put_entries;
-				var result = {};
-				for (var k in o) {
-					if (o.hasOwnProperty(k)) result[k] = JSON.stringify(o[k]);
-				}
-				return JSON.stringify(result);
-			})()`, "do_put_entries.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			var entries map[string]string
-			if err := json.Unmarshal([]byte(entriesResult.String()), &entries); err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			if err := store.PutMulti(namespace, objectID, entries); err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			resolver.Resolve(v8.Undefined(iso))
-		} else {
-			errVal, _ := v8.NewValue(iso, "storage.put requires (key, value) or (entries)")
-			resolver.Reject(errVal)
-		}
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
-
-	// storage.delete(key) or storage.delete([keys]) -> Promise
-	_ = stor.Set("delete", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "storage.delete requires a key argument")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+		var keys []string
+		if err := json.Unmarshal([]byte(keysJSON), &keys); err != nil {
+			return "", fmt.Errorf("invalid keys JSON: %w", err)
 		}
 
-		arg := args[0]
-		if arg.IsArray() {
-			_ = ctx.Global().Set("__tmp_do_del_keys", arg)
-			keysResult, err := ctx.RunScript(`(function() {
-				var a = globalThis.__tmp_do_del_keys;
-				delete globalThis.__tmp_do_del_keys;
-				return JSON.stringify(Array.from(a));
-			})()`, "do_del_keys.js")
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			var keys []string
-			_ = json.Unmarshal([]byte(keysResult.String()), &keys)
-			count, err := store.DeleteMulti(namespace, objectID, keys)
-			if err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			countVal, _ := v8.NewValue(iso, int32(count))
-			resolver.Resolve(countVal)
-		} else {
-			key := arg.String()
-			if err := store.Delete(namespace, objectID, key); err != nil {
-				errVal, _ := v8.NewValue(iso, err.Error())
-				resolver.Reject(errVal)
-				return resolver.GetPromise().Value
-			}
-			boolVal, _ := v8.NewValue(iso, true)
-			resolver.Resolve(boolVal)
+		result, err := store.GetMulti(namespace, objectID, keys)
+		if err != nil {
+			return "", err
 		}
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
 
-	// storage.deleteAll() -> Promise
-	_ = stor.Set("deleteAll", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
+		data, _ := json.Marshal(result)
+		return string(data), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __do_storage_get_multi: %w", err)
+	}
+
+	// __do_storage_put(reqIDStr, namespace, objectID, key, valueJSON) -> "" or error
+	err = registerGoFunc(vm, "__do_storage_put", func(reqIDStr, namespace, objectID, key, valueJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.DurableObjects == nil {
+			return "", fmt.Errorf("DurableObjects not available")
+		}
+		store, ok := state.env.DurableObjects[namespace]
+		if !ok {
+			return "", fmt.Errorf("DurableObject namespace %q not found", namespace)
+		}
+
+		if err := store.Put(namespace, objectID, key, valueJSON); err != nil {
+			return "", err
+		}
+		return "", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __do_storage_put: %w", err)
+	}
+
+	// __do_storage_put_multi(reqIDStr, namespace, objectID, entriesJSON) -> "" or error
+	err = registerGoFunc(vm, "__do_storage_put_multi", func(reqIDStr, namespace, objectID, entriesJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.DurableObjects == nil {
+			return "", fmt.Errorf("DurableObjects not available")
+		}
+		store, ok := state.env.DurableObjects[namespace]
+		if !ok {
+			return "", fmt.Errorf("DurableObject namespace %q not found", namespace)
+		}
+
+		var entries map[string]string
+		if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
+			return "", fmt.Errorf("invalid entries JSON: %w", err)
+		}
+
+		if err := store.PutMulti(namespace, objectID, entries); err != nil {
+			return "", err
+		}
+		return "", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __do_storage_put_multi: %w", err)
+	}
+
+	// __do_storage_delete(reqIDStr, namespace, objectID, key) -> "" or error
+	err = registerGoFunc(vm, "__do_storage_delete", func(reqIDStr, namespace, objectID, key string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.DurableObjects == nil {
+			return "", fmt.Errorf("DurableObjects not available")
+		}
+		store, ok := state.env.DurableObjects[namespace]
+		if !ok {
+			return "", fmt.Errorf("DurableObject namespace %q not found", namespace)
+		}
+
+		if err := store.Delete(namespace, objectID, key); err != nil {
+			return "", err
+		}
+		return "", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __do_storage_delete: %w", err)
+	}
+
+	// __do_storage_delete_multi(reqIDStr, namespace, objectID, keysJSON) -> JSON count or error
+	err = registerGoFunc(vm, "__do_storage_delete_multi", func(reqIDStr, namespace, objectID, keysJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.DurableObjects == nil {
+			return "", fmt.Errorf("DurableObjects not available")
+		}
+		store, ok := state.env.DurableObjects[namespace]
+		if !ok {
+			return "", fmt.Errorf("DurableObject namespace %q not found", namespace)
+		}
+
+		var keys []string
+		if err := json.Unmarshal([]byte(keysJSON), &keys); err != nil {
+			return "", fmt.Errorf("invalid keys JSON: %w", err)
+		}
+
+		count, err := store.DeleteMulti(namespace, objectID, keys)
+		if err != nil {
+			return "", err
+		}
+
+		result := map[string]int{"count": count}
+		data, _ := json.Marshal(result)
+		return string(data), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __do_storage_delete_multi: %w", err)
+	}
+
+	// __do_storage_delete_all(reqIDStr, namespace, objectID) -> "" or error
+	err = registerGoFunc(vm, "__do_storage_delete_all", func(reqIDStr, namespace, objectID string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.DurableObjects == nil {
+			return "", fmt.Errorf("DurableObjects not available")
+		}
+		store, ok := state.env.DurableObjects[namespace]
+		if !ok {
+			return "", fmt.Errorf("DurableObject namespace %q not found", namespace)
+		}
+
 		if err := store.DeleteAll(namespace, objectID); err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+			return "", err
 		}
-		resolver.Resolve(v8.Undefined(iso))
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
+		return "", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __do_storage_delete_all: %w", err)
+	}
 
-	// storage.list(options?) -> Promise<Map>
-	_ = stor.Set("list", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
+	// __do_storage_list(reqIDStr, namespace, objectID, optsJSON) -> JSON array of pairs
+	err = registerGoFunc(vm, "__do_storage_list", func(reqIDStr, namespace, objectID, optsJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.DurableObjects == nil {
+			return "", fmt.Errorf("DurableObjects not available")
+		}
+		store, ok := state.env.DurableObjects[namespace]
+		if !ok {
+			return "", fmt.Errorf("DurableObject namespace %q not found", namespace)
+		}
 
 		var prefix string
 		limit := 128
 		reverse := false
-
-		if len(args) > 0 && args[0].IsObject() {
-			_ = ctx.Global().Set("__tmp_do_list_opts", args[0])
-			optsResult, err := ctx.RunScript(`(function() {
-				var o = globalThis.__tmp_do_list_opts;
-				delete globalThis.__tmp_do_list_opts;
-				return JSON.stringify({
-					prefix: o.prefix !== undefined && o.prefix !== null ? String(o.prefix) : "",
-					limit: o.limit !== undefined && o.limit !== null ? Number(o.limit) : 128,
-					reverse: o.reverse === true,
-				});
-			})()`, "do_list_opts.js")
-			if err == nil {
-				var opts struct {
-					Prefix  string `json:"prefix"`
-					Limit   int    `json:"limit"`
-					Reverse bool   `json:"reverse"`
-				}
-				if json.Unmarshal([]byte(optsResult.String()), &opts) == nil {
-					prefix = opts.Prefix
-					limit = opts.Limit
-					reverse = opts.Reverse
-				}
+		if optsJSON != "" && optsJSON != "{}" {
+			var opts struct {
+				Prefix  string `json:"prefix"`
+				Limit   int    `json:"limit"`
+				Reverse bool   `json:"reverse"`
+			}
+			if err := json.Unmarshal([]byte(optsJSON), &opts); err == nil {
+				prefix = opts.Prefix
+				limit = opts.Limit
+				reverse = opts.Reverse
 			}
 		}
 
 		entries, err := store.List(namespace, objectID, prefix, limit, reverse)
 		if err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+			return "", err
 		}
 
-		// Build a Map in JS from ordered pairs to preserve sort order.
+		// Return as array of [key, value] pairs to preserve order
 		pairs := make([][2]string, len(entries))
 		for i, e := range entries {
 			pairs[i] = [2]string{e.Key, e.Value}
 		}
 		data, _ := json.Marshal(pairs)
-		jsResult, err := ctx.RunScript(fmt.Sprintf(`(function() {
-			var arr = JSON.parse(%q);
-			var m = new Map();
-			for (var i = 0; i < arr.length; i++) { m.set(arr[i][0], JSON.parse(arr[i][1])); }
-			return m;
-		})()`, string(data)), "do_list_result.js")
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
-		}
-		resolver.Resolve(jsResult)
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
+		return string(data), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __do_storage_list: %w", err)
+	}
 
-	return stor, nil
+	return nil
 }

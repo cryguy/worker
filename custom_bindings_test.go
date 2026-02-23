@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // ---------------------------------------------------------------------------
@@ -24,8 +24,8 @@ func TestCustomBinding_StringValue(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"MY_CUSTOM": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "custom-value")
+		"MY_CUSTOM": func(vm *quickjs.VM) (quickjs.Value, error) {
+			return vm.NewString("custom-value")
 		},
 	}
 
@@ -49,17 +49,11 @@ func TestCustomBinding_FunctionBinding(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"greet": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			fn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				args := info.Args()
-				name := "stranger"
-				if len(args) > 0 {
-					name = args[0].String()
-				}
-				val, _ := v8.NewValue(iso, "Hello, "+name+"!")
-				return val
-			})
-			return fn.GetFunction(ctx).Value, nil
+		"greet": func(vm *quickjs.VM) (quickjs.Value, error) {
+			vm.RegisterFunc("__custom_greet", func(name string) string {
+				return "Hello, " + name + "!"
+			}, false)
+			return vm.EvalValue("(function(name) { return __custom_greet(name); })", quickjs.EvalGlobal)
 		},
 	}
 
@@ -83,25 +77,13 @@ func TestCustomBinding_ObjectWithMethods(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"math": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			obj, err := NewJSObject(iso, ctx)
-			if err != nil {
-				return nil, err
-			}
-
-			addFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				args := info.Args()
-				if len(args) < 2 {
-					return v8.Undefined(iso)
-				}
-				a := args[0].Int32()
-				b := args[1].Int32()
-				val, _ := v8.NewValue(iso, int32(a+b))
-				return val
-			})
-			_ = obj.Set("add", addFn.GetFunction(ctx))
-
-			return obj.Value, nil
+		"math": func(vm *quickjs.VM) (quickjs.Value, error) {
+			vm.RegisterFunc("__custom_math_add", func(a, b int) int {
+				return a + b
+			}, false)
+			return vm.EvalValue(`({
+				add: function(a, b) { return __custom_math_add(a, b); }
+			})`, quickjs.EvalGlobal)
 		},
 	}
 
@@ -124,8 +106,8 @@ func TestCustomBinding_ErrorInBindingFunc(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"BAD": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return nil, fmt.Errorf("binding setup failed")
+		"BAD": func(vm *quickjs.VM) (quickjs.Value, error) {
+			return quickjs.Value{}, fmt.Errorf("binding setup failed")
 		},
 	}
 
@@ -151,8 +133,8 @@ func TestCustomBinding_CoexistsWithBuiltinBindings(t *testing.T) {
 	env := defaultEnv()
 	env.Vars["MY_VAR"] = "from-vars"
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"custom_val": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "from-custom")
+		"custom_val": func(vm *quickjs.VM) (quickjs.Value, error) {
+			return vm.NewString("from-custom")
 		},
 	}
 
@@ -175,14 +157,14 @@ func TestCustomBinding_MultipleBindings(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"A": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "alpha")
+		"A": func(vm *quickjs.VM) (quickjs.Value, error) {
+			return vm.NewString("alpha")
 		},
-		"B": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "beta")
+		"B": func(vm *quickjs.VM) (quickjs.Value, error) {
+			return vm.NewString("beta")
 		},
-		"C": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "gamma")
+		"C": func(vm *quickjs.VM) (quickjs.Value, error) {
+			return vm.NewString("gamma")
 		},
 	}
 
@@ -288,14 +270,13 @@ func TestExecuteFunction_WithCustomBindings(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"db": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			obj, _ := NewJSObject(iso, ctx)
-			getFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				val, _ := v8.NewValue(iso, "value-for-"+info.Args()[0].String())
-				return val
-			})
-			_ = obj.Set("get", getFn.GetFunction(ctx))
-			return obj.Value, nil
+		"db": func(vm *quickjs.VM) (quickjs.Value, error) {
+			vm.RegisterFunc("__custom_db_get", func(key string) string {
+				return "value-for-" + key
+			}, false)
+			return vm.EvalValue(`({
+				get: function(key) { return __custom_db_get(key); }
+			})`, quickjs.EvalGlobal)
 		},
 	}
 
@@ -465,23 +446,17 @@ func TestExecuteFunction_PluginCallsBackIntoGo(t *testing.T) {
 	var store []string
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"store": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			obj, _ := NewJSObject(iso, ctx)
-
-			saveFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				args := info.Args()
-				store = append(store, args[0].String()+"="+args[1].String())
-				return v8.Undefined(iso)
-			})
-			_ = obj.Set("save", saveFn.GetFunction(ctx))
-
-			countFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				val, _ := v8.NewValue(iso, int32(len(store)))
-				return val
-			})
-			_ = obj.Set("count", countFn.GetFunction(ctx))
-
-			return obj.Value, nil
+		"store": func(vm *quickjs.VM) (quickjs.Value, error) {
+			vm.RegisterFunc("__custom_store_save", func(name, value string) {
+				store = append(store, name+"="+value)
+			}, false)
+			vm.RegisterFunc("__custom_store_count", func() int {
+				return len(store)
+			}, false)
+			return vm.EvalValue(`({
+				save: function(name, value) { __custom_store_save(name, value); },
+				count: function() { return __custom_store_count(); }
+			})`, quickjs.EvalGlobal)
 		},
 	}
 

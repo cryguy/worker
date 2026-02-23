@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"math/big"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // cryptoExtJS patches crypto.subtle with JWK import/export, ECDSA, generateKey,
@@ -96,7 +96,7 @@ subtle.verify = async function(algorithm, key, signature, data) {
 	var sigB64 = __bufferSourceToB64(signature);
 	var dataB64 = __bufferSourceToB64(data);
 	var hashName = algo.hash ? (typeof algo.hash === 'string' ? algo.hash : algo.hash.name) : '';
-	return __cryptoVerify(algo.name, key._id, sigB64, dataB64, hashName);
+	return !!__cryptoVerify(algo.name, key._id, sigB64, dataB64, hashName);
 };
 
 subtle.wrapKey = async function(format, key, wrappingKey, wrapAlgorithm) {
@@ -151,7 +151,7 @@ func padBytes(b []byte, length int) []byte {
 }
 
 // importCryptoKeyFull stores a full cryptoKeyEntry and returns its ID.
-func importCryptoKeyFull(reqID uint64, entry *cryptoKeyEntry) int64 {
+func importCryptoKeyFull(reqID uint64, entry *cryptoKeyEntry) int {
 	state := getRequestState(reqID)
 	if state == nil {
 		return -1
@@ -159,7 +159,7 @@ func importCryptoKeyFull(reqID uint64, entry *cryptoKeyEntry) int64 {
 	state.nextKeyID++
 	id := state.nextKeyID
 	if state.cryptoKeys == nil {
-		state.cryptoKeys = make(map[int64]*cryptoKeyEntry)
+		state.cryptoKeys = make(map[int]*cryptoKeyEntry)
 	}
 	state.cryptoKeys[id] = entry
 	return id
@@ -167,36 +167,20 @@ func importCryptoKeyFull(reqID uint64, entry *cryptoKeyEntry) int64 {
 
 // setupCryptoExt registers extended crypto Go functions and evaluates the JS
 // patches for JWK, ECDSA, generateKey, and AES-CBC. Must run after setupCrypto.
-func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupCryptoExt(vm *quickjs.VM, _ *eventLoop) error {
 	// Override __cryptoImportKey to accept namedCurve, extractable, and handle ECDSA raw keys.
-	_ = ctx.Global().Set("__cryptoImportKey", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "importKey requires at least 3 argument(s)")
-		}
-		algoName := args[0].String()
-		hashAlgo := args[1].String()
-		dataB64 := args[2].String()
-		namedCurve := ""
-		if len(args) > 3 {
-			namedCurve = args[3].String()
-		}
-		extractableVal := true
-		if len(args) > 4 {
-			extractableVal = args[4].Boolean()
-		}
-
+	registerGoFunc(vm, "__cryptoImportKey", func(algoName, hashAlgo, dataB64, namedCurve string, extractableVal bool) (int, error) {
 		keyData, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "importKey: invalid base64")
+			return 0, fmt.Errorf("importKey: invalid base64")
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 
 		if normalizeAlgo(algoName) == "ECDSA" && namedCurve != "" {
 			curve := curveFromName(namedCurve)
 			if curve == nil {
-				return throwError(iso, fmt.Sprintf("importKey: unsupported curve %q", namedCurve))
+				return 0, fmt.Errorf("importKey: unsupported curve %q", namedCurve)
 			}
 			var ecdhCurve ecdh.Curve
 			switch namedCurve {
@@ -205,11 +189,11 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			case "P-384":
 				ecdhCurve = ecdh.P384()
 			default:
-				return throwError(iso, fmt.Sprintf("importKey: unsupported curve %q", namedCurve))
+				return 0, fmt.Errorf("importKey: unsupported curve %q", namedCurve)
 			}
 			ecdhKey, err := ecdhCurve.NewPublicKey(keyData)
 			if err != nil {
-				return throwError(iso, "importKey: invalid EC public key")
+				return 0, fmt.Errorf("importKey: invalid EC public key")
 			}
 			// Convert ecdh.PublicKey to ecdsa.PublicKey via raw bytes.
 			rawBytes := ecdhKey.Bytes() // uncompressed: 0x04 || X || Y
@@ -225,33 +209,26 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 				ecKey:       pubKey,
 				extractable: extractableVal,
 			})
-			val, _ := v8.NewValue(iso, int32(id))
-			return val
+			return id, nil
 		}
 
 		id := importCryptoKey(reqID, hashAlgo, keyData)
 		if id < 0 {
-			return throwError(iso, "importKey: no active request state")
+			return 0, fmt.Errorf("importKey: no active request state")
 		}
-		val, _ := v8.NewValue(iso, int32(id))
-		return val
-	}).GetFunction(ctx))
+		return id, nil
+	}, false)
 
 	// Override __cryptoExportKey to handle ECDSA EC keys (which store key
 	// material in ecKey, not data).
-	_ = ctx.Global().Set("__cryptoExportKey", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 1 {
-			return throwError(iso, errMissingArg("exportKey", 1).Error())
-		}
-		keyID := args[0].Integer()
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoExportKey", func(keyID int) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "exportKey: key not found")
+			return "", fmt.Errorf("exportKey: key not found")
 		}
 		if !entry.extractable {
-			return throwError(iso, "exportKey: key is not extractable")
+			return "", fmt.Errorf("exportKey: key is not extractable")
 		}
 		// For ECDSA keys, serialize the EC public key as uncompressed point.
 		if entry.ecKey != nil {
@@ -259,45 +236,30 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			case *ecdsa.PublicKey:
 				ecdhPub, err := pub.ECDH()
 				if err != nil {
-					return throwError(iso, fmt.Sprintf("exportKey: %s", err.Error()))
+					return "", fmt.Errorf("exportKey: %s", err.Error())
 				}
-				val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(ecdhPub.Bytes()))
-				return val
+				return base64.StdEncoding.EncodeToString(ecdhPub.Bytes()), nil
 			case *ecdsa.PrivateKey:
 				ecdhPub, err := pub.PublicKey.ECDH()
 				if err != nil {
-					return throwError(iso, fmt.Sprintf("exportKey: %s", err.Error()))
+					return "", fmt.Errorf("exportKey: %s", err.Error())
 				}
-				val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(ecdhPub.Bytes()))
-				return val
+				return base64.StdEncoding.EncodeToString(ecdhPub.Bytes()), nil
 			}
 		}
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(entry.data))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(entry.data), nil
+	}, false)
 
 	// __cryptoImportKeyJWK(algoName, hashAlgo, jwkJSON, namedCurve, extractable) -> JSON result
-	_ = ctx.Global().Set("__cryptoImportKeyJWK", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 5 {
-			return throwError(iso, "importKeyJWK requires at least 5 argument(s)")
-		}
-		algoName := args[0].String()
-		hashAlgo := args[1].String()
-		jwkJSON := args[2].String()
-		namedCurve := args[3].String()
-		extractableVal := args[4].Boolean()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoImportKeyJWK", func(algoName, hashAlgo, jwkJSON, namedCurve string, extractableVal bool) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		var jwk map[string]interface{}
 		if err := json.Unmarshal([]byte(jwkJSON), &jwk); err != nil {
-			val, _ := v8.NewValue(iso, `{"error":"invalid JWK JSON"}`)
-			return val
+			return `{"error":"invalid JWK JSON"}`, nil
 		}
 
 		kty, _ := jwk["kty"].(string)
@@ -306,8 +268,7 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			kB64URL, _ := jwk["k"].(string)
 			keyData, err := base64.RawURLEncoding.DecodeString(kB64URL)
 			if err != nil {
-				val, _ := v8.NewValue(iso, `{"error":"invalid JWK k value"}`)
-				return val
+				return `{"error":"invalid JWK k value"}`, nil
 			}
 			entry := &cryptoKeyEntry{
 				data:        keyData,
@@ -317,8 +278,7 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 				extractable: extractableVal,
 			}
 			id := importCryptoKeyFull(reqID, entry)
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"secret"}`, id))
-			return val
+			return fmt.Sprintf(`{"keyId":%d,"keyType":"secret"}`, id), nil
 
 		case "EC":
 			crv, _ := jwk["crv"].(string)
@@ -327,20 +287,17 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			}
 			curve := curveFromName(namedCurve)
 			if curve == nil {
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"unsupported curve %q"}`, namedCurve))
-				return val
+				return fmt.Sprintf(`{"error":"unsupported curve %q"}`, namedCurve), nil
 			}
 			xB64, _ := jwk["x"].(string)
 			yB64, _ := jwk["y"].(string)
 			xBytes, err := base64.RawURLEncoding.DecodeString(xB64)
 			if err != nil {
-				val, _ := v8.NewValue(iso, `{"error":"invalid JWK x value"}`)
-				return val
+				return `{"error":"invalid JWK x value"}`, nil
 			}
 			yBytes, err := base64.RawURLEncoding.DecodeString(yB64)
 			if err != nil {
-				val, _ := v8.NewValue(iso, `{"error":"invalid JWK y value"}`)
-				return val
+				return `{"error":"invalid JWK y value"}`, nil
 			}
 			x := new(big.Int).SetBytes(xBytes)
 			y := new(big.Int).SetBytes(yBytes)
@@ -350,8 +307,7 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			if hasD && dB64 != "" {
 				dBytes, err := base64.RawURLEncoding.DecodeString(dB64)
 				if err != nil {
-					val, _ := v8.NewValue(iso, `{"error":"invalid JWK d value"}`)
-					return val
+					return `{"error":"invalid JWK d value"}`, nil
 				}
 				privKey := &ecdsa.PrivateKey{
 					PublicKey: *pubKey,
@@ -361,40 +317,29 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 					algoName: "ECDSA", hashAlgo: hashAlgo, keyType: "private",
 					namedCurve: namedCurve, ecKey: privKey, extractable: extractableVal,
 				})
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id))
-				return val
+				return fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id), nil
 			}
 
 			id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 				algoName: "ECDSA", hashAlgo: hashAlgo, keyType: "public",
 				namedCurve: namedCurve, ecKey: pubKey, extractable: extractableVal,
 			})
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id))
-			return val
+			return fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id), nil
 
 		default:
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"unsupported JWK kty %q"}`, kty))
-			return val
+			return fmt.Sprintf(`{"error":"unsupported JWK kty %q"}`, kty), nil
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// __cryptoExportKeyJWK(keyID, algoName, hashAlgo, namedCurve) -> JSON JWK
-	_ = ctx.Global().Set("__cryptoExportKeyJWK", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "exportKeyJWK requires at least 4 argument(s)")
-		}
-		keyID := args[0].Integer()
-		algoName := args[1].String()
-		hashAlgo := args[2].String()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoExportKeyJWK", func(keyID int, algoName, hashAlgo, namedCurve string) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "exportKeyJWK: key not found")
+			return "", fmt.Errorf("exportKeyJWK: key not found")
 		}
 		if !entry.extractable {
-			return throwError(iso, "exportKey: key is not extractable")
+			return "", fmt.Errorf("exportKey: key is not extractable")
 		}
 
 		if entry.ecKey != nil {
@@ -417,8 +362,7 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 				jwk["y"] = base64.RawURLEncoding.EncodeToString(padBytes(k.Y.Bytes(), byteLen))
 			}
 			data, _ := json.Marshal(jwk)
-			val, _ := v8.NewValue(iso, string(data))
-			return val
+			return string(data), nil
 		}
 
 		jwk := map[string]string{
@@ -446,42 +390,25 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			}
 		}
 		data, _ := json.Marshal(jwk)
-		val, _ := v8.NewValue(iso, string(data))
-		return val
-	}).GetFunction(ctx))
+		return string(data), nil
+	}, false)
 
 	// __cryptoGenerateKey(algoName, hashAlgo, namedCurve, extractable, length) -> JSON result
-	_ = ctx.Global().Set("__cryptoGenerateKey", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "generateKey requires at least 4 argument(s)")
-		}
-		algoName := args[0].String()
-		hashAlgo := args[1].String()
-		namedCurve := args[2].String()
-		extractableVal := args[3].Boolean()
-		length := int32(0)
-		if len(args) > 4 {
-			length = args[4].Int32()
-		}
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoGenerateKey", func(algoName, hashAlgo, namedCurve string, extractableVal bool, length int) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		switch normalizeAlgo(algoName) {
 		case "ECDSA":
 			curve := curveFromName(namedCurve)
 			if curve == nil {
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"unsupported curve %q"}`, namedCurve))
-				return val
+				return fmt.Sprintf(`{"error":"unsupported curve %q"}`, namedCurve), nil
 			}
 			privKey, err := ecdsa.GenerateKey(curve, rand.Reader)
 			if err != nil {
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()))
-				return val
+				return fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()), nil
 			}
 			privID := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 				algoName: "ECDSA", hashAlgo: hashAlgo, keyType: "private",
@@ -491,8 +418,7 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 				algoName: "ECDSA", hashAlgo: hashAlgo, keyType: "public",
 				namedCurve: namedCurve, ecKey: &privKey.PublicKey, extractable: extractableVal,
 			})
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID))
-			return val
+			return fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID), nil
 
 		case "HMAC":
 			keyLen := 32
@@ -506,15 +432,13 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			}
 			keyData := make([]byte, keyLen)
 			if _, err := rand.Read(keyData); err != nil {
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()))
-				return val
+				return fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()), nil
 			}
 			id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 				data: keyData, hashAlgo: hashAlgo, algoName: "HMAC",
 				keyType: "secret", extractable: extractableVal,
 			})
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d}`, id))
-			return val
+			return fmt.Sprintf(`{"keyId":%d}`, id), nil
 
 		case "AES-GCM", "AES-CBC", "AES-CTR":
 			keyLen := 32 // default 256-bit
@@ -523,68 +447,51 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			} else if length == 192 {
 				keyLen = 24
 			} else if length != 0 && length != 256 {
-				val, _ := v8.NewValue(iso, `{"error":"AES: length must be 128, 192, or 256"}`)
-				return val
+				return `{"error":"AES: length must be 128, 192, or 256"}`, nil
 			}
 			keyData := make([]byte, keyLen)
 			if _, err := rand.Read(keyData); err != nil {
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()))
-				return val
+				return fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()), nil
 			}
 			id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 				data: keyData, hashAlgo: hashAlgo, algoName: normalizeAlgo(algoName),
 				keyType: "secret", extractable: extractableVal,
 			})
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d}`, id))
-			return val
+			return fmt.Sprintf(`{"keyId":%d}`, id), nil
 
 		default:
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"generateKey: unsupported algorithm %q"}`, algoName))
-			return val
+			return fmt.Sprintf(`{"error":"generateKey: unsupported algorithm %q"}`, algoName), nil
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// Override __cryptoSign to support ECDSA + extra hash arg.
-	_ = ctx.Global().Set("__cryptoSign", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "sign requires at least 3 argument(s)")
-		}
-		algo := args[0].String()
-		keyID := args[1].Integer()
-		dataB64 := args[2].String()
-		signHashAlgo := ""
-		if len(args) > 3 {
-			signHashAlgo = args[3].String()
-		}
-
+	registerGoFunc(vm, "__cryptoSign", func(algo string, keyID int, dataB64, signHashAlgo string) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "sign: invalid base64")
+			return "", fmt.Errorf("sign: invalid base64")
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "sign: key not found")
+			return "", fmt.Errorf("sign: key not found")
 		}
 
 		switch normalizeAlgo(algo) {
 		case "HMAC":
 			hashFn := hashFuncFromAlgo(entry.hashAlgo)
 			if hashFn == nil {
-				return throwError(iso, fmt.Sprintf("sign: unsupported HMAC hash %q", entry.hashAlgo))
+				return "", fmt.Errorf("sign: unsupported HMAC hash %q", entry.hashAlgo)
 			}
 			mac := hmac.New(hashFn, entry.data)
 			mac.Write(data)
 			sig := mac.Sum(nil)
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(sig))
-			return val
+			return base64.StdEncoding.EncodeToString(sig), nil
 
 		case "ECDSA":
 			privKey, ok := entry.ecKey.(*ecdsa.PrivateKey)
 			if !ok {
-				return throwError(iso, "sign: key is not an ECDSA private key")
+				return "", fmt.Errorf("sign: key is not an ECDSA private key")
 			}
 			ha := signHashAlgo
 			if ha == "" {
@@ -592,7 +499,7 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			}
 			hashFn := hashFuncFromAlgo(ha)
 			if hashFn == nil {
-				return throwError(iso, fmt.Sprintf("sign: unsupported hash %q", ha))
+				return "", fmt.Errorf("sign: unsupported hash %q", ha)
 			}
 			h := hashFn()
 			h.Write(data)
@@ -600,61 +507,46 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 
 			r, s, err := ecdsa.Sign(rand.Reader, privKey, digest)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("sign: %s", err.Error()))
+				return "", fmt.Errorf("sign: %s", err.Error())
 			}
 			byteLen := (privKey.Curve.Params().BitSize + 7) / 8
 			sig := make([]byte, byteLen*2)
 			copy(sig[:byteLen], padBytes(r.Bytes(), byteLen))
 			copy(sig[byteLen:], padBytes(s.Bytes(), byteLen))
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(sig))
-			return val
+			return base64.StdEncoding.EncodeToString(sig), nil
 
 		default:
-			return throwError(iso, fmt.Sprintf("sign: unsupported algorithm %q", algo))
+			return "", fmt.Errorf("sign: unsupported algorithm %q", algo)
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// Override __cryptoVerify to support ECDSA + extra hash arg.
-	_ = ctx.Global().Set("__cryptoVerify", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "verify requires at least 4 argument(s)")
-		}
-		algo := args[0].String()
-		keyID := args[1].Integer()
-		sigB64 := args[2].String()
-		dataB64 := args[3].String()
-		verifyHashAlgo := ""
-		if len(args) > 4 {
-			verifyHashAlgo = args[4].String()
-		}
-
+	registerGoFunc(vm, "__cryptoVerify", func(algo string, keyID int, sigB64, dataB64, verifyHashAlgo string) (int, error) {
 		sig, err := base64.StdEncoding.DecodeString(sigB64)
 		if err != nil {
-			return throwError(iso, "verify: invalid signature base64")
+			return 0, fmt.Errorf("verify: invalid signature base64")
 		}
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "verify: invalid data base64")
+			return 0, fmt.Errorf("verify: invalid data base64")
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "verify: key not found")
+			return 0, fmt.Errorf("verify: key not found")
 		}
 
 		switch normalizeAlgo(algo) {
 		case "HMAC":
 			hashFn := hashFuncFromAlgo(entry.hashAlgo)
 			if hashFn == nil {
-				return throwError(iso, fmt.Sprintf("verify: unsupported HMAC hash %q", entry.hashAlgo))
+				return 0, fmt.Errorf("verify: unsupported HMAC hash %q", entry.hashAlgo)
 			}
 			mac := hmac.New(hashFn, entry.data)
 			mac.Write(data)
 			expected := mac.Sum(nil)
-			val, _ := v8.NewValue(iso, hmac.Equal(sig, expected))
-			return val
+			return boolToInt(hmac.Equal(sig, expected)), nil
 
 		case "ECDSA":
 			var pubKey *ecdsa.PublicKey
@@ -664,7 +556,7 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			case *ecdsa.PrivateKey:
 				pubKey = &k.PublicKey
 			default:
-				return throwError(iso, "verify: key is not an ECDSA key")
+				return 0, fmt.Errorf("verify: key is not an ECDSA key")
 			}
 			ha := verifyHashAlgo
 			if ha == "" {
@@ -672,7 +564,7 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			}
 			hashFn := hashFuncFromAlgo(ha)
 			if hashFn == nil {
-				return throwError(iso, fmt.Sprintf("verify: unsupported hash %q", ha))
+				return 0, fmt.Errorf("verify: unsupported hash %q", ha)
 			}
 			h := hashFn()
 			h.Write(data)
@@ -680,83 +572,67 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 
 			byteLen := (pubKey.Curve.Params().BitSize + 7) / 8
 			if len(sig) != byteLen*2 {
-				val, _ := v8.NewValue(iso, false)
-				return val
+				return 0, nil
 			}
 			r := new(big.Int).SetBytes(sig[:byteLen])
 			s := new(big.Int).SetBytes(sig[byteLen:])
-			val, _ := v8.NewValue(iso, ecdsa.Verify(pubKey, digest, r, s))
-			return val
+			return boolToInt(ecdsa.Verify(pubKey, digest, r, s)), nil
 
 		default:
-			return throwError(iso, fmt.Sprintf("verify: unsupported algorithm %q", algo))
+			return 0, fmt.Errorf("verify: unsupported algorithm %q", algo)
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// Override __cryptoEncrypt to add AES-CBC.
-	_ = ctx.Global().Set("__cryptoEncrypt", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "encrypt requires at least 4 argument(s)")
-		}
-		algo := args[0].String()
-		keyID := args[1].Integer()
-		dataB64 := args[2].String()
-		ivB64 := args[3].String()
-		aadB64 := ""
-		if len(args) > 4 {
-			aadB64 = args[4].String()
-		}
-
+	registerGoFunc(vm, "__cryptoEncrypt", func(algo string, keyID int, dataB64, ivB64, aadB64 string) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "encrypt: invalid base64 data")
+			return "", fmt.Errorf("encrypt: invalid base64 data")
 		}
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "encrypt: key not found")
+			return "", fmt.Errorf("encrypt: key not found")
 		}
 
 		switch normalizeAlgo(algo) {
 		case "AES-GCM":
 			iv, err := base64.StdEncoding.DecodeString(ivB64)
 			if err != nil {
-				return throwError(iso, "encrypt: invalid IV base64")
+				return "", fmt.Errorf("encrypt: invalid IV base64")
 			}
 			if len(iv) != 12 {
-				return throwError(iso, fmt.Sprintf("encrypt: AES-GCM IV must be exactly 12 bytes, got %d", len(iv)))
+				return "", fmt.Errorf("encrypt: AES-GCM IV must be exactly 12 bytes, got %d", len(iv))
 			}
 			var aad []byte
 			if aadB64 != "" {
 				aad, err = base64.StdEncoding.DecodeString(aadB64)
 				if err != nil {
-					return throwError(iso, "encrypt: invalid AAD base64")
+					return "", fmt.Errorf("encrypt: invalid AAD base64")
 				}
 			}
 			block, err := aes.NewCipher(entry.data)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("encrypt: %s", err.Error()))
+				return "", fmt.Errorf("encrypt: %s", err.Error())
 			}
 			gcm, err := cipher.NewGCM(block)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("encrypt: %s", err.Error()))
+				return "", fmt.Errorf("encrypt: %s", err.Error())
 			}
 			ct := gcm.Seal(nil, iv, data, aad)
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(ct))
-			return val
+			return base64.StdEncoding.EncodeToString(ct), nil
 
 		case "AES-CBC":
 			iv, err := base64.StdEncoding.DecodeString(ivB64)
 			if err != nil {
-				return throwError(iso, "encrypt: invalid IV base64")
+				return "", fmt.Errorf("encrypt: invalid IV base64")
 			}
 			if len(iv) != aes.BlockSize {
-				return throwError(iso, fmt.Sprintf("encrypt: AES-CBC IV must be exactly %d bytes", aes.BlockSize))
+				return "", fmt.Errorf("encrypt: AES-CBC IV must be exactly %d bytes", aes.BlockSize)
 			}
 			block, err := aes.NewCipher(entry.data)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("encrypt: %s", err.Error()))
+				return "", fmt.Errorf("encrypt: %s", err.Error())
 			}
 			padLen := aes.BlockSize - (len(data) % aes.BlockSize)
 			padded := make([]byte, len(data)+padLen)
@@ -767,91 +643,75 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			mode := cipher.NewCBCEncrypter(block, iv)
 			ct := make([]byte, len(padded))
 			mode.CryptBlocks(ct, padded)
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(ct))
-			return val
+			return base64.StdEncoding.EncodeToString(ct), nil
 
 		default:
-			return throwError(iso, fmt.Sprintf("encrypt: unsupported algorithm %q", algo))
+			return "", fmt.Errorf("encrypt: unsupported algorithm %q", algo)
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// Override __cryptoDecrypt to add AES-CBC.
-	_ = ctx.Global().Set("__cryptoDecrypt", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "decrypt requires at least 4 argument(s)")
-		}
-		algo := args[0].String()
-		keyID := args[1].Integer()
-		dataB64 := args[2].String()
-		ivB64 := args[3].String()
-		aadB64 := ""
-		if len(args) > 4 {
-			aadB64 = args[4].String()
-		}
-
+	registerGoFunc(vm, "__cryptoDecrypt", func(algo string, keyID int, dataB64, ivB64, aadB64 string) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "decrypt: invalid base64 data")
+			return "", fmt.Errorf("decrypt: invalid base64 data")
 		}
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "decrypt: key not found")
+			return "", fmt.Errorf("decrypt: key not found")
 		}
 
 		switch normalizeAlgo(algo) {
 		case "AES-GCM":
 			iv, err := base64.StdEncoding.DecodeString(ivB64)
 			if err != nil {
-				return throwError(iso, "decrypt: invalid IV base64")
+				return "", fmt.Errorf("decrypt: invalid IV base64")
 			}
 			if len(iv) != 12 {
-				return throwError(iso, fmt.Sprintf("decrypt: AES-GCM IV must be exactly 12 bytes, got %d", len(iv)))
+				return "", fmt.Errorf("decrypt: AES-GCM IV must be exactly 12 bytes, got %d", len(iv))
 			}
 			var aad []byte
 			if aadB64 != "" {
 				aad, err = base64.StdEncoding.DecodeString(aadB64)
 				if err != nil {
-					return throwError(iso, "decrypt: invalid AAD base64")
+					return "", fmt.Errorf("decrypt: invalid AAD base64")
 				}
 			}
 			block, err := aes.NewCipher(entry.data)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("decrypt: %s", err.Error()))
+				return "", fmt.Errorf("decrypt: %s", err.Error())
 			}
 			gcm, err := cipher.NewGCM(block)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("decrypt: %s", err.Error()))
+				return "", fmt.Errorf("decrypt: %s", err.Error())
 			}
 			pt, err := gcm.Open(nil, iv, data, aad)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("decrypt: %s", err.Error()))
+				return "", fmt.Errorf("decrypt: %s", err.Error())
 			}
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(pt))
-			return val
+			return base64.StdEncoding.EncodeToString(pt), nil
 
 		case "AES-CBC":
 			iv, err := base64.StdEncoding.DecodeString(ivB64)
 			if err != nil {
-				return throwError(iso, "decrypt: invalid IV base64")
+				return "", fmt.Errorf("decrypt: invalid IV base64")
 			}
 			if len(iv) != aes.BlockSize {
-				return throwError(iso, fmt.Sprintf("decrypt: AES-CBC IV must be exactly %d bytes", aes.BlockSize))
+				return "", fmt.Errorf("decrypt: AES-CBC IV must be exactly %d bytes", aes.BlockSize)
 			}
 			if len(data)%aes.BlockSize != 0 {
-				return throwError(iso, "decrypt: ciphertext not a multiple of block size")
+				return "", fmt.Errorf("decrypt: ciphertext not a multiple of block size")
 			}
 			block, err := aes.NewCipher(entry.data)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("decrypt: %s", err.Error()))
+				return "", fmt.Errorf("decrypt: %s", err.Error())
 			}
 			mode := cipher.NewCBCDecrypter(block, iv)
 			pt := make([]byte, len(data))
 			mode.CryptBlocks(pt, data)
 			if len(pt) == 0 {
-				val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(pt))
-				return val
+				return base64.StdEncoding.EncodeToString(pt), nil
 			}
 			// Constant-time PKCS7 padding validation
 			padLen := int(pt[len(pt)-1])
@@ -869,19 +729,18 @@ func setupCryptoExt(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 				}
 			}
 			if good != 1 {
-				return throwError(iso, "decrypt: invalid PKCS7 padding")
+				return "", fmt.Errorf("decrypt: invalid PKCS7 padding")
 			}
 			pt = pt[:len(pt)-padLen]
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(pt))
-			return val
+			return base64.StdEncoding.EncodeToString(pt), nil
 
 		default:
-			return throwError(iso, fmt.Sprintf("decrypt: unsupported algorithm %q", algo))
+			return "", fmt.Errorf("decrypt: unsupported algorithm %q", algo)
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// Evaluate the JS patches.
-	if _, err := ctx.RunScript(cryptoExtJS, "crypto_ext.js"); err != nil {
+	if err := evalDiscard(vm, cryptoExtJS); err != nil {
 		return fmt.Errorf("evaluating crypto_ext.js: %w", err)
 	}
 

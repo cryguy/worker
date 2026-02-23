@@ -11,7 +11,7 @@ import (
 	"sync"
 
 	"github.com/andybalholm/brotli"
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 const maxDecompressedSize = 128 * 1024 * 1024 // 128 MB
@@ -82,7 +82,7 @@ class CompressionStream {
 		if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw' && format !== 'br') {
 			throw new TypeError('Unsupported compression format: ' + format);
 		}
-		var reqID = globalThis.__requestID;
+		var reqID = String(globalThis.__requestID);
 		var streamID = __compressInit(reqID, format);
 		var ts = new TransformStream({
 			transform(chunk, controller) {
@@ -109,7 +109,7 @@ class DecompressionStream {
 		if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw' && format !== 'br') {
 			throw new TypeError('Unsupported compression format: ' + format);
 		}
-		var reqID = globalThis.__requestID;
+		var reqID = String(globalThis.__requestID);
 		var streamID = __decompressInit(reqID, format);
 		var ts = new TransformStream({
 			transform(chunk, controller) {
@@ -153,52 +153,40 @@ func newCompressWriter(buf *bytes.Buffer, format string) (io.WriteCloser, error)
 
 // setupCompression registers Go-backed streaming compress/decompress functions
 // and evaluates the JS classes. Must run after setupStreams and setupCrypto.
-func setupCompression(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupCompression(vm *quickjs.VM, _ *eventLoop) error {
 
 	// --- Legacy bulk functions (kept for backward compat with direct callers) ---
 
 	// __compress(format, dataB64) -> compressedB64
-	_ = ctx.Global().Set("__compress", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "compress requires 2 argument(s)")
-		}
-		format := args[0].String()
-		dataB64 := args[1].String()
-
+	err := registerGoFunc(vm, "__compress", func(format, dataB64 string) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "compress: invalid base64")
+			return "", fmt.Errorf("compress: invalid base64")
 		}
 
 		var buf bytes.Buffer
 		w, err := newCompressWriter(&buf, format)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("compress: %s", err.Error()))
+			return "", fmt.Errorf("compress: %w", err)
 		}
 		if _, err := w.Write(data); err != nil {
-			return throwError(iso, fmt.Sprintf("compress: %s", err.Error()))
+			return "", fmt.Errorf("compress: %w", err)
 		}
 		if err := w.Close(); err != nil {
-			return throwError(iso, fmt.Sprintf("compress: %s", err.Error()))
+			return "", fmt.Errorf("compress: %w", err)
 		}
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(buf.Bytes()))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __compress: %w", err)
+	}
 
 	// __decompress(format, dataB64) -> decompressedB64
-	_ = ctx.Global().Set("__decompress", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "decompress requires 2 argument(s)")
-		}
-		format := args[0].String()
-		dataB64 := args[1].String()
-
+	err = registerGoFunc(vm, "__decompress", func(format, dataB64 string) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "decompress: invalid base64")
+			return "", fmt.Errorf("decompress: invalid base64")
 		}
 
 		var result []byte
@@ -206,63 +194,59 @@ func setupCompression(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		case "gzip":
 			r, err := gzip.NewReader(bytes.NewReader(data))
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("decompress: %s", err.Error()))
+				return "", fmt.Errorf("decompress: %w", err)
 			}
 			result, err = io.ReadAll(io.LimitReader(r, int64(maxDecompressedSize)+1))
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("decompress: %s", err.Error()))
+				return "", fmt.Errorf("decompress: %w", err)
 			}
 			if len(result) > maxDecompressedSize {
-				return throwError(iso, "decompress: output exceeds maximum allowed size")
+				return "", fmt.Errorf("decompress: output exceeds maximum allowed size")
 			}
 			_ = r.Close()
 		case "deflate", "deflate-raw":
 			r := flate.NewReader(bytes.NewReader(data))
 			result, err = io.ReadAll(io.LimitReader(r, int64(maxDecompressedSize)+1))
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("decompress: %s", err.Error()))
+				return "", fmt.Errorf("decompress: %w", err)
 			}
 			if len(result) > maxDecompressedSize {
-				return throwError(iso, "decompress: output exceeds maximum allowed size")
+				return "", fmt.Errorf("decompress: output exceeds maximum allowed size")
 			}
 			_ = r.Close()
 		case "br":
 			r := brotli.NewReader(bytes.NewReader(data))
 			result, err = io.ReadAll(io.LimitReader(r, int64(maxDecompressedSize)+1))
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("decompress: %s", err.Error()))
+				return "", fmt.Errorf("decompress: %w", err)
 			}
 			if len(result) > maxDecompressedSize {
-				return throwError(iso, "decompress: output exceeds maximum allowed size")
+				return "", fmt.Errorf("decompress: output exceeds maximum allowed size")
 			}
 		default:
-			return throwError(iso, fmt.Sprintf("decompress: unsupported format %q", format))
+			return "", fmt.Errorf("decompress: unsupported format %q", format)
 		}
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(result))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(result), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __decompress: %w", err)
+	}
 
 	// --- Streaming compression functions ---
 
 	// __compressInit(requestID, format) -> streamID
-	_ = ctx.Global().Set("__compressInit", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("__compressInit", 2).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		format := args[1].String()
-
+	err = registerGoFunc(vm, "__compressInit", func(requestIDStr, format string) (string, error) {
+		reqID := parseReqID(requestIDStr)
 		state := getRequestState(reqID)
 		if state == nil {
-			return throwError(iso, "compressInit: invalid request state")
+			return "", fmt.Errorf("compressInit: invalid request state")
 		}
 
 		cs := &compressStreamState{format: format, mode: "compress"}
 		w, err := newCompressWriter(&cs.buf, format)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("compressInit: %s", err.Error()))
+			return "", fmt.Errorf("compressInit: %w", err)
 		}
 		cs.writer = w
 
@@ -273,87 +257,74 @@ func setupCompression(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		streamID := strconv.FormatInt(state.nextCompressID, 10)
 		state.compressStreams[streamID] = cs
 
-		val, _ := v8.NewValue(iso, streamID)
-		return val
-	}).GetFunction(ctx))
+		return streamID, nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __compressInit: %w", err)
+	}
 
 	// __compressChunk(requestID, streamID, base64data) -> base64 compressed output
-	_ = ctx.Global().Set("__compressChunk", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, errMissingArg("__compressChunk", 3).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		streamID := args[1].String()
-		dataB64 := args[2].String()
-
+	err = registerGoFunc(vm, "__compressChunk", func(requestIDStr, streamID, dataB64 string) (string, error) {
+		reqID := parseReqID(requestIDStr)
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "compressChunk: invalid base64")
+			return "", fmt.Errorf("compressChunk: invalid base64")
 		}
 
 		state := getRequestState(reqID)
 		if state == nil || state.compressStreams == nil {
-			return throwError(iso, "compressChunk: invalid state")
+			return "", fmt.Errorf("compressChunk: invalid state")
 		}
 		cs, ok := state.compressStreams[streamID]
 		if !ok {
-			return throwError(iso, "compressChunk: unknown stream")
+			return "", fmt.Errorf("compressChunk: unknown stream")
 		}
 
 		// Reset buf to capture only this chunk's compressed output.
 		cs.buf.Reset()
 		if _, err := cs.writer.Write(data); err != nil {
-			return throwError(iso, fmt.Sprintf("compressChunk: %s", err.Error()))
+			return "", fmt.Errorf("compressChunk: %w", err)
 		}
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(cs.buf.Bytes()))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(cs.buf.Bytes()), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __compressChunk: %w", err)
+	}
 
 	// __compressFlush(requestID, streamID) -> base64 remaining compressed data
-	_ = ctx.Global().Set("__compressFlush", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("__compressFlush", 2).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		streamID := args[1].String()
-
+	err = registerGoFunc(vm, "__compressFlush", func(requestIDStr, streamID string) (string, error) {
+		reqID := parseReqID(requestIDStr)
 		state := getRequestState(reqID)
 		if state == nil || state.compressStreams == nil {
-			return throwError(iso, "compressFlush: invalid state")
+			return "", fmt.Errorf("compressFlush: invalid state")
 		}
 		cs, ok := state.compressStreams[streamID]
 		if !ok {
-			return throwError(iso, "compressFlush: unknown stream")
+			return "", fmt.Errorf("compressFlush: unknown stream")
 		}
 
 		// Reset buf, then close the writer to flush final compressed data.
 		cs.buf.Reset()
 		if err := cs.writer.Close(); err != nil {
-			return throwError(iso, fmt.Sprintf("compressFlush: %s", err.Error()))
+			return "", fmt.Errorf("compressFlush: %w", err)
 		}
 		delete(state.compressStreams, streamID)
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(cs.buf.Bytes()))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(cs.buf.Bytes()), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __compressFlush: %w", err)
+	}
 
 	// --- Streaming decompression functions ---
 
 	// __decompressInit(requestID, format) -> streamID
-	_ = ctx.Global().Set("__decompressInit", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("__decompressInit", 2).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		format := args[1].String()
-
+	err = registerGoFunc(vm, "__decompressInit", func(requestIDStr, format string) (string, error) {
+		reqID := parseReqID(requestIDStr)
 		state := getRequestState(reqID)
 		if state == nil {
-			return throwError(iso, "decompressInit: invalid request state")
+			return "", fmt.Errorf("decompressInit: invalid request state")
 		}
 
 		pr, pw := io.Pipe()
@@ -419,34 +390,29 @@ func setupCompression(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		streamID := strconv.FormatInt(state.nextCompressID, 10)
 		state.compressStreams[streamID] = cs
 
-		val, _ := v8.NewValue(iso, streamID)
-		return val
-	}).GetFunction(ctx))
+		return streamID, nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __decompressInit: %w", err)
+	}
 
 	// __decompressChunk(requestID, streamID, base64data) -> base64 decompressed output
 	// Feeds compressed data to the decompressor goroutine via io.Pipe and
 	// returns any decompressed output that is already available.
-	_ = ctx.Global().Set("__decompressChunk", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, errMissingArg("__decompressChunk", 3).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		streamID := args[1].String()
-		dataB64 := args[2].String()
-
+	err = registerGoFunc(vm, "__decompressChunk", func(requestIDStr, streamID, dataB64 string) (string, error) {
+		reqID := parseReqID(requestIDStr)
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "decompressChunk: invalid base64")
+			return "", fmt.Errorf("decompressChunk: invalid base64")
 		}
 
 		state := getRequestState(reqID)
 		if state == nil || state.compressStreams == nil {
-			return throwError(iso, "decompressChunk: invalid state")
+			return "", fmt.Errorf("decompressChunk: invalid state")
 		}
 		cs, ok := state.compressStreams[streamID]
 		if !ok {
-			return throwError(iso, "decompressChunk: unknown stream")
+			return "", fmt.Errorf("decompressChunk: unknown stream")
 		}
 
 		// Feed compressed data to the decompressor goroutine. Write in a
@@ -459,7 +425,7 @@ func setupCompression(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		}()
 
 		if werr := <-errCh; werr != nil {
-			return throwError(iso, fmt.Sprintf("decompressChunk: %s", werr.Error()))
+			return "", fmt.Errorf("decompressChunk: %w", werr)
 		}
 
 		// Collect any decompressed output the goroutine has produced so far.
@@ -471,29 +437,25 @@ func setupCompression(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		cs.decompMu.Unlock()
 
 		if derr != nil {
-			return throwError(iso, fmt.Sprintf("decompressChunk: %s", derr.Error()))
+			return "", fmt.Errorf("decompressChunk: %w", derr)
 		}
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(out))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(out), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __decompressChunk: %w", err)
+	}
 
 	// __decompressFlush(requestID, streamID) -> base64 remaining decompressed data
-	_ = ctx.Global().Set("__decompressFlush", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("__decompressFlush", 2).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		streamID := args[1].String()
-
+	err = registerGoFunc(vm, "__decompressFlush", func(requestIDStr, streamID string) (string, error) {
+		reqID := parseReqID(requestIDStr)
 		state := getRequestState(reqID)
 		if state == nil || state.compressStreams == nil {
-			return throwError(iso, "decompressFlush: invalid state")
+			return "", fmt.Errorf("decompressFlush: invalid state")
 		}
 		cs, ok := state.compressStreams[streamID]
 		if !ok {
-			return throwError(iso, "decompressFlush: unknown stream")
+			return "", fmt.Errorf("decompressFlush: unknown stream")
 		}
 
 		// Close the pipe writer to signal EOF to the decompressor goroutine,
@@ -511,14 +473,16 @@ func setupCompression(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		delete(state.compressStreams, streamID)
 
 		if derr != nil {
-			return throwError(iso, fmt.Sprintf("decompressFlush: %s", derr.Error()))
+			return "", fmt.Errorf("decompressFlush: %w", derr)
 		}
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(result))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(result), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __decompressFlush: %w", err)
+	}
 
-	if _, err := ctx.RunScript(compressionJS, "compression.js"); err != nil {
+	if err := evalDiscard(vm, compressionJS); err != nil {
 		return fmt.Errorf("evaluating compression.js: %w", err)
 	}
 	return nil

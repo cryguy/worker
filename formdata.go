@@ -3,7 +3,7 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // formdataJS implements Blob, File, and FormData as pure JS polyfills.
@@ -157,8 +157,8 @@ globalThis.FormData = FormData;
 `
 
 // setupFormData evaluates the FormData/Blob/File polyfills.
-func setupFormData(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(formdataJS, "formdata.js"); err != nil {
+func setupFormData(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, formdataJS); err != nil {
 		return fmt.Errorf("evaluating formdata.js: %w", err)
 	}
 	return nil
@@ -186,8 +186,8 @@ Blob.prototype.bytes = function() {
 `
 
 // setupBlobExt evaluates the Blob.stream()/bytes() polyfills.
-func setupBlobExt(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(blobExtJS, "blob_ext.js"); err != nil {
+func setupBlobExt(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, blobExtJS); err != nil {
 		return fmt.Errorf("evaluating blob_ext.js: %w", err)
 	}
 	return nil

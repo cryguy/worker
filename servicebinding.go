@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // ServiceBindingConfig identifies the target worker for a service binding.
@@ -39,84 +39,18 @@ func (sb *ServiceBindingBridge) Fetch(config ServiceBindingConfig, req *WorkerRe
 	return result.Response, nil
 }
 
-// buildServiceBinding creates a JS object with an async fetch() method
-// that calls the target worker via the engine.
-func buildServiceBinding(iso *v8.Isolate, ctx *v8.Context, bridge *ServiceBindingBridge, config ServiceBindingConfig) (*v8.Value, error) {
-	sbObj, err := newJSObject(iso, ctx)
-	if err != nil {
-		return nil, fmt.Errorf("creating service binding object: %w", err)
-	}
-
-	// fetch(urlOrRequest, init?) -> Promise<Response>
-	_ = sbObj.Set("fetch", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		resolver, _ := v8.NewPromiseResolver(ctx)
-		args := info.Args()
-		if len(args) == 0 {
-			errVal, _ := v8.NewValue(iso, "service binding fetch() requires at least one argument")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+// setupServiceBindings registers global Go functions for service binding operations.
+func setupServiceBindings(vm *quickjs.VM, el *eventLoop) error {
+	// __sb_fetch(reqIDStr, bindingName, reqJSON) -> JSON response or error
+	err := registerGoFunc(vm, "__sb_fetch", func(reqIDStr, bindingName, reqJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.ServiceBindings == nil || state.env.Dispatcher == nil {
+			return "", fmt.Errorf("ServiceBindings not available")
 		}
-
-		// Extract request details via JS.
-		_ = ctx.Global().Set("__tmp_sb_arg", args[0])
-		var initArg string
-		if len(args) > 1 && args[1].IsObject() {
-			_ = ctx.Global().Set("__tmp_sb_init", args[1])
-			initArg = "globalThis.__tmp_sb_init"
-		} else {
-			initArg = "null"
-		}
-
-		extractScript := fmt.Sprintf(`(function() {
-			var arg = globalThis.__tmp_sb_arg;
-			var init = %s;
-			delete globalThis.__tmp_sb_arg;
-			delete globalThis.__tmp_sb_init;
-
-			var url, method, headers, body;
-
-			if (typeof arg === 'string') {
-				url = arg;
-			} else if (arg && typeof arg === 'object') {
-				url = arg.url || '';
-				method = arg.method;
-				headers = {};
-				if (arg.headers) {
-					if (typeof arg.headers.forEach === 'function') {
-						arg.headers.forEach(function(v, k) { headers[k] = v; });
-					} else {
-						for (var k in arg.headers) headers[k] = arg.headers[k];
-					}
-				}
-				body = arg._bodyStr || null;
-			}
-
-			if (init) {
-				if (init.method) method = init.method;
-				if (init.headers) {
-					if (!headers) headers = {};
-					if (typeof init.headers.forEach === 'function') {
-						init.headers.forEach(function(v, k) { headers[k] = v; });
-					} else {
-						for (var k in init.headers) headers[k] = init.headers[k];
-					}
-				}
-				if (init.body !== undefined) body = String(init.body);
-			}
-
-			return JSON.stringify({
-				url: url || 'https://fake-host/',
-				method: method || 'GET',
-				headers: headers || {},
-				body: body || null
-			});
-		})()`, initArg)
-
-		reqResult, err := ctx.RunScript(extractScript, "sb_extract_req.js")
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "failed to parse request: "+err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+		config, ok := state.env.ServiceBindings[bindingName]
+		if !ok {
+			return "", fmt.Errorf("ServiceBinding %q not found", bindingName)
 		}
 
 		var reqData struct {
@@ -125,10 +59,8 @@ func buildServiceBinding(iso *v8.Isolate, ctx *v8.Context, bridge *ServiceBindin
 			Headers map[string]string `json:"headers"`
 			Body    *string           `json:"body"`
 		}
-		if err := json.Unmarshal([]byte(reqResult.String()), &reqData); err != nil {
-			errVal, _ := v8.NewValue(iso, "failed to unmarshal request: "+err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+		if err := json.Unmarshal([]byte(reqJSON), &reqData); err != nil {
+			return "", fmt.Errorf("invalid request JSON: %w", err)
 		}
 
 		workerReq := &WorkerRequest{
@@ -140,36 +72,28 @@ func buildServiceBinding(iso *v8.Isolate, ctx *v8.Context, bridge *ServiceBindin
 			workerReq.Body = []byte(*reqData.Body)
 		}
 
-		resp, err := bridge.Fetch(config, workerReq)
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "service binding fetch failed: "+err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
+		bridge := &ServiceBindingBridge{
+			Dispatcher: state.env.Dispatcher,
+			Env:        state.env,
 		}
 
-		// Build a JS Response from the Go response.
-		respJSON, _ := json.Marshal(map[string]interface{}{
+		resp, err := bridge.Fetch(config, workerReq)
+		if err != nil {
+			return "", err
+		}
+
+		// Build response JSON
+		respJSON := map[string]interface{}{
 			"status":  resp.StatusCode,
 			"headers": resp.Headers,
 			"body":    string(resp.Body),
-		})
-		jsResp, err := ctx.RunScript(fmt.Sprintf(`(function() {
-			var d = JSON.parse(%q);
-			var h = new Headers();
-			if (d.headers) {
-				for (var k in d.headers) h.set(k, d.headers[k]);
-			}
-			return new Response(d.body, { status: d.status, headers: h });
-		})()`, string(respJSON)), "sb_build_response.js")
-		if err != nil {
-			errVal, _ := v8.NewValue(iso, "failed to build response: "+err.Error())
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
 		}
+		data, _ := json.Marshal(respJSON)
+		return string(data), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __sb_fetch: %w", err)
+	}
 
-		resolver.Resolve(jsResp)
-		return resolver.GetPromise().Value
-	}).GetFunction(ctx))
-
-	return sbObj.Value, nil
+	return nil
 }

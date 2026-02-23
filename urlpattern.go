@@ -3,7 +3,7 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 const urlPatternJS = `
@@ -174,8 +174,8 @@ globalThis.URLPattern = URLPattern;
 })();
 `
 
-func setupURLPattern(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(urlPatternJS, "urlpattern.js"); err != nil {
+func setupURLPattern(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, urlPatternJS); err != nil {
 		return fmt.Errorf("evaluating urlpattern.js: %w", err)
 	}
 	return nil

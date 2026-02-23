@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 func TestWrapESModule_ExportDefault(t *testing.T) {
@@ -117,16 +117,16 @@ func TestWrapESModule_ErrorFallback(t *testing.T) {
 }
 
 func TestNewV8Pool_InvalidScript(t *testing.T) {
-	_, err := newV8Pool(1, "function {{{invalid syntax", []setupFunc{}, 0)
+	_, err := newQJSPool(1, "function {{{invalid syntax", []setupFunc{}, 0)
 	if err == nil {
-		t.Fatal("newV8Pool should fail with invalid JS")
+		t.Fatal("newQJSPool should fail with invalid JS")
 	}
 }
 
 func TestNewV8Pool_NoDefaultExport(t *testing.T) {
-	_, err := newV8Pool(1, "var x = 42;", []setupFunc{}, 0)
+	_, err := newQJSPool(1, "var x = 42;", []setupFunc{}, 0)
 	if err == nil {
-		t.Fatal("newV8Pool should fail when script has no default export")
+		t.Fatal("newQJSPool should fail when script has no default export")
 	}
 	if !strings.Contains(err.Error(), "did not export a default module") {
 		t.Errorf("error = %q, should mention missing default module", err)
@@ -135,9 +135,9 @@ func TestNewV8Pool_NoDefaultExport(t *testing.T) {
 
 func TestNewV8Pool_WithMemoryLimit(t *testing.T) {
 	source := `export default { fetch() { return new Response("ok"); } };`
-	pool, err := newV8Pool(1, source, []setupFunc{setupWebAPIs}, 64)
+	pool, err := newQJSPool(1, source, []setupFunc{setupWebAPIs}, 64)
 	if err != nil {
-		t.Fatalf("newV8Pool with memory limit: %v", err)
+		t.Fatalf("newQJSPool with memory limit: %v", err)
 	}
 	defer pool.dispose()
 
@@ -148,12 +148,12 @@ func TestNewV8Pool_WithMemoryLimit(t *testing.T) {
 
 func TestNewV8Pool_SetupFuncError(t *testing.T) {
 	source := `export default { fetch() { return new Response("ok"); } };`
-	badSetup := func(iso *v8.Isolate, ctx *v8.Context, el *eventLoop) error {
+	badSetup := func(vm *quickjs.VM, el *eventLoop) error {
 		return fmt.Errorf("setup failed")
 	}
-	_, err := newV8Pool(1, source, []setupFunc{badSetup}, 0)
+	_, err := newQJSPool(1, source, []setupFunc{badSetup}, 0)
 	if err == nil {
-		t.Fatal("newV8Pool should fail when setup function errors")
+		t.Fatal("newQJSPool should fail when setup function errors")
 	}
 	if !strings.Contains(err.Error(), "setup failed") {
 		t.Errorf("error = %q, should mention 'setup failed'", err)
@@ -162,9 +162,9 @@ func TestNewV8Pool_SetupFuncError(t *testing.T) {
 
 func TestPool_GetPutCycle(t *testing.T) {
 	source := `export default { fetch() { return new Response("ok"); } };`
-	pool, err := newV8Pool(2, source, []setupFunc{setupWebAPIs}, 0)
+	pool, err := newQJSPool(2, source, []setupFunc{setupWebAPIs}, 0)
 	if err != nil {
-		t.Fatalf("newV8Pool: %v", err)
+		t.Fatalf("newQJSPool: %v", err)
 	}
 	defer pool.dispose()
 
@@ -187,9 +187,9 @@ func TestPool_GetPutCycle(t *testing.T) {
 
 func TestPool_Dispose(t *testing.T) {
 	source := `export default { fetch() { return new Response("ok"); } };`
-	pool, err := newV8Pool(2, source, []setupFunc{setupWebAPIs}, 0)
+	pool, err := newQJSPool(2, source, []setupFunc{setupWebAPIs}, 0)
 	if err != nil {
-		t.Fatalf("newV8Pool: %v", err)
+		t.Fatalf("newQJSPool: %v", err)
 	}
 
 	// Dispose should not panic.
@@ -202,9 +202,9 @@ func TestPool_Dispose(t *testing.T) {
 func TestPool_PutOverflow(t *testing.T) {
 	source := `export default { fetch() { return new Response("ok"); } };`
 	// Pool of size 1.
-	pool, err := newV8Pool(1, source, []setupFunc{setupWebAPIs}, 0)
+	pool, err := newQJSPool(1, source, []setupFunc{setupWebAPIs}, 0)
 	if err != nil {
-		t.Fatalf("newV8Pool: %v", err)
+		t.Fatalf("newQJSPool: %v", err)
 	}
 
 	// Get the single worker.
@@ -217,9 +217,9 @@ func TestPool_PutOverflow(t *testing.T) {
 	pool.put(w1)
 
 	// Create a second worker manually.
-	w2, err := newV8Worker(source, []setupFunc{setupWebAPIs}, 0)
+	w2, err := newQJSWorker(source, []setupFunc{setupWebAPIs}, 0)
 	if err != nil {
-		t.Fatalf("newV8Worker: %v", err)
+		t.Fatalf("newQJSWorker: %v", err)
 	}
 
 	// Put the second worker — channel is full, so it should be disposed (default branch).
@@ -230,9 +230,9 @@ func TestPool_PutOverflow(t *testing.T) {
 
 func TestPool_GetAfterDispose(t *testing.T) {
 	source := `export default { fetch() { return new Response("ok"); } };`
-	pool, err := newV8Pool(1, source, []setupFunc{setupWebAPIs}, 0)
+	pool, err := newQJSPool(1, source, []setupFunc{setupWebAPIs}, 0)
 	if err != nil {
-		t.Fatalf("newV8Pool: %v", err)
+		t.Fatalf("newQJSPool: %v", err)
 	}
 
 	// Dispose empties workers and closes aren't done explicitly, but drain.

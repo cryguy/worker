@@ -3,7 +3,7 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // streamsJS implements ReadableStream, WritableStream, and TransformStream
@@ -534,11 +534,11 @@ globalThis.CountQueuingStrategy = CountQueuingStrategy;
 `
 
 // setupStreams evaluates the Streams API polyfills.
-func setupStreams(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(streamsJS, "streams.js"); err != nil {
+func setupStreams(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, streamsJS); err != nil {
 		return fmt.Errorf("evaluating streams.js: %w", err)
 	}
-	if _, err := ctx.RunScript(queuingStrategiesJS, "queuing_strategies.js"); err != nil {
+	if err := evalDiscard(vm, queuingStrategiesJS); err != nil {
 		return fmt.Errorf("evaluating queuing_strategies.js: %w", err)
 	}
 	return nil

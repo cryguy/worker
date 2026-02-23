@@ -5,25 +5,24 @@ import (
 	"sync"
 
 	"github.com/evanw/esbuild/pkg/api"
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
-// v8Worker is a single V8 isolate+context pair in the pool.
-type v8Worker struct {
-	iso       *v8.Isolate
-	ctx       *v8.Context
+// qjsWorker is a single QuickJS VM in the pool.
+type qjsWorker struct {
+	vm        *quickjs.VM
 	eventLoop *eventLoop
 }
 
-// v8Pool manages a fixed-size pool of pre-warmed V8 workers.
-type v8Pool struct {
-	workers chan *v8Worker
+// qjsPool manages a fixed-size pool of pre-warmed QuickJS workers.
+type qjsPool struct {
+	workers chan *qjsWorker
 	size    int
 	mu      sync.Mutex
 }
 
-// setupFunc configures a V8 context with Web APIs, crypto, console, etc.
-type setupFunc func(iso *v8.Isolate, ctx *v8.Context, el *eventLoop) error
+// setupFunc configures a QuickJS VM with Web APIs, crypto, console, etc.
+type setupFunc func(vm *quickjs.VM, el *eventLoop) error
 
 // globalThisCleanupJS removes per-request state and user-set globals from
 // globalThis before a worker is returned to the pool. Built-in APIs and
@@ -32,34 +31,42 @@ type setupFunc func(iso *v8.Isolate, ctx *v8.Context, el *eventLoop) error
 const globalThisCleanupJS = `
 (function() {
 	// Delete known per-request globals.
-	var perRequest = ['__requestID', '__ws_active_server'];
+	var perRequest = ['__requestID', '__ws_active_server',
+		'__await_input', '__awaited_result', '__awaited_state',
+		'__fn_result'];
 	for (var i = 0; i < perRequest.length; i++) {
 		try { delete globalThis[perRequest[i]]; } catch(e) {}
 	}
-	// Delete all __d1_exec_, __tmp_, __kv_ prefixed globals.
+	// Clear per-request promise/callback maps.
+	if (globalThis.__fetchPromises) {
+		globalThis.__fetchPromises = {};
+	}
+	if (globalThis.__timerCallbacks) {
+		globalThis.__timerCallbacks = {};
+	}
+	// Delete dynamic per-request __tmp_ prefixed globals.
+	// NOTE: Do NOT delete __kv_*, __do_*, __d1_exec* — those are permanent
+	// Go-backed functions registered at pool creation time.
 	var names = Object.getOwnPropertyNames(globalThis);
 	for (var i = 0; i < names.length; i++) {
 		var n = names[i];
-		if (n.indexOf('__d1_exec_') === 0 ||
-			n.indexOf('__tmp_') === 0 ||
-			n.indexOf('__kv_') === 0 ||
-			n.indexOf('__do_') === 0) {
+		if (n.indexOf('__tmp_') === 0) {
 			try { delete globalThis[n]; } catch(e) {}
 		}
 	}
 })();
 `
 
-// newV8Pool creates a pool of V8 isolates, each configured with the given
+// newQJSPool creates a pool of QuickJS VMs, each configured with the given
 // setup functions and loaded with the worker script.
-func newV8Pool(size int, source string, setupFns []setupFunc, memoryLimitMB int) (*v8Pool, error) {
-	pool := &v8Pool{
-		workers: make(chan *v8Worker, size),
+func newQJSPool(size int, source string, setupFns []setupFunc, memoryLimitMB int) (*qjsPool, error) {
+	pool := &qjsPool{
+		workers: make(chan *qjsWorker, size),
 		size:    size,
 	}
 
 	for i := 0; i < size; i++ {
-		w, err := newV8Worker(source, setupFns, memoryLimitMB)
+		w, err := newQJSWorker(source, setupFns, memoryLimitMB)
 		if err != nil {
 			pool.dispose()
 			return nil, fmt.Errorf("creating pool worker %d: %w", i, err)
@@ -70,56 +77,49 @@ func newV8Pool(size int, source string, setupFns []setupFunc, memoryLimitMB int)
 	return pool, nil
 }
 
-// newV8Worker creates a single V8 isolate+context, runs all setup functions,
+// newQJSWorker creates a single QuickJS VM, runs all setup functions,
 // and loads the worker script.
-func newV8Worker(source string, setupFns []setupFunc, memoryLimitMB int) (*v8Worker, error) {
-	var iso *v8.Isolate
-	if memoryLimitMB > 0 {
-		heapSize := uint64(memoryLimitMB) * 1024 * 1024
-		iso = v8.NewIsolate(v8.WithResourceConstraints(heapSize/2, heapSize))
-	} else {
-		iso = v8.NewIsolate()
+func newQJSWorker(source string, setupFns []setupFunc, memoryLimitMB int) (*qjsWorker, error) {
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		return nil, fmt.Errorf("creating QuickJS VM: %w", err)
 	}
-	ctx := v8.NewContext(iso)
+
+	if memoryLimitMB > 0 {
+		vm.SetMemoryLimit(uintptr(memoryLimitMB) * 1024 * 1024)
+	}
+
 	el := newEventLoop()
 
-	// Run all setup functions (Web APIs, crypto, console, fetch, etc.).
+	// Run all setup functions (Web APIs, crypto, console, fetch, timers, etc.).
 	for _, setup := range setupFns {
-		if err := setup(iso, ctx, el); err != nil {
-			ctx.Close()
-			iso.Dispose()
+		if err := setup(vm, el); err != nil {
+			vm.Close()
 			return nil, fmt.Errorf("setup: %w", err)
 		}
 	}
 
 	// Compile and run the worker script.
 	wrapped := wrapESModule(source)
-	script, err := iso.CompileUnboundScript(wrapped, "worker.js", v8.CompileOptions{})
+	v, err := vm.EvalValue(wrapped, quickjs.EvalGlobal)
 	if err != nil {
-		ctx.Close()
-		iso.Dispose()
-		return nil, fmt.Errorf("compiling worker script: %w", err)
-	}
-
-	if _, err := script.Run(ctx); err != nil {
-		ctx.Close()
-		iso.Dispose()
+		vm.Close()
 		return nil, fmt.Errorf("running worker script: %w", err)
 	}
+	v.Free()
 
 	// Verify __worker_module__ was set.
-	check, err := ctx.RunScript("typeof globalThis.__worker_module__ !== 'undefined'", "check.js")
-	if err != nil || !check.Boolean() {
-		ctx.Close()
-		iso.Dispose()
+	ok, err := evalBool(vm, "typeof globalThis.__worker_module__ !== 'undefined'")
+	if err != nil || !ok {
+		vm.Close()
 		return nil, fmt.Errorf("worker script did not export a default module")
 	}
 
-	return &v8Worker{iso: iso, ctx: ctx, eventLoop: el}, nil
+	return &qjsWorker{vm: vm, eventLoop: el}, nil
 }
 
 // get acquires a worker from the pool. Blocks until one is available.
-func (p *v8Pool) get() (*v8Worker, error) {
+func (p *qjsPool) get() (*qjsWorker, error) {
 	w, ok := <-p.workers
 	if !ok {
 		return nil, fmt.Errorf("worker pool is closed")
@@ -128,28 +128,26 @@ func (p *v8Pool) get() (*v8Worker, error) {
 }
 
 // put returns a worker to the pool after resetting its event loop.
-func (p *v8Pool) put(w *v8Worker) {
+func (p *qjsPool) put(w *qjsWorker) {
 	// Clean per-request globals before reuse.
-	_, _ = w.ctx.RunScript(globalThisCleanupJS, "cleanup.js")
+	_ = evalDiscard(w.vm, globalThisCleanupJS)
 	w.eventLoop.reset()
 	select {
 	case p.workers <- w:
 	default:
 		// Pool full (shouldn't happen), dispose the worker.
-		w.ctx.Close()
-		w.iso.Dispose()
+		w.vm.Close()
 	}
 }
 
 // dispose closes all workers in the pool.
-func (p *v8Pool) dispose() {
+func (p *qjsPool) dispose() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {
 		select {
 		case w := <-p.workers:
-			w.ctx.Close()
-			w.iso.Dispose()
+			w.vm.Close()
 		default:
 			return
 		}

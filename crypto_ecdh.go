@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // ecdhCurveFromName returns the ecdh.Curve for the given Web Crypto curve name.
@@ -160,32 +160,22 @@ subtle.exportKey = async function(format, key) {
 
 // setupCryptoECDH registers ECDH and X25519 key agreement operations.
 // Must run after setupCryptoDerive.
-func setupCryptoECDH(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupCryptoECDH(vm *quickjs.VM, _ *eventLoop) error {
 	// __cryptoGenerateECDH(curve, extractable) -> JSON { privateKeyId, publicKeyId }
-	_ = ctx.Global().Set("__cryptoGenerateECDH", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "generateECDH requires 2 argument(s)")
-		}
-		curveName := args[0].String()
-		extractableVal := args[1].Boolean()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoGenerateECDH", func(curveName string, extractableVal bool) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		curve := ecdhCurveFromName(curveName)
 		if curve == nil {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"unsupported curve %q"}`, curveName))
-			return val
+			return fmt.Sprintf(`{"error":"unsupported curve %q"}`, curveName), nil
 		}
 
 		privKey, err := curve.GenerateKey(rand.Reader)
 		if err != nil {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()))
-			return val
+			return fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()), nil
 		}
 
 		privID := importCryptoKeyFull(reqID, &cryptoKeyEntry{
@@ -195,42 +185,33 @@ func setupCryptoECDH(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			algoName: "ECDH", keyType: "public", namedCurve: curveName, ecKey: privKey.PublicKey(), extractable: extractableVal,
 		})
 
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID))
-		return val
-	}).GetFunction(ctx))
+		return fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID), nil
+	}, false)
 
 	// __cryptoDeriveECDH(privateKeyID, publicKeyID, lengthBits) -> base64 shared secret
-	_ = ctx.Global().Set("__cryptoDeriveECDH", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "deriveECDH requires 3 argument(s)")
-		}
-		privKeyID := args[0].Integer()
-		pubKeyID := args[1].Integer()
-		lengthBits := int(args[2].Int32())
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoDeriveECDH", func(privKeyID, pubKeyID int, lengthBits int) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		privEntry := getCryptoKey(reqID, privKeyID)
 		if privEntry == nil {
-			return throwError(iso, "deriveECDH: private key not found")
+			return "", fmt.Errorf("deriveECDH: private key not found")
 		}
 		pubEntry := getCryptoKey(reqID, pubKeyID)
 		if pubEntry == nil {
-			return throwError(iso, "deriveECDH: public key not found")
+			return "", fmt.Errorf("deriveECDH: public key not found")
 		}
 
 		privKey, ok := privEntry.ecKey.(*ecdh.PrivateKey)
 		if !ok {
-			return throwError(iso, "deriveECDH: key is not an ECDH private key")
+			return "", fmt.Errorf("deriveECDH: key is not an ECDH private key")
 		}
 		pubKey, ok := pubEntry.ecKey.(*ecdh.PublicKey)
 		if !ok {
-			return throwError(iso, "deriveECDH: key is not an ECDH public key")
+			return "", fmt.Errorf("deriveECDH: key is not an ECDH public key")
 		}
 
 		shared, err := privKey.ECDH(pubKey)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("deriveECDH: %s", err.Error()))
+			return "", fmt.Errorf("deriveECDH: %s", err.Error())
 		}
 
 		// Truncate to requested bit length
@@ -239,121 +220,88 @@ func setupCryptoECDH(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			lengthBytes = len(shared)
 		}
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(shared[:lengthBytes]))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(shared[:lengthBytes]), nil
+	}, false)
 
 	// __cryptoImportECDH(format, dataB64, curve, extractable) -> JSON { keyId, keyType }
-	_ = ctx.Global().Set("__cryptoImportECDH", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "importECDH requires 4 argument(s)")
-		}
-		format := args[0].String()
-		dataStr := args[1].String()
-		curveName := args[2].String()
-		extractableVal := args[3].Boolean()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoImportECDH", func(format, dataStr, curveName string, extractableVal bool) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		curve := ecdhCurveFromName(curveName)
 		if curve == nil {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"unsupported curve %q"}`, curveName))
-			return val
+			return fmt.Sprintf(`{"error":"unsupported curve %q"}`, curveName), nil
 		}
 
 		switch format {
 		case "raw":
 			keyData, err := base64.StdEncoding.DecodeString(dataStr)
 			if err != nil {
-				val, _ := v8.NewValue(iso, `{"error":"invalid base64"}`)
-				return val
+				return `{"error":"invalid base64"}`, nil
 			}
 			// Raw format is always a public key (uncompressed point)
 			pubKey, err := curve.NewPublicKey(keyData)
 			if err != nil {
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"invalid ECDH public key: %s"}`, err.Error()))
-				return val
+				return fmt.Sprintf(`{"error":"invalid ECDH public key: %s"}`, err.Error()), nil
 			}
 			id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 				algoName: "ECDH", keyType: "public", namedCurve: curveName, ecKey: pubKey, extractable: extractableVal,
 			})
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id))
-			return val
+			return fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id), nil
 
 		case "jwk":
-			return importECDHJWK(iso, reqID, dataStr, curveName, curve, extractableVal)
+			return importECDHJWK(reqID, dataStr, curveName, curve, extractableVal)
 
 		default:
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"unsupported format %q"}`, format))
-			return val
+			return fmt.Sprintf(`{"error":"unsupported format %q"}`, format), nil
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// __cryptoExportECDH(keyID, format) -> base64 or JSON string
-	_ = ctx.Global().Set("__cryptoExportECDH", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "exportECDH requires 2 argument(s)")
-		}
-		keyID := args[0].Integer()
-		format := args[1].String()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoExportECDH", func(keyID int, format string) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "exportECDH: key not found")
+			return "", fmt.Errorf("exportECDH: key not found")
 		}
 		if !entry.extractable {
-			return throwError(iso, "key is not extractable")
+			return "", fmt.Errorf("key is not extractable")
 		}
 
 		switch format {
 		case "raw":
 			switch k := entry.ecKey.(type) {
 			case *ecdh.PublicKey:
-				val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(k.Bytes()))
-				return val
+				return base64.StdEncoding.EncodeToString(k.Bytes()), nil
 			case *ecdh.PrivateKey:
 				// Export public key bytes for raw format
-				val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(k.PublicKey().Bytes()))
-				return val
+				return base64.StdEncoding.EncodeToString(k.PublicKey().Bytes()), nil
 			default:
-				return throwError(iso, "exportECDH: not an ECDH key")
+				return "", fmt.Errorf("exportECDH: not an ECDH key")
 			}
 
 		case "jwk":
-			return exportECDHJWK(iso, entry)
+			return exportECDHJWK(entry)
 
 		default:
-			return throwError(iso, fmt.Sprintf("exportECDH: unsupported format %q", format))
+			return "", fmt.Errorf("exportECDH: unsupported format %q", format)
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// --- X25519 callbacks ---
 
 	// __cryptoGenerateX25519(extractable) -> JSON { privateKeyId, publicKeyId }
-	_ = ctx.Global().Set("__cryptoGenerateX25519", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		extractableVal := false
-		if len(args) > 0 {
-			extractableVal = args[0].Boolean()
-		}
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoGenerateX25519", func(extractableVal bool) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		privKey, err := ecdh.X25519().GenerateKey(rand.Reader)
 		if err != nil {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()))
-			return val
+			return fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()), nil
 		}
 
 		privID := importCryptoKeyFull(reqID, &cryptoKeyEntry{
@@ -363,42 +311,33 @@ func setupCryptoECDH(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			algoName: "X25519", keyType: "public", ecKey: privKey.PublicKey(), extractable: extractableVal,
 		})
 
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID))
-		return val
-	}).GetFunction(ctx))
+		return fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID), nil
+	}, false)
 
 	// __cryptoDeriveX25519(privateKeyID, publicKeyID, lengthBits) -> base64 shared secret
-	_ = ctx.Global().Set("__cryptoDeriveX25519", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "deriveX25519 requires 3 argument(s)")
-		}
-		privKeyID := args[0].Integer()
-		pubKeyID := args[1].Integer()
-		lengthBits := int(args[2].Int32())
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoDeriveX25519", func(privKeyID, pubKeyID int, lengthBits int) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		privEntry := getCryptoKey(reqID, privKeyID)
 		if privEntry == nil {
-			return throwError(iso, "deriveX25519: private key not found")
+			return "", fmt.Errorf("deriveX25519: private key not found")
 		}
 		pubEntry := getCryptoKey(reqID, pubKeyID)
 		if pubEntry == nil {
-			return throwError(iso, "deriveX25519: public key not found")
+			return "", fmt.Errorf("deriveX25519: public key not found")
 		}
 
 		privKey, ok := privEntry.ecKey.(*ecdh.PrivateKey)
 		if !ok {
-			return throwError(iso, "deriveX25519: key is not an X25519 private key")
+			return "", fmt.Errorf("deriveX25519: key is not an X25519 private key")
 		}
 		pubKey, ok := pubEntry.ecKey.(*ecdh.PublicKey)
 		if !ok {
-			return throwError(iso, "deriveX25519: key is not an X25519 public key")
+			return "", fmt.Errorf("deriveX25519: key is not an X25519 public key")
 		}
 
 		shared, err := privKey.ECDH(pubKey)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("deriveX25519: %s", err.Error()))
+			return "", fmt.Errorf("deriveX25519: %s", err.Error())
 		}
 
 		// Truncate to requested bit length
@@ -407,111 +346,84 @@ func setupCryptoECDH(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			lengthBytes = len(shared)
 		}
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(shared[:lengthBytes]))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(shared[:lengthBytes]), nil
+	}, false)
 
 	// __cryptoImportX25519(format, dataB64, keyType, extractable) -> JSON { keyId, keyType }
-	_ = ctx.Global().Set("__cryptoImportX25519", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "importX25519 requires 4 argument(s)")
-		}
-		format := args[0].String()
-		dataStr := args[1].String()
-		keyType := args[2].String()
-		extractableVal := args[3].Boolean()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoImportX25519", func(format, dataStr, keyType string, extractableVal bool) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		if format != "raw" {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"X25519 only supports raw format, got %q"}`, format))
-			return val
+			return fmt.Sprintf(`{"error":"X25519 only supports raw format, got %q"}`, format), nil
 		}
 
 		keyData, err := base64.StdEncoding.DecodeString(dataStr)
 		if err != nil {
-			val, _ := v8.NewValue(iso, `{"error":"invalid base64"}`)
-			return val
+			return `{"error":"invalid base64"}`, nil
 		}
 
 		if len(keyData) != 32 {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"X25519 key must be 32 bytes, got %d"}`, len(keyData)))
-			return val
+			return fmt.Sprintf(`{"error":"X25519 key must be 32 bytes, got %d"}`, len(keyData)), nil
 		}
 
 		curve := ecdh.X25519()
 		if keyType == "private" {
 			privKey, err := curve.NewPrivateKey(keyData)
 			if err != nil {
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"invalid X25519 private key: %s"}`, err.Error()))
-				return val
+				return fmt.Sprintf(`{"error":"invalid X25519 private key: %s"}`, err.Error()), nil
 			}
 			id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 				algoName: "X25519", keyType: "private", ecKey: privKey, extractable: extractableVal,
 			})
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id))
-			return val
+			return fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id), nil
 		}
 
 		pubKey, err := curve.NewPublicKey(keyData)
 		if err != nil {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"invalid X25519 public key: %s"}`, err.Error()))
-			return val
+			return fmt.Sprintf(`{"error":"invalid X25519 public key: %s"}`, err.Error()), nil
 		}
 		id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 			algoName: "X25519", keyType: "public", ecKey: pubKey, extractable: extractableVal,
 		})
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id))
-		return val
-	}).GetFunction(ctx))
+		return fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id), nil
+	}, false)
 
 	// __cryptoExportX25519(keyID, format) -> base64
-	_ = ctx.Global().Set("__cryptoExportX25519", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "exportX25519 requires 2 argument(s)")
-		}
-		keyID := args[0].Integer()
-		format := args[1].String()
-
+	registerGoFunc(vm, "__cryptoExportX25519", func(keyID int, format string) (string, error) {
 		if format != "raw" {
-			return throwError(iso, fmt.Sprintf("exportX25519: only raw format supported, got %q", format))
+			return "", fmt.Errorf("exportX25519: only raw format supported, got %q", format)
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "exportX25519: key not found")
+			return "", fmt.Errorf("exportX25519: key not found")
 		}
 		if !entry.extractable {
-			return throwError(iso, "key is not extractable")
+			return "", fmt.Errorf("key is not extractable")
 		}
 
 		switch k := entry.ecKey.(type) {
 		case *ecdh.PublicKey:
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(k.Bytes()))
-			return val
+			return base64.StdEncoding.EncodeToString(k.Bytes()), nil
 		case *ecdh.PrivateKey:
-			val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(k.Bytes()))
-			return val
+			return base64.StdEncoding.EncodeToString(k.Bytes()), nil
 		default:
-			return throwError(iso, "exportX25519: not an X25519 key")
+			return "", fmt.Errorf("exportX25519: not an X25519 key")
 		}
-	}).GetFunction(ctx))
+	}, false)
 
-	if _, err := ctx.RunScript(cryptoECDHJS, "crypto_ecdh.js"); err != nil {
+	if err := evalDiscard(vm, cryptoECDHJS); err != nil {
 		return fmt.Errorf("evaluating crypto_ecdh.js: %w", err)
 	}
 	return nil
 }
 
 // importECDHJWK imports an ECDH key from JWK format.
-func importECDHJWK(iso *v8.Isolate, reqID uint64, dataStr, curveName string, curve ecdh.Curve, extractable bool) *v8.Value {
+func importECDHJWK(reqID uint64, dataStr, curveName string, curve ecdh.Curve, extractable bool) (string, error) {
 	var jwk struct {
 		Kty string `json:"kty"`
 		Crv string `json:"crv"`
@@ -519,47 +431,39 @@ func importECDHJWK(iso *v8.Isolate, reqID uint64, dataStr, curveName string, cur
 		Y   string `json:"y"`
 		D   string `json:"d"`
 	}
-	if err := decodeJSON([]byte(dataStr), &jwk); err != nil {
-		val, _ := v8.NewValue(iso, `{"error":"invalid JWK JSON"}`)
-		return val
+	if err := json.Unmarshal([]byte(dataStr), &jwk); err != nil {
+		return `{"error":"invalid JWK JSON"}`, nil
 	}
 	if jwk.Kty != "EC" {
-		val, _ := v8.NewValue(iso, `{"error":"JWK kty must be EC for ECDH"}`)
-		return val
+		return `{"error":"JWK kty must be EC for ECDH"}`, nil
 	}
 	if jwk.Crv != curveName {
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"JWK crv %q does not match algorithm curve %q"}`, jwk.Crv, curveName))
-		return val
+		return fmt.Sprintf(`{"error":"JWK crv %q does not match algorithm curve %q"}`, jwk.Crv, curveName), nil
 	}
 
 	xBytes, err := base64.RawURLEncoding.DecodeString(jwk.X)
 	if err != nil {
-		val, _ := v8.NewValue(iso, `{"error":"invalid JWK x value"}`)
-		return val
+		return `{"error":"invalid JWK x value"}`, nil
 	}
 	yBytes, err := base64.RawURLEncoding.DecodeString(jwk.Y)
 	if err != nil {
-		val, _ := v8.NewValue(iso, `{"error":"invalid JWK y value"}`)
-		return val
+		return `{"error":"invalid JWK y value"}`, nil
 	}
 
 	if jwk.D != "" {
 		// Private key
 		dBytes, err := base64.RawURLEncoding.DecodeString(jwk.D)
 		if err != nil {
-			val, _ := v8.NewValue(iso, `{"error":"invalid JWK d value"}`)
-			return val
+			return `{"error":"invalid JWK d value"}`, nil
 		}
 		privKey, err := curve.NewPrivateKey(dBytes)
 		if err != nil {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"invalid ECDH private key: %s"}`, err.Error()))
-			return val
+			return fmt.Sprintf(`{"error":"invalid ECDH private key: %s"}`, err.Error()), nil
 		}
 		id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 			algoName: "ECDH", keyType: "private", namedCurve: curveName, ecKey: privKey, extractable: extractable,
 		})
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id))
-		return val
+		return fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id), nil
 	}
 
 	// Public key - reconstruct uncompressed point: 0x04 || x || y
@@ -570,18 +474,16 @@ func importECDHJWK(iso *v8.Isolate, reqID uint64, dataStr, curveName string, cur
 
 	pubKey, err := curve.NewPublicKey(uncompressed)
 	if err != nil {
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"invalid ECDH public key: %s"}`, err.Error()))
-		return val
+		return fmt.Sprintf(`{"error":"invalid ECDH public key: %s"}`, err.Error()), nil
 	}
 	id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 		algoName: "ECDH", keyType: "public", namedCurve: curveName, ecKey: pubKey, extractable: extractable,
 	})
-	val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id))
-	return val
+	return fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id), nil
 }
 
 // exportECDHJWK exports an ECDH key as JWK.
-func exportECDHJWK(iso *v8.Isolate, entry *cryptoKeyEntry) *v8.Value {
+func exportECDHJWK(entry *cryptoKeyEntry) (string, error) {
 	jwk := map[string]string{
 		"kty": "EC",
 		"crv": entry.namedCurve,
@@ -595,28 +497,17 @@ func exportECDHJWK(iso *v8.Isolate, entry *cryptoKeyEntry) *v8.Value {
 		pubBytes = k.PublicKey().Bytes()
 		jwk["d"] = base64.RawURLEncoding.EncodeToString(k.Bytes())
 	default:
-		return throwError(iso, "exportECDH: not an ECDH key")
+		return "", fmt.Errorf("exportECDH: not an ECDH key")
 	}
 
 	// Uncompressed point: 0x04 || x || y
 	if len(pubBytes) < 3 || pubBytes[0] != 0x04 {
-		return throwError(iso, "exportECDH: unexpected public key format")
+		return "", fmt.Errorf("exportECDH: unexpected public key format")
 	}
 	coordLen := (len(pubBytes) - 1) / 2
 	jwk["x"] = base64.RawURLEncoding.EncodeToString(pubBytes[1 : 1+coordLen])
 	jwk["y"] = base64.RawURLEncoding.EncodeToString(pubBytes[1+coordLen:])
 
-	data, _ := encodeJSON(jwk)
-	val, _ := v8.NewValue(iso, string(data))
-	return val
-}
-
-// decodeJSON is a small wrapper for json.Unmarshal used in ECDH JWK import.
-func decodeJSON(data []byte, v any) error {
-	return json.Unmarshal(data, v)
-}
-
-// encodeJSON is a small wrapper for json.Marshal used in ECDH JWK export.
-func encodeJSON(v any) ([]byte, error) {
-	return json.Marshal(v)
+	data, _ := json.Marshal(jwk)
+	return string(data), nil
 }

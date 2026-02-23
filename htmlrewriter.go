@@ -6,8 +6,8 @@ import (
 	"html"
 	"strings"
 
-	v8 "github.com/tommie/v8go"
 	gohtml "golang.org/x/net/html"
+	"modernc.org/quickjs"
 )
 
 // maxHTMLRewriterHandlers caps the number of selector handlers to prevent CPU DoS.
@@ -74,32 +74,22 @@ globalThis.HTMLRewriter = HTMLRewriter;
 
 // setupHTMLRewriter registers the HTMLRewriter JS class and the Go-backed
 // __htmlRewrite function that performs streaming HTML transformation.
-func setupHTMLRewriter(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupHTMLRewriter(vm *quickjs.VM, _ *eventLoop) error {
 	// Register __htmlRewrite(htmlString) — transforms HTML using registered handlers.
-	rewriteFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 1 {
-			return nil
-		}
-		htmlStr := args[0].String()
-		c := info.Context()
-
-		result, err := rewriteHTML(iso, c, htmlStr)
+	err := registerGoFunc(vm, "__htmlRewrite", func(htmlStr string) string {
+		result, err := rewriteHTML(vm, htmlStr)
 		if err != nil {
 			// Return original HTML on error.
-			val, _ := v8.NewValue(iso, htmlStr)
-			return val
+			return htmlStr
 		}
-
-		val, _ := v8.NewValue(iso, result)
-		return val
-	})
-	if err := ctx.Global().Set("__htmlRewrite", rewriteFn.GetFunction(ctx)); err != nil {
-		return fmt.Errorf("setting __htmlRewrite: %w", err)
+		return result
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __htmlRewrite: %w", err)
 	}
 
 	// Evaluate the JS class.
-	if _, err := ctx.RunScript(htmlRewriterJS, "htmlrewriter.js"); err != nil {
+	if err := evalDiscard(vm, htmlRewriterJS); err != nil {
 		return fmt.Errorf("evaluating htmlrewriter.js: %w", err)
 	}
 	return nil
@@ -125,15 +115,14 @@ type matchedElement struct {
 
 // rewriteHTML tokenizes HTML, matches selectors, calls JS handlers, and
 // applies mutations to produce transformed output.
-func rewriteHTML(iso *v8.Isolate, ctx *v8.Context, htmlStr string) (string, error) {
+func rewriteHTML(vm *quickjs.VM, htmlStr string) (string, error) {
 	// Read handler registrations from JS globals.
-	handlersCountVal, err := ctx.RunScript(`
+	handlersCount, err := evalInt(vm, `
 		globalThis.__htmlrw_handlers ? globalThis.__htmlrw_handlers.length : 0
-	`, "rw_count.js")
+	`)
 	if err != nil {
 		return htmlStr, err
 	}
-	handlersCount := int(handlersCountVal.Int32())
 	if handlersCount > maxHTMLRewriterHandlers {
 		handlersCount = maxHTMLRewriterHandlers
 	}
@@ -141,14 +130,11 @@ func rewriteHTML(iso *v8.Isolate, ctx *v8.Context, htmlStr string) (string, erro
 	// Parse selectors for each handler.
 	var specs []handlerSpec
 	for i := 0; i < handlersCount; i++ {
-		selVal, err := ctx.RunScript(
-			fmt.Sprintf(`globalThis.__htmlrw_handlers[%d].selector`, i),
-			"rw_sel.js",
-		)
+		selStr, err := evalString(vm, fmt.Sprintf(`globalThis.__htmlrw_handlers[%d].selector`, i))
 		if err != nil {
 			continue
 		}
-		sel := parseCompoundSelector(selVal.String())
+		sel := parseCompoundSelector(selStr)
 		specs = append(specs, handlerSpec{selector: sel, handlerIdx: i})
 	}
 
@@ -217,7 +203,7 @@ func rewriteHTML(iso *v8.Isolate, ctx *v8.Context, htmlStr string) (string, erro
 				if !selectorMatches(spec, token.Data, attrs) {
 					continue
 				}
-				mutations := callElementHandler(iso, ctx, spec.handlerIdx, token.Data, attrs)
+				mutations := callElementHandler(vm, spec.handlerIdx, token.Data, attrs)
 
 				if mutations == nil {
 					// No element handler, but selector matched.
@@ -365,7 +351,7 @@ func rewriteHTML(iso *v8.Isolate, ctx *v8.Context, htmlStr string) (string, erro
 			// Call text handlers for matched parent elements.
 			for _, me := range matchStack {
 				if !me.skipContent && depth >= me.depth {
-					mutations := callTextHandler(iso, ctx, me.handlerIdx, textContent, false)
+					mutations := callTextHandler(vm, me.handlerIdx, textContent, false)
 					if mutations != nil {
 						handled = true
 						out.WriteString(mutations.Before)
@@ -383,7 +369,7 @@ func rewriteHTML(iso *v8.Isolate, ctx *v8.Context, htmlStr string) (string, erro
 			}
 
 			// Document-level text handler.
-			docMut := callDocTextHandler(iso, ctx, textContent)
+			docMut := callDocTextHandler(vm, textContent)
 			if docMut != nil && !handled {
 				out.WriteString(docMut.Before)
 				if docMut.Removed {
@@ -406,7 +392,7 @@ func rewriteHTML(iso *v8.Isolate, ctx *v8.Context, htmlStr string) (string, erro
 			handled := false
 			for _, me := range matchStack {
 				if !me.skipContent && depth >= me.depth {
-					mutations := callCommentHandler(iso, ctx, me.handlerIdx, token.Data)
+					mutations := callCommentHandler(vm, me.handlerIdx, token.Data)
 					if mutations != nil {
 						handled = true
 						out.WriteString(mutations.Before)
@@ -445,7 +431,7 @@ func rewriteHTML(iso *v8.Isolate, ctx *v8.Context, htmlStr string) (string, erro
 				if !selectorMatches(spec, token.Data, attrs) {
 					continue
 				}
-				mutations := callElementHandler(iso, ctx, spec.handlerIdx, token.Data, attrs)
+				mutations := callElementHandler(vm, spec.handlerIdx, token.Data, attrs)
 				if mutations == nil {
 					continue
 				}
@@ -486,7 +472,7 @@ func rewriteHTML(iso *v8.Isolate, ctx *v8.Context, htmlStr string) (string, erro
 	}
 
 	// Call document end handler.
-	endMutations := callDocEndHandler(ctx)
+	endMutations := callDocEndHandler(vm)
 	if endMutations != "" {
 		out.WriteString(endMutations)
 	}
@@ -526,16 +512,21 @@ type textMutations struct {
 }
 
 // callElementHandler invokes the JS element handler and returns mutations.
-func callElementHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, tagName string, attrs map[string]string) *elementMutations {
+func callElementHandler(vm *quickjs.VM, handlerIdx int, tagName string, attrs map[string]string) *elementMutations {
 	attrsJSON, _ := json.Marshal(attrs)
-	tagVal, _ := v8.NewValue(iso, tagName)
-	_ = ctx.Global().Set("__el_tag", tagVal)
-	attrsVal, _ := v8.NewValue(iso, string(attrsJSON))
-	_ = ctx.Global().Set("__el_attrs", attrsVal)
-	idxVal, _ := v8.NewValue(iso, int32(handlerIdx))
-	_ = ctx.Global().Set("__el_handler_idx", idxVal)
 
-	result, err := ctx.RunScript(`
+	// Set globals
+	if err := setGlobal(vm, "__el_tag", tagName); err != nil {
+		return nil
+	}
+	if err := setGlobal(vm, "__el_attrs", string(attrsJSON)); err != nil {
+		return nil
+	}
+	if err := evalDiscard(vm, fmt.Sprintf("globalThis.__el_handler_idx = %d;", handlerIdx)); err != nil {
+		return nil
+	}
+
+	result, err := evalString(vm, `
 		(function() {
 			var tag = globalThis.__el_tag;
 			var attrsObj = JSON.parse(globalThis.__el_attrs);
@@ -579,8 +570,8 @@ func callElementHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, tagNam
 				tagName: newTag,
 			});
 		})()
-	`, "rw_element.js")
-	if err != nil || result == nil || result.String() == "null" {
+	`)
+	if err != nil || result == "null" {
 		return nil
 	}
 
@@ -593,7 +584,7 @@ func callElementHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, tagNam
 		Attrs   map[string]string `json:"attrs"`
 		TagName string            `json:"tagName"`
 	}
-	if err := json.Unmarshal([]byte(result.String()), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
 		return nil
 	}
 
@@ -627,15 +618,18 @@ func callElementHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, tagNam
 }
 
 // callTextHandler invokes the JS text handler and returns mutations.
-func callTextHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, text string, last bool) *textMutations {
-	textVal, _ := v8.NewValue(iso, text)
-	_ = ctx.Global().Set("__text_content", textVal)
-	lastVal, _ := v8.NewValue(iso, last)
-	_ = ctx.Global().Set("__text_last", lastVal)
-	idxVal, _ := v8.NewValue(iso, int32(handlerIdx))
-	_ = ctx.Global().Set("__text_handler_idx", idxVal)
+func callTextHandler(vm *quickjs.VM, handlerIdx int, text string, last bool) *textMutations {
+	if err := setGlobal(vm, "__text_content", text); err != nil {
+		return nil
+	}
+	if err := evalDiscard(vm, fmt.Sprintf("globalThis.__text_last = %t;", last)); err != nil {
+		return nil
+	}
+	if err := evalDiscard(vm, fmt.Sprintf("globalThis.__text_handler_idx = %d;", handlerIdx)); err != nil {
+		return nil
+	}
 
-	result, err := ctx.RunScript(`
+	result, err := evalString(vm, `
 		(function() {
 			var content = globalThis.__text_content;
 			var isLast = globalThis.__text_last;
@@ -661,8 +655,8 @@ func callTextHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, text stri
 
 			return JSON.stringify(mutations);
 		})()
-	`, "rw_text.js")
-	if err != nil || result == nil || result.String() == "null" {
+	`)
+	if err != nil || result == "null" {
 		return nil
 	}
 
@@ -671,7 +665,7 @@ func callTextHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, text stri
 		C string `json:"c"`
 		H bool   `json:"h"`
 	}
-	if err := json.Unmarshal([]byte(result.String()), &muts); err != nil {
+	if err := json.Unmarshal([]byte(result), &muts); err != nil {
 		return nil
 	}
 
@@ -700,13 +694,15 @@ func callTextHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, text stri
 }
 
 // callCommentHandler invokes the JS comment handler and returns mutations.
-func callCommentHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, comment string) *textMutations {
-	commentVal, _ := v8.NewValue(iso, comment)
-	_ = ctx.Global().Set("__comment_content", commentVal)
-	idxVal, _ := v8.NewValue(iso, int32(handlerIdx))
-	_ = ctx.Global().Set("__comment_handler_idx", idxVal)
+func callCommentHandler(vm *quickjs.VM, handlerIdx int, comment string) *textMutations {
+	if err := setGlobal(vm, "__comment_content", comment); err != nil {
+		return nil
+	}
+	if err := evalDiscard(vm, fmt.Sprintf("globalThis.__comment_handler_idx = %d;", handlerIdx)); err != nil {
+		return nil
+	}
 
-	result, err := ctx.RunScript(`
+	result, err := evalString(vm, `
 		(function() {
 			var content = globalThis.__comment_content;
 			var idx = globalThis.__comment_handler_idx;
@@ -729,8 +725,8 @@ func callCommentHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, commen
 
 			return JSON.stringify(mutations);
 		})()
-	`, "rw_comment.js")
-	if err != nil || result == nil || result.String() == "null" {
+	`)
+	if err != nil || result == "null" {
 		return nil
 	}
 
@@ -739,7 +735,7 @@ func callCommentHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, commen
 		C string `json:"c"`
 		H bool   `json:"h"`
 	}
-	if err := json.Unmarshal([]byte(result.String()), &muts); err != nil {
+	if err := json.Unmarshal([]byte(result), &muts); err != nil {
 		return nil
 	}
 	if len(muts) == 0 {
@@ -767,11 +763,12 @@ func callCommentHandler(iso *v8.Isolate, ctx *v8.Context, handlerIdx int, commen
 }
 
 // callDocTextHandler calls the document-level text handler if registered.
-func callDocTextHandler(iso *v8.Isolate, ctx *v8.Context, text string) *textMutations {
-	textVal, _ := v8.NewValue(iso, text)
-	_ = ctx.Global().Set("__doc_text_content", textVal)
+func callDocTextHandler(vm *quickjs.VM, text string) *textMutations {
+	if err := setGlobal(vm, "__doc_text_content", text); err != nil {
+		return nil
+	}
 
-	result, err := ctx.RunScript(`
+	result, err := evalString(vm, `
 		(function() {
 			var content = globalThis.__doc_text_content;
 			delete globalThis.__doc_text_content;
@@ -793,8 +790,8 @@ func callDocTextHandler(iso *v8.Isolate, ctx *v8.Context, text string) *textMuta
 
 			return JSON.stringify(mutations);
 		})()
-	`, "rw_doc_text.js")
-	if err != nil || result == nil || result.String() == "null" {
+	`)
+	if err != nil || result == "null" {
 		return nil
 	}
 
@@ -803,7 +800,7 @@ func callDocTextHandler(iso *v8.Isolate, ctx *v8.Context, text string) *textMuta
 		C string `json:"c"`
 		H bool   `json:"h"`
 	}
-	if err := json.Unmarshal([]byte(result.String()), &muts); err != nil {
+	if err := json.Unmarshal([]byte(result), &muts); err != nil {
 		return nil
 	}
 	if len(muts) == 0 {
@@ -831,8 +828,8 @@ func callDocTextHandler(iso *v8.Isolate, ctx *v8.Context, text string) *textMuta
 }
 
 // callDocEndHandler calls the document end handler and returns any appended content.
-func callDocEndHandler(ctx *v8.Context) string {
-	result, err := ctx.RunScript(`
+func callDocEndHandler(vm *quickjs.VM) string {
+	result, err := evalString(vm, `
 		(function() {
 			var handler = globalThis.__htmlrw_doc_handlers;
 			if (!handler || typeof handler.end !== 'function') return 'null';
@@ -849,8 +846,8 @@ func callDocEndHandler(ctx *v8.Context) string {
 			if (appended.length === 0) return 'null';
 			return JSON.stringify(appended);
 		})()
-	`, "rw_doc_end.js")
-	if err != nil || result == nil || result.String() == "null" {
+	`)
+	if err != nil || result == "null" {
 		return ""
 	}
 
@@ -858,7 +855,7 @@ func callDocEndHandler(ctx *v8.Context) string {
 		C string `json:"c"`
 		H bool   `json:"h"`
 	}
-	if err := json.Unmarshal([]byte(result.String()), &items); err != nil {
+	if err := json.Unmarshal([]byte(result), &items); err != nil {
 		return ""
 	}
 

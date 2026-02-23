@@ -8,16 +8,15 @@ import (
 	"encoding/base64"
 	"fmt"
 	"hash"
-	"strconv"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // cryptoJS wires up the global crypto object with getRandomValues and randomUUID
 // backed by Go helper functions, plus a crypto.subtle proxy that delegates
 // digest/sign/verify/encrypt/decrypt/importKey/exportKey to Go-backed functions.
 //
-// Key material is scoped per-request via __requestID  Eno global key store.
+// Key material is scoped per-request via __requestID — no global key store.
 const cryptoJS = `
 (function() {
 	// Pure-JS base64 encode/decode for the crypto internals.
@@ -105,7 +104,7 @@ const cryptoJS = `
 		const algo = typeof algorithm === 'string' ? { name: algorithm } : algorithm;
 		const sigB64 = __bufferSourceToB64(signature);
 		const dataB64 = __bufferSourceToB64(data);
-		return __cryptoVerify(algo.name, key._id, sigB64, dataB64);
+		return !!__cryptoVerify(algo.name, key._id, sigB64, dataB64);
 	};
 
 	subtle.encrypt = async function(algorithm, key, data) {
@@ -201,67 +200,38 @@ const cryptoJS = `
 })();
 `
 
-// getReqIDFromJS reads the __requestID global from the JS context.
-func getReqIDFromJS(ctx *v8.Context) uint64 {
-	v, err := ctx.Global().Get("__requestID")
-	if err != nil || v.IsUndefined() || v.IsNull() {
-		return 0
-	}
-	id, _ := strconv.ParseUint(v.String(), 10, 64)
-	return id
-}
-
-// throwError is a helper to throw a JS exception from a FunctionCallback.
-func throwError(iso *v8.Isolate, msg string) *v8.Value {
-	errVal, _ := v8.NewValue(iso, msg)
-	return iso.ThrowException(errVal)
-}
-
 // setupCrypto registers Go-backed crypto helpers and evaluates the JS wrapper.
-func setupCrypto(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupCrypto(vm *quickjs.VM, _ *eventLoop) error {
 	// __cryptoGetRandomBytes(n) -> base64 string of n random bytes.
-	_ = ctx.Global().Set("__cryptoGetRandomBytes", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 1 {
-			return throwError(iso, errMissingArg("__cryptoGetRandomBytes", 1).Error())
-		}
-		n := int(args[0].Int32())
+	registerGoFunc(vm, "__cryptoGetRandomBytes", func(n int) (string, error) {
 		if n <= 0 || n > 65536 {
-			return throwError(iso, errInvalidArg("getRandomValues", "byte length must be 1-65536").Error())
+			return "", fmt.Errorf("getRandomValues: byte length must be 1-65536")
 		}
 		buf := make([]byte, n)
 		if _, err := rand.Read(buf); err != nil {
-			return throwError(iso, fmt.Sprintf("crypto/rand: %v", err))
+			return "", fmt.Errorf("crypto/rand: %v", err)
 		}
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(buf))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(buf), nil
+	}, false)
 
 	// __cryptoRandomUUID() -> UUID v4 string.
-	_ = ctx.Global().Set("__cryptoRandomUUID", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
+	registerGoFunc(vm, "__cryptoRandomUUID", func() (string, error) {
 		var uuid [16]byte
 		if _, err := rand.Read(uuid[:]); err != nil {
-			return throwError(iso, fmt.Sprintf("crypto/rand: %v", err))
+			return "", fmt.Errorf("crypto/rand: %v", err)
 		}
 		uuid[6] = (uuid[6] & 0x0f) | 0x40
 		uuid[8] = (uuid[8] & 0x3f) | 0x80
 		s := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 			uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:16])
-		val, _ := v8.NewValue(iso, s)
-		return val
-	}).GetFunction(ctx))
+		return s, nil
+	}, false)
 
 	// __cryptoDigest(algorithm, dataBase64) -> resultBase64
-	_ = ctx.Global().Set("__cryptoDigest", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("crypto.subtle.digest", 2).Error())
-		}
-		algo := args[0].String()
-		dataB64 := args[1].String()
+	registerGoFunc(vm, "__cryptoDigest", func(algo string, dataB64 string) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "digest: invalid base64 data")
+			return "", fmt.Errorf("digest: invalid base64 data")
 		}
 		var h hash.Hash
 		switch normalizeAlgo(algo) {
@@ -274,31 +244,24 @@ func setupCrypto(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		case "SHA-512":
 			h = sha512.New()
 		default:
-			return throwError(iso, fmt.Sprintf("digest: unsupported algorithm %q", algo))
+			return "", fmt.Errorf("digest: unsupported algorithm %q", algo)
 		}
 		h.Write(data)
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(h.Sum(nil)))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(h.Sum(nil)), nil
+	}, false)
 
 	// __cryptoExportKey(keyID) -> base64
-	_ = ctx.Global().Set("__cryptoExportKey", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 1 {
-			return throwError(iso, errMissingArg("exportKey", 1).Error())
-		}
-		keyID := args[0].Integer()
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoExportKey", func(keyID int) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "exportKey: key not found")
+			return "", fmt.Errorf("exportKey: key not found")
 		}
 		if !entry.extractable {
-			return throwError(iso, "exportKey: key is not extractable")
+			return "", fmt.Errorf("exportKey: key is not extractable")
 		}
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(entry.data))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(entry.data), nil
+	}, false)
 
 	// Note: __cryptoImportKey, __cryptoSign, __cryptoVerify, __cryptoEncrypt,
 	// and __cryptoDecrypt are registered by setupCryptoExt which runs after
@@ -306,7 +269,7 @@ func setupCrypto(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 	// AES-CBC, ECDSA, and Ed25519.
 
 	// Evaluate the JS wrapper that builds the crypto global.
-	if _, err := ctx.RunScript(cryptoJS, "crypto.js"); err != nil {
+	if err := evalDiscard(vm, cryptoJS); err != nil {
 		return fmt.Errorf("evaluating crypto.js: %w", err)
 	}
 

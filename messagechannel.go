@@ -3,7 +3,7 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // messageChannelJS defines MessagePort and MessageChannel as pure JS polyfills
@@ -89,8 +89,8 @@ globalThis.MessageChannel = MessageChannel;
 `
 
 // setupMessageChannel registers MessageChannel and MessagePort globals.
-func setupMessageChannel(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(messageChannelJS, "messagechannel.js"); err != nil {
+func setupMessageChannel(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, messageChannelJS); err != nil {
 		return fmt.Errorf("evaluating messagechannel.js: %w", err)
 	}
 	return nil

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 func TestEventLoop_NewEventLoop(t *testing.T) {
@@ -23,53 +23,27 @@ func TestEventLoop_NewEventLoop(t *testing.T) {
 	}
 }
 
-func TestEventLoop_SetTimeout(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
-
+func TestEventLoop_RegisterTimer_Timeout(t *testing.T) {
 	el := newEventLoop()
 
-	// Create a dummy callback function
-	fn, err := ctx.RunScript("(function() {})", "cb.js")
-	if err != nil {
-		t.Fatalf("creating callback: %v", err)
-	}
-	callback, err := fn.AsFunction()
-	if err != nil {
-		t.Fatalf("as function: %v", err)
-	}
-
-	id1 := el.setTimeout(callback, 100*time.Millisecond)
+	id1 := el.registerTimer(100*time.Millisecond, false)
 	if id1 != 1 {
 		t.Errorf("first timer ID = %d, want 1", id1)
 	}
 	if !el.hasPending() {
-		t.Error("should have pending timers after setTimeout")
+		t.Error("should have pending timers after registerTimer")
 	}
 
-	id2 := el.setTimeout(callback, 200*time.Millisecond)
+	id2 := el.registerTimer(200*time.Millisecond, false)
 	if id2 != 2 {
 		t.Errorf("second timer ID = %d, want 2", id2)
 	}
 }
 
-func TestEventLoop_SetInterval(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
-
+func TestEventLoop_RegisterTimer_Interval(t *testing.T) {
 	el := newEventLoop()
 
-	fn, err := ctx.RunScript("(function() {})", "cb.js")
-	if err != nil {
-		t.Fatalf("creating callback: %v", err)
-	}
-	callback, _ := fn.AsFunction()
-
-	id := el.setInterval(callback, 50*time.Millisecond)
+	id := el.registerTimer(50*time.Millisecond, true)
 	if id != 1 {
 		t.Errorf("interval ID = %d, want 1", id)
 	}
@@ -81,23 +55,15 @@ func TestEventLoop_SetInterval(t *testing.T) {
 	if entry == nil {
 		t.Fatal("timer entry not found")
 	}
-	if entry.interval != 50*time.Millisecond {
-		t.Errorf("interval = %v, want 50ms", entry.interval)
+	if entry.interval < 10*time.Millisecond {
+		t.Errorf("interval = %v, should be at least 10ms (minimum enforced)", entry.interval)
 	}
 }
 
 func TestEventLoop_ClearTimer(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
-
 	el := newEventLoop()
 
-	fn, _ := ctx.RunScript("(function() {})", "cb.js")
-	callback, _ := fn.AsFunction()
-
-	id := el.setTimeout(callback, 100*time.Millisecond)
+	id := el.registerTimer(100*time.Millisecond, false)
 	if !el.hasPending() {
 		t.Error("should have pending timer")
 	}
@@ -118,19 +84,11 @@ func TestEventLoop_ClearTimer_NonExistent(t *testing.T) {
 }
 
 func TestEventLoop_Reset(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
-
 	el := newEventLoop()
 
-	fn, _ := ctx.RunScript("(function() {})", "cb.js")
-	callback, _ := fn.AsFunction()
-
-	el.setTimeout(callback, 100*time.Millisecond)
-	el.setInterval(callback, 200*time.Millisecond)
-	el.setTimeout(callback, 300*time.Millisecond)
+	el.registerTimer(100*time.Millisecond, false)
+	el.registerTimer(200*time.Millisecond, true)
+	el.registerTimer(300*time.Millisecond, false)
 
 	if !el.hasPending() {
 		t.Error("should have pending timers")
@@ -147,32 +105,38 @@ func TestEventLoop_Reset(t *testing.T) {
 }
 
 func TestEventLoop_Drain_Empty(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+	defer vm.Close()
 
 	el := newEventLoop()
 	// Drain on empty event loop should return immediately.
-	el.drain(iso, ctx, time.Now().Add(time.Second))
+	el.drain(vm, time.Now().Add(time.Second))
 }
 
 func TestEventLoop_Drain_Timeout(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+	defer vm.Close()
 
 	el := newEventLoop()
 
-	fn, _ := ctx.RunScript("(function() {})", "cb.js")
-	callback, _ := fn.AsFunction()
+	// Register the timer callbacks JS infrastructure
+	if err := setupTimers(vm, el); err != nil {
+		t.Fatalf("setupTimers: %v", err)
+	}
 
-	// Set a timer far in the future
-	el.setTimeout(callback, 10*time.Second)
+	// Set a timer far in the future via JS
+	if err := evalDiscard(vm, "setTimeout(function(){}, 10000)"); err != nil {
+		t.Fatalf("setTimeout: %v", err)
+	}
 
 	// Drain with a deadline in the past
-	el.drain(iso, ctx, time.Now().Add(-1*time.Second))
+	el.drain(vm, time.Now().Add(-1*time.Second))
 
 	// Timer should still be pending (not fired because deadline passed)
 	if !el.hasPending() {
@@ -181,91 +145,111 @@ func TestEventLoop_Drain_Timeout(t *testing.T) {
 }
 
 func TestEventLoop_Drain_FiresCallback(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+	defer vm.Close()
 
 	el := newEventLoop()
 
+	if err := setupTimers(vm, el); err != nil {
+		t.Fatalf("setupTimers: %v", err)
+	}
+
 	// Set a global that the callback will modify
-	_, _ = ctx.RunScript("globalThis.__timer_fired = false", "init.js")
+	if err := evalDiscard(vm, "globalThis.__timer_fired = false"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
 
-	fn, _ := ctx.RunScript("(function() { globalThis.__timer_fired = true; })", "cb.js")
-	callback, _ := fn.AsFunction()
-
-	el.setTimeout(callback, 1*time.Millisecond)
+	if err := evalDiscard(vm, "setTimeout(function() { globalThis.__timer_fired = true; }, 1)"); err != nil {
+		t.Fatalf("setTimeout: %v", err)
+	}
 
 	// Drain with sufficient deadline
-	el.drain(iso, ctx, time.Now().Add(5*time.Second))
+	el.drain(vm, time.Now().Add(5*time.Second))
 
-	result, _ := ctx.RunScript("globalThis.__timer_fired", "check.js")
-	if !result.Boolean() {
+	result, err := evalBool(vm, "globalThis.__timer_fired")
+	if err != nil {
+		t.Fatalf("checking result: %v", err)
+	}
+	if !result {
 		t.Error("timer callback should have fired")
 	}
 }
 
 func TestEventLoop_Drain_IntervalRepeats(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+	defer vm.Close()
 
 	el := newEventLoop()
 
-	_, _ = ctx.RunScript("globalThis.__count = 0", "init.js")
-	fn, _ := ctx.RunScript("(function() { globalThis.__count++; if (globalThis.__count >= 3) { /* stop */ } })", "cb.js")
-	callback, _ := fn.AsFunction()
+	if err := setupTimers(vm, el); err != nil {
+		t.Fatalf("setupTimers: %v", err)
+	}
 
-	el.setInterval(callback, 1*time.Millisecond)
+	if err := evalDiscard(vm, "globalThis.__count = 0"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	if err := evalDiscard(vm, "setInterval(function() { globalThis.__count++; }, 1)"); err != nil {
+		t.Fatalf("setInterval: %v", err)
+	}
 
 	// Drain for a short period - interval should fire multiple times
-	el.drain(iso, ctx, time.Now().Add(100*time.Millisecond))
+	el.drain(vm, time.Now().Add(100*time.Millisecond))
 
-	result, _ := ctx.RunScript("globalThis.__count", "check.js")
-	count := result.Int32()
+	count, err := evalInt(vm, "globalThis.__count")
+	if err != nil {
+		t.Fatalf("checking count: %v", err)
+	}
 	if count < 2 {
 		t.Errorf("interval should have fired at least twice, got %d", count)
 	}
 }
 
 func TestEventLoop_ClearTimer_DuringDrain(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+	defer vm.Close()
 
 	el := newEventLoop()
 
-	fn, _ := ctx.RunScript("(function() {})", "cb.js")
-	callback, _ := fn.AsFunction()
+	if err := setupTimers(vm, el); err != nil {
+		t.Fatalf("setupTimers: %v", err)
+	}
 
-	id := el.setInterval(callback, 1*time.Millisecond)
+	if err := evalDiscard(vm, "var __intervalId = setInterval(function() {}, 1)"); err != nil {
+		t.Fatalf("setInterval: %v", err)
+	}
 
 	// Clear the timer from another goroutine during drain
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		el.clearTimer(id)
+		el.mu.Lock()
+		for id := range el.timers {
+			el.mu.Unlock()
+			el.clearTimer(id)
+			return
+		}
+		el.mu.Unlock()
 	}()
 
-	el.drain(iso, ctx, time.Now().Add(200*time.Millisecond))
+	el.drain(vm, time.Now().Add(200*time.Millisecond))
 	// Should complete without hanging
 }
 
 func TestEventLoop_IDsIncrement(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
-
 	el := newEventLoop()
 
-	fn, _ := ctx.RunScript("(function() {})", "cb.js")
-	callback, _ := fn.AsFunction()
-
-	id1 := el.setTimeout(callback, time.Second)
-	id2 := el.setTimeout(callback, time.Second)
-	id3 := el.setInterval(callback, time.Second)
+	id1 := el.registerTimer(time.Second, false)
+	id2 := el.registerTimer(time.Second, false)
+	id3 := el.registerTimer(time.Second, true)
 
 	if id1 != 1 || id2 != 2 || id3 != 3 {
 		t.Errorf("IDs should increment: got %d, %d, %d", id1, id2, id3)

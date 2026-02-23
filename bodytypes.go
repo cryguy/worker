@@ -3,7 +3,7 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // bodyTypesJS patches Request and Response prototypes with:
@@ -222,8 +222,8 @@ Response.prototype.formData = async function() {
 
 // setupBodyTypes patches Request/Response with extended body type support.
 // Must be called after setupWebAPIs, setupStreams, and setupFormData.
-func setupBodyTypes(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(bodyTypesJS, "bodytypes.js"); err != nil {
+func setupBodyTypes(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, bodyTypesJS); err != nil {
 		return fmt.Errorf("evaluating bodytypes.js: %w", err)
 	}
 	return nil

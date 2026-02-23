@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // wsConnectionTimeout is the maximum duration for a WebSocket connection.
@@ -25,10 +25,10 @@ type poolKey struct {
 	DeployKey string
 }
 
-// sitePool wraps a v8Pool with an invalidation flag so that stale pools
+// sitePool wraps a qjsPool with an invalidation flag so that stale pools
 // are replaced transparently on the next Execute call.
 type sitePool struct {
-	pool    *v8Pool
+	pool    *qjsPool
 	invalid bool
 	mu      sync.RWMutex
 }
@@ -63,7 +63,6 @@ func NewEngine(cfg EngineConfig, sourceLoader SourceLoader) *Engine {
 }
 
 // EnsureSource loads the worker JS source into memory if not already cached.
-// Handles the server restart scenario where in-memory caches are lost.
 func (e *Engine) EnsureSource(siteID string, deployKey string) error {
 	key := poolKey{SiteID: siteID, DeployKey: deployKey}
 	if _, ok := e.sources.Load(key); ok {
@@ -88,23 +87,27 @@ func (e *Engine) EnsureSource(siteID string, deployKey string) error {
 func (e *Engine) CompileAndCache(siteID string, deployKey string, source string) ([]byte, error) {
 	key := poolKey{SiteID: siteID, DeployKey: deployKey}
 
-	// Validate the source compiles in a temporary isolate.
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
+	// Validate the source compiles in a temporary VM.
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		return nil, fmt.Errorf("creating validation VM: %w", err)
+	}
+	defer vm.Close()
 
 	wrapped := wrapESModule(source)
-	if _, err := iso.CompileUnboundScript(wrapped, "worker.js", v8.CompileOptions{}); err != nil {
+	v, err := vm.EvalValue(wrapped, quickjs.EvalGlobal)
+	if err != nil {
 		return nil, fmt.Errorf("compiling worker script: %w", err)
 	}
+	v.Free()
 
 	e.sources.Store(key, source)
 	return []byte(source), nil
 }
 
 // getOrCreatePool returns the worker pool for the given site/deploy,
-// creating it if necessary. Each worker in the pool has all Web APIs,
-// console, fetch, crypto, and the compiled worker script loaded.
-func (e *Engine) getOrCreatePool(siteID string, deployKey string) (*v8Pool, error) {
+// creating it if necessary.
+func (e *Engine) getOrCreatePool(siteID string, deployKey string) (*qjsPool, error) {
 	key := poolKey{SiteID: siteID, DeployKey: deployKey}
 
 	// Fast path: valid pool exists (lock-free).
@@ -139,82 +142,56 @@ func (e *Engine) getOrCreatePool(siteID string, deployKey string) (*v8Pool, erro
 	cfg := e.config
 
 	setupFns := []setupFunc{
-		// Web APIs: Headers, Request, Response, URL, URLSearchParams, TextEncoder/Decoder
 		setupWebAPIs,
 		setupURLSearchParamsExt,
-		// Globals: structuredClone, performance.now(), navigator, queueMicrotask
 		setupGlobals,
-		// Encoding: atob, btoa
 		setupEncoding,
-		// Timers: setTimeout, setInterval, clearTimeout, clearInterval (real event loop)
 		setupTimers,
-		// Abort: AbortController, AbortSignal, Event, EventTarget, DOMException
 		setupAbort,
-		// reportError/ErrorEvent: global error reporting (requires EventTarget)
 		setupReportError,
-		// Crypto: crypto.getRandomValues, crypto.subtle, crypto.randomUUID
 		setupCrypto,
-		// Crypto extensions: JWK, ECDSA, AES-CBC, generateKey
 		setupCryptoExt,
-		// Crypto: HKDF, PBKDF2 deriveBits/deriveKey
 		setupCryptoDerive,
-		// Crypto: RSA-OAEP, RSASSA-PKCS1-v1_5, RSA-PSS
 		setupCryptoRSA,
-		// Crypto: Ed25519 sign/verify
 		setupCryptoEd25519,
-		// Crypto: AES-CTR encrypt/decrypt, AES-KW wrapKey/unwrapKey
 		setupCryptoAesCtrKw,
-		// Crypto: ECDH and X25519 key agreement
 		setupCryptoECDH,
-		// URLPattern: URL pattern matching API
 		setupURLPattern,
-		// Streams: ReadableStream, WritableStream, TransformStream
 		setupStreams,
-		// TextStreams: TextEncoderStream, TextDecoderStream, IdentityTransformStream
 		setupTextStreams,
-		// FormData: FormData, Blob, File
 		setupFormData,
-		// Blob extensions: Blob.stream(), Blob.bytes() (requires Blob + ReadableStream)
 		setupBlobExt,
-		// Compression: CompressionStream, DecompressionStream
 		setupCompression,
-		// Body types: patches Request/Response for non-string bodies
 		setupBodyTypes,
-		// WebSocket: WebSocketPair, WebSocket class
 		setupWebSocket,
-		// HTMLRewriter: streaming HTML transformation
 		setupHTMLRewriter,
-		// Console: log/info/warn/error/debug capture
 		setupConsole,
-		// Console extensions: time, count, assert, table, trace, group
 		setupConsoleExt,
-		// Fetch: Go-backed fetch() with SSRF protection
-		func(iso *v8.Isolate, ctx *v8.Context, el *eventLoop) error {
-			return setupFetch(iso, ctx, cfg, el)
+		// Fetch needs engine config.
+		func(vm *quickjs.VM, el *eventLoop) error {
+			return setupFetchWithConfig(vm, cfg, el)
 		},
-		// BYOB Reader: ReadableStreamBYOBReader, ReadableByteStreamController
 		setupBYOBReader,
-		// MessageChannel: MessageChannel, MessagePort
 		setupMessageChannel,
-		// Unhandled Rejection: PromiseRejectionEvent, unhandledrejection tracking
 		setupUnhandledRejection,
-		// Scheduler: scheduler.wait()
 		setupScheduler,
-		// DigestStream: crypto.DigestStream for streaming hash computation
 		setupDigestStream,
-		// EventSource: Server-Sent Events client
 		setupEventSource,
-		// TCP Sockets: connect() for outbound TCP connections
 		setupTCPSocket,
-		// D1: SQL database bindings (per-binding setup in buildEnvObject)
+		// Phase 6: Env bindings
+		setupKV,
+		setupStorage,
+		setupQueues,
 		setupD1,
-		// Cache: Cache API (caches.default, caches.open)
+		setupDurableObjects,
+		setupServiceBindings,
+		setupAssets,
 		setupCache,
 	}
 
-	pool, err := newV8Pool(cfg.PoolSize, source, setupFns, e.config.MemoryLimitMB)
+	pool, err := newQJSPool(cfg.PoolSize, source, setupFns, e.config.MemoryLimitMB)
 	if err != nil {
-		return nil, fmt.Errorf("creating v8 pool: %w", err)
+		return nil, fmt.Errorf("creating worker pool: %w", err)
 	}
 
 	sp := &sitePool{pool: pool}
@@ -224,7 +201,6 @@ func (e *Engine) getOrCreatePool(siteID string, deployKey string) (*v8Pool, erro
 
 // Execute runs the worker's fetch handler for the given request and returns
 // the result including the response, captured logs, and any error.
-// env must not be nil — the caller is responsible for constructing a fully-wired Env.
 func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerRequest) (result *WorkerResult) {
 	start := time.Now()
 	result = &WorkerResult{}
@@ -235,7 +211,6 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 		return result
 	}
 
-	// Set dispatcher and site ID so buildEnvObject can wire up service bindings.
 	if env.Dispatcher == nil {
 		env.Dispatcher = e
 	}
@@ -243,7 +218,6 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 		env.SiteID = siteID
 	}
 
-	// Ensure source is loaded (handles server restart).
 	if err := e.EnsureSource(siteID, deployKey); err != nil {
 		result.Error = err
 		result.Duration = time.Since(start)
@@ -264,16 +238,12 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 		return result
 	}
 
-	// keepWorker is set to true when a WebSocket upgrade response is detected,
-	// preventing the deferred cleanup from returning the worker to the pool.
 	var keepWorker bool
-
-	// Watchdog: iso.TerminateExecution() is the one thread-safe V8 call.
 	var timedOut atomic.Bool
 	timeout := time.Duration(e.config.ExecutionTimeout) * time.Millisecond
 	watchdog := time.AfterFunc(timeout, func() {
 		timedOut.Store(true)
-		w.iso.TerminateExecution()
+		w.vm.Interrupt()
 	})
 
 	var panicked bool
@@ -288,17 +258,14 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 			}
 		}
 		result.Duration = time.Since(start)
-		// WebSocket: worker is managed by WebSocketHandler.Bridge().
 		if keepWorker {
 			return
 		}
-		// Only return healthy workers to the pool.
 		if stopped && !timedOut.Load() && !panicked {
 			pool.put(w)
 		} else {
 			log.Printf("worker: discarding worker for site %s deploy %s (timed out or panicked)", siteID, deployKey)
-			w.ctx.Close()
-			w.iso.Dispose()
+			w.vm.Close()
 			key := poolKey{SiteID: siteID, DeployKey: deployKey}
 			if val, ok := e.pools.Load(key); ok {
 				sp := val.(*sitePool)
@@ -307,28 +274,24 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 		}
 	}()
 
-	iso := w.iso
-	ctx := w.ctx
+	vm := w.vm
 
 	// Set up per-request state.
 	reqID := newRequestState(e.config.MaxFetchRequests, env)
-	reqIDVal, _ := v8.NewValue(iso, strconv.FormatUint(reqID, 10))
-	if err := ctx.Global().Set("__requestID", reqIDVal); err != nil {
+	if err := setGlobal(vm, "__requestID", strconv.FormatUint(reqID, 10)); err != nil {
 		clearRequestState(reqID)
 		result.Error = fmt.Errorf("setting request ID: %w", err)
 		return result
 	}
 
 	// Build the JS arguments: request, env, ctx.
-	jsReq, err := goRequestToJS(iso, ctx, req)
-	if err != nil {
+	if err := goRequestToJS(vm, req); err != nil {
 		clearRequestState(reqID)
 		result.Error = fmt.Errorf("building JS request: %w", err)
 		return result
 	}
 
-	jsEnv, err := buildEnvObject(iso, ctx, env, reqID)
-	if err != nil {
+	if err := buildEnvObject(vm, env, reqID); err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
 			result.Logs = state.logs
@@ -337,8 +300,7 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 		return result
 	}
 
-	jsCtx, err := buildExecContext(iso, ctx)
-	if err != nil {
+	if err := buildExecContext(vm); err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
 			result.Logs = state.logs
@@ -347,48 +309,16 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 		return result
 	}
 
-	// Call __worker_module__.fetch(request, env, ctx).
-	moduleVal, err := ctx.Global().Get("__worker_module__")
-	if err != nil || moduleVal.IsUndefined() || moduleVal.IsNull() {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module has no default export")
-		return result
-	}
-
-	moduleObj, err := moduleVal.AsObject()
-	if err != nil {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module is not an object: %w", err)
-		return result
-	}
-
-	fetchVal, err := moduleObj.Get("fetch")
-	if err != nil || fetchVal.IsUndefined() {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module has no fetch handler")
-		return result
-	}
-
-	fetchFn, err := fetchVal.AsFunction()
-	if err != nil {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker fetch is not a function: %w", err)
-		return result
-	}
-
-	fetchResult, err := fetchFn.Call(moduleObj, jsReq, jsEnv, jsCtx)
+	// Call __worker_module__.fetch(request, env, ctx) via EvalValue.
+	callResult, err := vm.EvalValue(`
+		(function() {
+			var mod = globalThis.__worker_module__;
+			if (!mod || typeof mod.fetch !== 'function') {
+				throw new Error('worker module has no fetch handler');
+			}
+			return mod.fetch(globalThis.__req, globalThis.__env, globalThis.__ctx);
+		})()
+	`, quickjs.EvalGlobal)
 	if err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
@@ -402,18 +332,29 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 		return result
 	}
 
-	// Pump microtasks to settle any immediately-resolved promises.
-	ctx.PerformMicrotaskCheckpoint()
+	// Store the result for further processing and free the EvalValue result.
+	if err := setGlobal(vm, "__call_result", callResult); err != nil {
+		callResult.Free()
+		state := clearRequestState(reqID)
+		if state != nil {
+			result.Logs = state.logs
+		}
+		result.Error = fmt.Errorf("storing call result: %w", err)
+		return result
+	}
+	callResult.Free()
 
-	// Drain event loop (fire timers, each followed by microtask checkpoint).
+	// Pump microtasks.
+	executePendingJobs(vm)
+
+	// Drain event loop.
 	deadline := start.Add(timeout)
 	if w.eventLoop.hasPending() {
-		w.eventLoop.drain(iso, ctx, deadline)
+		w.eventLoop.drain(vm, deadline)
 	}
 
 	// Await the result if it's a Promise.
-	fetchResult, err = awaitValue(ctx, fetchResult, deadline)
-	if err != nil {
+	if err := awaitValueWithLoop(vm, "__call_result", deadline, w.eventLoop); err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
 			result.Logs = state.logs
@@ -422,9 +363,11 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 		return result
 	}
 
-	// Convert JS Response to Go.
-	resp, err := jsResponseToGo(ctx, fetchResult)
+	// Move result to __result for jsResponseToGo.
+	_ = evalDiscard(vm, "globalThis.__result = globalThis.__call_result; delete globalThis.__call_result;")
 
+	// Convert JS Response to Go.
+	resp, err := jsResponseToGo(vm)
 	if err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
@@ -434,20 +377,18 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 		return result
 	}
 
-	// Drain waitUntil promises after the response is ready.
-	drainWaitUntil(ctx, deadline)
+	// Drain waitUntil promises.
+	drainWaitUntil(vm, deadline)
 
-	// WebSocket upgrade: if the response is 101 with a webSocket, hold the
-	// worker for the bridge loop instead of returning it to the pool.
+	// WebSocket upgrade handling.
 	if resp.HasWebSocket && resp.StatusCode == 101 {
-		// Store the server WebSocket reference for the bridge and mark it as HTTP-bridged.
-		_, _ = ctx.RunScript(`
+		_ = evalDiscard(vm, `
 			if (globalThis.__ws_check_resp && globalThis.__ws_check_resp._peer) {
 				globalThis.__ws_active_server = globalThis.__ws_check_resp._peer;
 				globalThis.__ws_active_server._isHTTPBridged = true;
 			}
 			delete globalThis.__ws_check_resp;
-		`, "ws_setup_bridge.js")
+		`)
 
 		state := getRequestState(reqID)
 		if state != nil {
@@ -469,7 +410,6 @@ func (e *Engine) Execute(siteID string, deployKey string, env *Env, req *WorkerR
 	if state != nil {
 		result.Logs = state.logs
 	}
-
 	result.Response = resp
 	return result
 }
@@ -516,7 +456,7 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *Env, cro
 	timeout := time.Duration(e.config.ExecutionTimeout) * time.Millisecond
 	watchdog := time.AfterFunc(timeout, func() {
 		timedOut.Store(true)
-		w.iso.TerminateExecution()
+		w.vm.Interrupt()
 	})
 
 	var panicked bool
@@ -535,8 +475,7 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *Env, cro
 			pool.put(w)
 		} else {
 			log.Printf("worker: discarding scheduled worker for site %s deploy %s (timed out or panicked)", siteID, deployKey)
-			w.ctx.Close()
-			w.iso.Dispose()
+			w.vm.Close()
 			key := poolKey{SiteID: siteID, DeployKey: deployKey}
 			if val, ok := e.pools.Load(key); ok {
 				sp := val.(*sitePool)
@@ -545,32 +484,29 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *Env, cro
 		}
 	}()
 
-	iso := w.iso
-	ctx := w.ctx
+	vm := w.vm
 
-	// Set up per-request state.
 	reqID := newRequestState(e.config.MaxFetchRequests, env)
-	reqIDVal, _ := v8.NewValue(iso, strconv.FormatUint(reqID, 10))
-	_ = ctx.Global().Set("__requestID", reqIDVal)
+	_ = setGlobal(vm, "__requestID", strconv.FormatUint(reqID, 10))
 
-	// Build the scheduled event using the ScheduledEvent class.
+	// Build the scheduled event.
 	scheduledTimeMs := float64(time.Now().UnixMilli())
 	eventScript := fmt.Sprintf(`new ScheduledEvent(%f, %q)`, scheduledTimeMs, cron)
-	eventVal, err := ctx.RunScript(eventScript, "scheduled_event.js")
+	v, err := vm.EvalValue(eventScript, quickjs.EvalGlobal)
 	if err != nil {
 		clearRequestState(reqID)
 		result.Error = fmt.Errorf("creating ScheduledEvent: %w", err)
 		return result
 	}
-	event, err := eventVal.AsObject()
-	if err != nil {
+	if err := setGlobal(vm, "__sched_event", v); err != nil {
+		v.Free()
 		clearRequestState(reqID)
-		result.Error = fmt.Errorf("ScheduledEvent is not an object: %w", err)
+		result.Error = fmt.Errorf("storing ScheduledEvent: %w", err)
 		return result
 	}
+	v.Free()
 
-	jsEnv, err := buildEnvObject(iso, ctx, env, reqID)
-	if err != nil {
+	if err := buildEnvObject(vm, env, reqID); err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
 			result.Logs = state.logs
@@ -579,8 +515,7 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *Env, cro
 		return result
 	}
 
-	jsCtx, err := buildExecContext(iso, ctx)
-	if err != nil {
+	if err := buildExecContext(vm); err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
 			result.Logs = state.logs
@@ -590,47 +525,15 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *Env, cro
 	}
 
 	// Call __worker_module__.scheduled(event, env, ctx).
-	moduleVal, err := ctx.Global().Get("__worker_module__")
-	if err != nil || moduleVal.IsUndefined() || moduleVal.IsNull() {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module has no default export")
-		return result
-	}
-
-	moduleObj, err := moduleVal.AsObject()
-	if err != nil {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module is not an object: %w", err)
-		return result
-	}
-
-	scheduledVal, err := moduleObj.Get("scheduled")
-	if err != nil || scheduledVal.IsUndefined() {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module has no scheduled handler")
-		return result
-	}
-
-	scheduledFn, err := scheduledVal.AsFunction()
-	if err != nil {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker scheduled is not a function: %w", err)
-		return result
-	}
-
-	schedResult, err := scheduledFn.Call(moduleObj, event, jsEnv, jsCtx)
+	callResult, err := vm.EvalValue(`
+		(function() {
+			var mod = globalThis.__worker_module__;
+			if (!mod || typeof mod.scheduled !== 'function') {
+				throw new Error('worker module has no scheduled handler');
+			}
+			return mod.scheduled(globalThis.__sched_event, globalThis.__env, globalThis.__ctx);
+		})()
+	`, quickjs.EvalGlobal)
 	if err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
@@ -639,17 +542,21 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *Env, cro
 		result.Error = fmt.Errorf("invoking worker scheduled: %w", err)
 		return result
 	}
+	if err := setGlobal(vm, "__call_result", callResult); err == nil {
+		callResult.Free()
+	}
 
 	// Pump microtasks and drain event loop.
-	ctx.PerformMicrotaskCheckpoint()
+	executePendingJobs(vm)
 	deadline := start.Add(timeout)
 	if w.eventLoop.hasPending() {
-		w.eventLoop.drain(iso, ctx, deadline)
+		w.eventLoop.drain(vm, deadline)
 	}
 
 	// Await if the handler returns a promise.
-	if schedResult != nil && schedResult.IsPromise() {
-		if _, err := awaitValue(ctx, schedResult, deadline); err != nil {
+	isPromise, _ := evalBool(vm, "globalThis.__call_result instanceof Promise")
+	if isPromise {
+		if err := awaitValueWithLoop(vm, "__call_result", deadline, w.eventLoop); err != nil {
 			state := clearRequestState(reqID)
 			if state != nil {
 				result.Logs = state.logs
@@ -659,8 +566,9 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *Env, cro
 		}
 	}
 
-	// Drain waitUntil promises after the handler completes.
-	drainWaitUntil(ctx, deadline)
+	_ = evalDiscard(vm, "delete globalThis.__call_result; delete globalThis.__sched_event;")
+
+	drainWaitUntil(vm, deadline)
 
 	state := clearRequestState(reqID)
 	if state != nil {
@@ -711,7 +619,7 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 	timeout := time.Duration(e.config.ExecutionTimeout) * time.Millisecond
 	watchdog := time.AfterFunc(timeout, func() {
 		timedOut.Store(true)
-		w.iso.TerminateExecution()
+		w.vm.Interrupt()
 	})
 
 	var panicked bool
@@ -730,8 +638,7 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 			pool.put(w)
 		} else {
 			log.Printf("worker: discarding tail worker for site %s deploy %s (timed out or panicked)", siteID, deployKey)
-			w.ctx.Close()
-			w.iso.Dispose()
+			w.vm.Close()
 			key := poolKey{SiteID: siteID, DeployKey: deployKey}
 			if val, ok := e.pools.Load(key); ok {
 				sp := val.(*sitePool)
@@ -740,13 +647,10 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 		}
 	}()
 
-	iso := w.iso
-	ctx := w.ctx
+	vm := w.vm
 
-	// Set up per-request state.
 	reqID := newRequestState(e.config.MaxFetchRequests, env)
-	reqIDVal, _ := v8.NewValue(iso, strconv.FormatUint(reqID, 10))
-	_ = ctx.Global().Set("__requestID", reqIDVal)
+	_ = setGlobal(vm, "__requestID", strconv.FormatUint(reqID, 10))
 
 	// Serialize tail events to JSON and inject into JS context.
 	eventsJSON, err := json.Marshal(events)
@@ -756,15 +660,21 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 		return result
 	}
 	eventsScript := fmt.Sprintf(`JSON.parse(%q)`, string(eventsJSON))
-	jsEvents, err := ctx.RunScript(eventsScript, "tail_events.js")
+	evVal, err := vm.EvalValue(eventsScript, quickjs.EvalGlobal)
 	if err != nil {
 		clearRequestState(reqID)
 		result.Error = fmt.Errorf("creating tail events array: %w", err)
 		return result
 	}
+	if err := setGlobal(vm, "__tail_events", evVal); err != nil {
+		evVal.Free()
+		clearRequestState(reqID)
+		result.Error = fmt.Errorf("storing tail events: %w", err)
+		return result
+	}
+	evVal.Free()
 
-	jsEnv, err := buildEnvObject(iso, ctx, env, reqID)
-	if err != nil {
+	if err := buildEnvObject(vm, env, reqID); err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
 			result.Logs = state.logs
@@ -773,8 +683,7 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 		return result
 	}
 
-	jsCtx, err := buildExecContext(iso, ctx)
-	if err != nil {
+	if err := buildExecContext(vm); err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
 			result.Logs = state.logs
@@ -784,47 +693,15 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 	}
 
 	// Call __worker_module__.tail(events, env, ctx).
-	moduleVal, err := ctx.Global().Get("__worker_module__")
-	if err != nil || moduleVal.IsUndefined() || moduleVal.IsNull() {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module has no default export")
-		return result
-	}
-
-	moduleObj, err := moduleVal.AsObject()
-	if err != nil {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module is not an object: %w", err)
-		return result
-	}
-
-	tailVal, err := moduleObj.Get("tail")
-	if err != nil || tailVal.IsUndefined() {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module has no tail handler")
-		return result
-	}
-
-	tailFn, err := tailVal.AsFunction()
-	if err != nil {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker tail is not a function: %w", err)
-		return result
-	}
-
-	tailResult, err := tailFn.Call(moduleObj, jsEvents, jsEnv, jsCtx)
+	callResult, err := vm.EvalValue(`
+		(function() {
+			var mod = globalThis.__worker_module__;
+			if (!mod || typeof mod.tail !== 'function') {
+				throw new Error('worker module has no tail handler');
+			}
+			return mod.tail(globalThis.__tail_events, globalThis.__env, globalThis.__ctx);
+		})()
+	`, quickjs.EvalGlobal)
 	if err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
@@ -837,17 +714,21 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 		}
 		return result
 	}
+	if err := setGlobal(vm, "__call_result", callResult); err == nil {
+		callResult.Free()
+	}
 
 	// Pump microtasks and drain event loop.
-	ctx.PerformMicrotaskCheckpoint()
+	executePendingJobs(vm)
 	deadline := start.Add(timeout)
 	if w.eventLoop.hasPending() {
-		w.eventLoop.drain(iso, ctx, deadline)
+		w.eventLoop.drain(vm, deadline)
 	}
 
 	// Await if the handler returns a promise.
-	if tailResult != nil && tailResult.IsPromise() {
-		if _, err := awaitValue(ctx, tailResult, deadline); err != nil {
+	isPromise, _ := evalBool(vm, "globalThis.__call_result instanceof Promise")
+	if isPromise {
+		if err := awaitValueWithLoop(vm, "__call_result", deadline, w.eventLoop); err != nil {
 			state := clearRequestState(reqID)
 			if state != nil {
 				result.Logs = state.logs
@@ -857,8 +738,9 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 		}
 	}
 
-	// Drain waitUntil promises after the handler completes.
-	drainWaitUntil(ctx, deadline)
+	_ = evalDiscard(vm, "delete globalThis.__call_result; delete globalThis.__tail_events;")
+
+	drainWaitUntil(vm, deadline)
 
 	state := clearRequestState(reqID)
 	if state != nil {
@@ -869,8 +751,6 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *Env, events [
 
 // ExecuteFunction calls an arbitrary named function on the worker module
 // with the given env and optional JSON-serializable arguments.
-// The function signature in JS is: fnName(env, ...args)
-// The return value is JSON-serialized into result.Data.
 func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnName string, args ...any) (result *WorkerResult) {
 	start := time.Now()
 	result = &WorkerResult{}
@@ -912,7 +792,7 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnNa
 	timeout := time.Duration(e.config.ExecutionTimeout) * time.Millisecond
 	watchdog := time.AfterFunc(timeout, func() {
 		timedOut.Store(true)
-		w.iso.TerminateExecution()
+		w.vm.Interrupt()
 	})
 
 	var panicked bool
@@ -931,8 +811,7 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnNa
 			pool.put(w)
 		} else {
 			log.Printf("worker: discarding worker for site %s deploy %s (timed out or panicked)", siteID, deployKey)
-			w.ctx.Close()
-			w.iso.Dispose()
+			w.vm.Close()
 			key := poolKey{SiteID: siteID, DeployKey: deployKey}
 			if val, ok := e.pools.Load(key); ok {
 				sp := val.(*sitePool)
@@ -941,19 +820,16 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnNa
 		}
 	}()
 
-	iso := w.iso
-	ctx := w.ctx
+	vm := w.vm
 
 	reqID := newRequestState(e.config.MaxFetchRequests, env)
-	reqIDVal, _ := v8.NewValue(iso, strconv.FormatUint(reqID, 10))
-	if err := ctx.Global().Set("__requestID", reqIDVal); err != nil {
+	if err := setGlobal(vm, "__requestID", strconv.FormatUint(reqID, 10)); err != nil {
 		clearRequestState(reqID)
 		result.Error = fmt.Errorf("setting request ID: %w", err)
 		return result
 	}
 
-	jsEnv, err := buildEnvObject(iso, ctx, env, reqID)
-	if err != nil {
+	if err := buildEnvObject(vm, env, reqID); err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
 			result.Logs = state.logs
@@ -962,49 +838,8 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnNa
 		return result
 	}
 
-	// Look up the named function on the module.
-	moduleVal, err := ctx.Global().Get("__worker_module__")
-	if err != nil || moduleVal.IsUndefined() || moduleVal.IsNull() {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module has no default export")
-		return result
-	}
-
-	moduleObj, err := moduleVal.AsObject()
-	if err != nil {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module is not an object: %w", err)
-		return result
-	}
-
-	fnVal, err := moduleObj.Get(fnName)
-	if err != nil || fnVal.IsUndefined() {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker module has no %q function", fnName)
-		return result
-	}
-
-	fn, err := fnVal.AsFunction()
-	if err != nil {
-		state := clearRequestState(reqID)
-		if state != nil {
-			result.Logs = state.logs
-		}
-		result.Error = fmt.Errorf("worker %q is not a function: %w", fnName, err)
-		return result
-	}
-
-	// Build the call arguments: env first, then any extra args.
-	callArgs := []v8.Valuer{jsEnv}
+	// Build JS arguments array: inject each arg via JSON.parse.
+	argsJS := "globalThis.__env"
 	for i, arg := range args {
 		argJSON, err := json.Marshal(arg)
 		if err != nil {
@@ -1015,8 +850,9 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnNa
 			result.Error = fmt.Errorf("marshaling argument %d: %w", i, err)
 			return result
 		}
+		varName := fmt.Sprintf("__fn_arg_%d", i)
 		argScript := fmt.Sprintf(`JSON.parse(%q)`, string(argJSON))
-		jsArg, err := ctx.RunScript(argScript, fmt.Sprintf("arg_%d.js", i))
+		argVal, err := vm.EvalValue(argScript, quickjs.EvalGlobal)
 		if err != nil {
 			state := clearRequestState(reqID)
 			if state != nil {
@@ -1025,10 +861,31 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnNa
 			result.Error = fmt.Errorf("creating JS argument %d: %w", i, err)
 			return result
 		}
-		callArgs = append(callArgs, jsArg)
+		if err := setGlobal(vm, varName, argVal); err != nil {
+			argVal.Free()
+			state := clearRequestState(reqID)
+			if state != nil {
+				result.Logs = state.logs
+			}
+			result.Error = fmt.Errorf("storing JS argument %d: %w", i, err)
+			return result
+		}
+		argVal.Free()
+		argsJS += fmt.Sprintf(", globalThis.%s", varName)
 	}
 
-	fnResult, err := fn.Call(moduleObj, callArgs...)
+	// Call the named function.
+	callScript := fmt.Sprintf(`
+		(function() {
+			var mod = globalThis.__worker_module__;
+			if (!mod || typeof mod[%q] !== 'function') {
+				throw new Error('worker module has no "' + %q + '" function');
+			}
+			return mod[%q](%s);
+		})()
+	`, fnName, fnName, fnName, argsJS)
+
+	callResult, err := vm.EvalValue(callScript, quickjs.EvalGlobal)
 	if err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
@@ -1041,17 +898,19 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnNa
 		}
 		return result
 	}
+	if err := setGlobal(vm, "__call_result", callResult); err == nil {
+		callResult.Free()
+	}
 
 	// Pump microtasks and drain event loop.
-	ctx.PerformMicrotaskCheckpoint()
+	executePendingJobs(vm)
 	deadline := start.Add(timeout)
 	if w.eventLoop.hasPending() {
-		w.eventLoop.drain(iso, ctx, deadline)
+		w.eventLoop.drain(vm, deadline)
 	}
 
 	// Await the result if it's a Promise.
-	fnResult, err = awaitValue(ctx, fnResult, deadline)
-	if err != nil {
+	if err := awaitValueWithLoop(vm, "__call_result", deadline, w.eventLoop); err != nil {
 		state := clearRequestState(reqID)
 		if state != nil {
 			result.Logs = state.logs
@@ -1060,25 +919,30 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnNa
 		return result
 	}
 
-	// Drain waitUntil promises.
-	drainWaitUntil(ctx, deadline)
+	drainWaitUntil(vm, deadline)
 
 	// Serialize the return value to JSON.
-	if fnResult == nil || fnResult.IsUndefined() || fnResult.IsNull() {
-		result.Data = "null"
-	} else {
-		_ = ctx.Global().Set("__fn_result", fnResult)
-		jsonVal, err := ctx.RunScript(`JSON.stringify(globalThis.__fn_result)`, "serialize_result.js")
-		_, _ = ctx.RunScript(`delete globalThis.__fn_result`, "cleanup_result.js")
-		if err != nil {
-			state := clearRequestState(reqID)
-			if state != nil {
-				result.Logs = state.logs
-			}
-			result.Error = fmt.Errorf("serializing return value: %w", err)
-			return result
+	jsonStr, err := evalString(vm, `
+		(function() {
+			var r = globalThis.__call_result;
+			delete globalThis.__call_result;
+			if (r === undefined || r === null) return "null";
+			return JSON.stringify(r);
+		})()
+	`)
+	if err != nil {
+		state := clearRequestState(reqID)
+		if state != nil {
+			result.Logs = state.logs
 		}
-		result.Data = jsonVal.String()
+		result.Error = fmt.Errorf("serializing return value: %w", err)
+		return result
+	}
+	result.Data = jsonStr
+
+	// Clean up fn arg globals.
+	for i := range args {
+		_ = evalDiscard(vm, fmt.Sprintf("delete globalThis.__fn_arg_%d", i))
 	}
 
 	state := clearRequestState(reqID)
@@ -1089,7 +953,6 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *Env, fnNa
 }
 
 // InvalidatePool marks the pool for the given site/deploy as invalid.
-// The next Execute call will create a fresh pool.
 func (e *Engine) InvalidatePool(siteID string, deployKey string) {
 	key := poolKey{SiteID: siteID, DeployKey: deployKey}
 	if val, ok := e.pools.LoadAndDelete(key); ok {
@@ -1120,72 +983,76 @@ func (e *Engine) MaxResponseBytes() int {
 	return e.config.MaxResponseBytes
 }
 
-// awaitValue resolves a potentially-promise value by pumping V8's microtask
-// queue. Uses JS-side Promise.resolve().then() to capture the result,
-// avoiding the need for a direct AsPromise() API.
-func awaitValue(ctx *v8.Context, val *v8.Value, deadline time.Time) (*v8.Value, error) {
-	if val == nil || !val.IsPromise() {
-		return val, nil
+// awaitValue resolves a potentially-promise value stored in a global variable
+// by pumping QuickJS's microtask queue via Promise.resolve().then().
+// The global variable is updated in-place with the resolved value.
+func awaitValue(vm *quickjs.VM, globalVar string, deadline time.Time) error {
+	return awaitValueWithLoop(vm, globalVar, deadline, nil)
+}
+
+// awaitValueWithLoop awaits a Promise stored in a global variable, optionally
+// draining the event loop between microtask pumps. This is needed for streaming
+// operations (CompressionStream, etc.) that create async work requiring timers.
+func awaitValueWithLoop(vm *quickjs.VM, globalVar string, deadline time.Time, el *eventLoop) error {
+	// Check if the value is a Promise.
+	isPromise, err := evalBool(vm, fmt.Sprintf("globalThis.%s instanceof Promise", globalVar))
+	if err != nil || !isPromise {
+		return nil // Not a promise, nothing to await.
 	}
 
-	// Use JS Promise.then() to capture the resolved/rejected value into globals.
-	if err := ctx.Global().Set("__await_input", val); err != nil {
-		return nil, fmt.Errorf("setting await input: %w", err)
-	}
-
-	_, err := ctx.RunScript(`
+	// Set up Promise.then() to capture the resolved/rejected value.
+	setupJS := fmt.Sprintf(`
 		delete globalThis.__awaited_result;
 		delete globalThis.__awaited_state;
-		Promise.resolve(globalThis.__await_input).then(
-			r => { globalThis.__awaited_result = r; globalThis.__awaited_state = 'fulfilled'; },
-			e => { globalThis.__awaited_result = e; globalThis.__awaited_state = 'rejected'; }
+		Promise.resolve(globalThis.%s).then(
+			function(r) { globalThis.__awaited_result = r; globalThis.__awaited_state = 'fulfilled'; },
+			function(e) { globalThis.__awaited_result = e; globalThis.__awaited_state = 'rejected'; }
 		);
-		delete globalThis.__await_input;
-	`, "await.js")
-	if err != nil {
-		return nil, fmt.Errorf("setting up promise await: %w", err)
+	`, globalVar)
+	if err := evalDiscard(vm, setupJS); err != nil {
+		return fmt.Errorf("setting up promise await: %w", err)
 	}
 
-	// Pump microtasks until the promise settles.
+	// Pump microtasks (and optionally the event loop) until the promise settles.
 	for {
-		ctx.PerformMicrotaskCheckpoint()
+		executePendingJobs(vm)
 
-		stateVal, err := ctx.Global().Get("__awaited_state")
-		if err != nil {
-			return nil, fmt.Errorf("checking promise state: %w", err)
+		// Also drain event loop if provided — streaming operations need timers/fetches.
+		if el != nil && el.hasPending() {
+			shortDeadline := time.Now().Add(10 * time.Millisecond)
+			if shortDeadline.After(deadline) {
+				shortDeadline = deadline
+			}
+			el.drain(vm, shortDeadline)
+			executePendingJobs(vm)
 		}
-		if !stateVal.IsUndefined() {
+
+		stateStr, err := evalString(vm, "String(globalThis.__awaited_state)")
+		if err != nil {
+			return fmt.Errorf("checking promise state: %w", err)
+		}
+		if stateStr != "undefined" {
 			break
 		}
 
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("promise resolution timed out")
+			return fmt.Errorf("promise resolution timed out")
 		}
 		runtime.Gosched()
 	}
 
-	stateVal, _ := ctx.Global().Get("__awaited_state")
-	resultVal, _ := ctx.Global().Get("__awaited_result")
+	stateStr, _ := evalString(vm, "String(globalThis.__awaited_state)")
 
-	// Clean up globals.
-	_, _ = ctx.RunScript("delete globalThis.__awaited_result; delete globalThis.__awaited_state;", "cleanup.js")
-
-	if stateVal.String() == "rejected" {
-		return nil, fmt.Errorf("promise rejected: %s", resultVal.String())
+	if stateStr == "rejected" {
+		errMsg, _ := evalString(vm, "String(globalThis.__awaited_result)")
+		_ = evalDiscard(vm, "delete globalThis.__awaited_result; delete globalThis.__awaited_state;")
+		return fmt.Errorf("promise rejected: %s", errMsg)
 	}
 
-	return resultVal, nil
-}
+	// Move the resolved value back to the original global.
+	_ = evalDiscard(vm, fmt.Sprintf(
+		"globalThis.%s = globalThis.__awaited_result; delete globalThis.__awaited_result; delete globalThis.__awaited_state;",
+		globalVar))
 
-// newJSObject creates a new empty JavaScript object.
-func newJSObject(iso *v8.Isolate, ctx *v8.Context) (*v8.Object, error) {
-	tmpl := v8.NewObjectTemplate(iso)
-	return tmpl.NewInstance(ctx)
-}
-
-// NewJSObject creates a new empty JavaScript object. This is the exported
-// version of newJSObject, intended for use by downstream users building
-// custom env bindings via EnvBindingFunc.
-func NewJSObject(iso *v8.Isolate, ctx *v8.Context) (*v8.Object, error) {
-	return newJSObject(iso, ctx)
+	return nil
 }

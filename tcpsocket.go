@@ -6,12 +6,11 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 const maxTCPSockets = 10
@@ -21,10 +20,10 @@ const maxTCPBufferSize = 1 * 1024 * 1024 // 1 MB
 type tcpSocketBuffer struct {
 	mu      sync.Mutex
 	conn    net.Conn
-	buf     []byte         // accumulated unread data
-	err     error          // sticky read error (io.EOF, etc.)
-	done    bool           // true once background reader exits
-	hasData chan struct{}   // signaled (non-blocking) when new data arrives or done
+	buf     []byte        // accumulated unread data
+	err     error         // sticky read error (io.EOF, etc.)
+	done    bool          // true once background reader exits
+	hasData chan struct{} // signaled (non-blocking) when new data arrives or done
 }
 
 // readLoop reads from conn into the buffer in the background.
@@ -105,11 +104,12 @@ func (b *tcpSocketBuffer) take(maxBytes int) (string, bool, error) {
 }
 
 // tcpSocketJS is the pure JS polyfill for the connect() global and Socket class.
+// Uses "EOF" sentinel from __tcpRead to detect end-of-stream.
 const tcpSocketJS = `
 (function() {
 
 globalThis.connect = function(address, options) {
-	var requestID = globalThis.__requestID;
+	var requestID = String(globalThis.__requestID);
 	var hostname, port;
 	if (typeof address === 'string') {
 		var colonIdx = address.lastIndexOf(':');
@@ -130,7 +130,6 @@ globalThis.connect = function(address, options) {
 	var secure = (options.secureTransport === 'on') ? 'on' : 'off';
 	var allowHalfOpen = !!options.allowHalfOpen;
 
-	// Synchronous connect call - throws on error (including SSRF).
 	var socketID = __tcpConnect(requestID, hostname, String(port), secure);
 
 	var closedResolve, closedReject;
@@ -141,26 +140,17 @@ globalThis.connect = function(address, options) {
 
 	var socketClosed = false;
 
-	// Build the opened promise (resolves immediately since connect is sync).
 	var openedPromise = Promise.resolve({
 		remoteAddress: hostname + ':' + port,
 		localAddress: '0.0.0.0:0'
 	});
 
-	// Build readable stream backed by __tcpRead.
 	var readable = new ReadableStream({
 		pull: function(controller) {
-			if (socketClosed) {
-				controller.close();
-				return;
-			}
+			if (socketClosed) { controller.close(); return; }
 			var result = __tcpRead(requestID, socketID, 4096);
-			if (result === '') {
-				// No data available yet, return without enqueuing.
-				return;
-			}
-			if (result === null) {
-				// EOF
+			if (result === '') return;
+			if (result === 'EOF') {
 				controller.close();
 				if (!socketClosed && !allowHalfOpen) {
 					socketClosed = true;
@@ -169,33 +159,22 @@ globalThis.connect = function(address, options) {
 				}
 				return;
 			}
-			// result is base64 data
 			var raw = atob(result);
 			var bytes = new Uint8Array(raw.length);
-			for (var i = 0; i < raw.length; i++) {
-				bytes[i] = raw.charCodeAt(i);
-			}
+			for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
 			controller.enqueue(bytes);
 		}
 	});
 
-	// Build writable stream backed by __tcpWrite.
 	var writable = new WritableStream({
 		write: function(chunk) {
 			if (socketClosed) throw new Error('Socket is closed');
 			var bytes;
-			if (typeof chunk === 'string') {
-				var enc = new TextEncoder();
-				bytes = enc.encode(chunk);
-			} else if (chunk instanceof Uint8Array) {
-				bytes = chunk;
-			} else if (chunk instanceof ArrayBuffer) {
-				bytes = new Uint8Array(chunk);
-			} else if (ArrayBuffer.isView(chunk)) {
-				bytes = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-			} else {
-				throw new Error('write: unsupported chunk type');
-			}
+			if (typeof chunk === 'string') { bytes = new TextEncoder().encode(chunk); }
+			else if (chunk instanceof Uint8Array) { bytes = chunk; }
+			else if (chunk instanceof ArrayBuffer) { bytes = new Uint8Array(chunk); }
+			else if (ArrayBuffer.isView(chunk)) { bytes = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength); }
+			else { throw new Error('write: unsupported chunk type'); }
 			var b64 = btoa(String.fromCharCode.apply(null, bytes));
 			__tcpWrite(requestID, socketID, b64);
 		},
@@ -231,7 +210,6 @@ globalThis.connect = function(address, options) {
 		startTls: function() {
 			if (socketClosed) throw new Error('Socket is closed');
 			var newSocketID = __tcpStartTls(requestID, socketID, hostname);
-			// Return a new socket-like object for the upgraded connection
 			var tlsClosedResolve, tlsClosedReject;
 			var tlsClosedPromise = new Promise(function(resolve, reject) {
 				tlsClosedResolve = resolve;
@@ -243,7 +221,7 @@ globalThis.connect = function(address, options) {
 					if (tlsClosed) { controller.close(); return; }
 					var result = __tcpRead(requestID, newSocketID, 4096);
 					if (result === '') return;
-					if (result === null) {
+					if (result === 'EOF') {
 						controller.close();
 						if (!tlsClosed) { tlsClosed = true; try { __tcpClose(requestID, newSocketID); } catch(e) {} tlsClosedResolve(); }
 						return;
@@ -291,54 +269,41 @@ globalThis.connect = function(address, options) {
 `
 
 // setupTCPSocket registers Go-backed TCP helpers and evaluates the JS wrapper.
-func setupTCPSocket(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	// __tcpConnect(requestID, hostname, port, secure) -> socketID string
-	_ = ctx.Global().Set("__tcpConnect", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "tcpConnect: requires 4 arguments")
-		}
-
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		hostname := args[1].String()
-		port := args[2].String()
-		secure := args[3].String()
-
+func setupTCPSocket(vm *quickjs.VM, _ *eventLoop) error {
+	// __tcpConnect(reqIDStr, hostname, port, secure) -> socketID
+	registerGoFunc(vm, "__tcpConnect", func(reqIDStr, hostname, port, secure string) (string, error) {
+		reqID := parseReqID(reqIDStr)
 		state := getRequestState(reqID)
 		if state == nil {
-			return throwError(iso, "tcpConnect: invalid request state")
+			return "", fmt.Errorf("tcpConnect: invalid request state")
 		}
-
 		if state.tcpSockets != nil && len(state.tcpSockets) >= maxTCPSockets {
-			return throwError(iso, "TCP: maximum socket limit reached")
+			return "", fmt.Errorf("TCP: maximum socket limit reached")
 		}
 
-		// SSRF-safe connection: DNS resolution + IP validation + direct connect.
 		var conn net.Conn
 		var err error
 
 		if secure == "on" {
-			// For TLS: establish raw connection first, then upgrade.
 			rawConn, dialErr := ssrfSafeTCPDial(context.Background(), hostname, port)
 			if dialErr != nil {
-				return throwError(iso, fmt.Sprintf("tcpConnect: %s", dialErr.Error()))
+				return "", fmt.Errorf("tcpConnect: %s", dialErr.Error())
 			}
 			tlsConn := tls.Client(rawConn, &tls.Config{
 				ServerName: hostname,
 			})
 			if err = tlsConn.Handshake(); err != nil {
 				_ = rawConn.Close()
-				return throwError(iso, fmt.Sprintf("tcpConnect: TLS handshake failed: %s", err.Error()))
+				return "", fmt.Errorf("tcpConnect: TLS handshake failed: %s", err.Error())
 			}
 			conn = tlsConn
 		} else {
 			conn, err = ssrfSafeTCPDial(context.Background(), hostname, port)
 			if err != nil {
-				return throwError(iso, fmt.Sprintf("tcpConnect: %s", err.Error()))
+				return "", fmt.Errorf("tcpConnect: %s", err.Error())
 			}
 		}
 
-		// Store connection in request state.
 		state.nextTCPSocketID++
 		socketID := fmt.Sprintf("tcp_%d", state.nextTCPSocketID)
 
@@ -355,150 +320,94 @@ func setupTCPSocket(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		state.tcpSocketBuffers[socketID] = buf
 		go buf.readLoop()
 
-		val, _ := v8.NewValue(iso, socketID)
-		return val
-	}).GetFunction(ctx))
+		return socketID, nil
+	}, false)
 
-	// __tcpRead(requestID, socketID, maxBytes) -> base64 string, "" if no data, null if EOF
-	_ = ctx.Global().Set("__tcpRead", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "tcpRead: requires 3 arguments")
-		}
-
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		socketID := args[1].String()
-		maxBytes := int(args[2].Int32())
-
+	// __tcpRead(reqIDStr, socketID, maxBytes) -> base64 data, "" for no data, "EOF" for connection closed
+	registerGoFunc(vm, "__tcpRead", func(reqIDStr, socketID string, maxBytes int) (string, error) {
+		reqID := parseReqID(reqIDStr)
 		state := getRequestState(reqID)
 		if state == nil {
-			return throwError(iso, "tcpRead: invalid request state")
+			return "", fmt.Errorf("tcpRead: invalid request state")
 		}
-
 		buf, ok := state.tcpSocketBuffers[socketID]
 		if !ok {
-			return throwError(iso, "tcpRead: unknown socket ID")
+			return "", fmt.Errorf("tcpRead: unknown socket ID")
 		}
 
-		// Loop until data is available or EOF. Each iteration waits
-		// up to 1 second for the readLoop goroutine to deliver data.
-		// Bounded to 30 iterations (30s) to prevent blocking forever
-		// if no data arrives (the execution watchdog will also fire).
 		for attempts := 0; attempts < 30; attempts++ {
 			data, eof, _ := buf.take(maxBytes)
 			if data != "" {
-				val, _ := v8.NewValue(iso, data)
-				return val
+				return data, nil
 			}
 			if eof {
-				result, _ := ctx.RunScript("null", "null.js")
-				return result
+				return "EOF", nil
 			}
 			buf.waitForData(1 * time.Second)
 		}
-		// Exhausted retries without data — return empty string
-		// so the JS pull() can yield control.
-		val, _ := v8.NewValue(iso, "")
-		return val
-	}).GetFunction(ctx))
+		return "", nil
+	}, false)
 
-	// __tcpWrite(requestID, socketID, b64data) -> writes data to conn
-	_ = ctx.Global().Set("__tcpWrite", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "tcpWrite: requires 3 arguments")
-		}
-
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		socketID := args[1].String()
-		b64data := args[2].String()
-
+	// __tcpWrite(reqIDStr, socketID, b64data)
+	registerGoFunc(vm, "__tcpWrite", func(reqIDStr, socketID, b64data string) (int, error) {
+		reqID := parseReqID(reqIDStr)
 		state := getRequestState(reqID)
 		if state == nil {
-			return throwError(iso, "tcpWrite: invalid request state")
+			return 0, fmt.Errorf("tcpWrite: invalid request state")
 		}
-
 		conn, ok := state.tcpSockets[socketID]
 		if !ok {
-			return throwError(iso, "tcpWrite: unknown socket ID")
+			return 0, fmt.Errorf("tcpWrite: unknown socket ID")
 		}
-
 		data, err := base64.StdEncoding.DecodeString(b64data)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("tcpWrite: invalid base64: %s", err.Error()))
+			return 0, fmt.Errorf("tcpWrite: invalid base64: %s", err.Error())
 		}
-
 		if _, err := conn.Write(data); err != nil {
-			return throwError(iso, fmt.Sprintf("tcpWrite: %s", err.Error()))
+			return 0, fmt.Errorf("tcpWrite: %s", err.Error())
 		}
+		return 1, nil
+	}, false)
 
-		val, _ := v8.NewValue(iso, true)
-		return val
-	}).GetFunction(ctx))
-
-	// __tcpClose(requestID, socketID) -> closes the connection
-	_ = ctx.Global().Set("__tcpClose", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "tcpClose: requires 2 arguments")
-		}
-
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		socketID := args[1].String()
-
+	// __tcpClose(reqIDStr, socketID)
+	registerGoFunc(vm, "__tcpClose", func(reqIDStr, socketID string) {
+		reqID := parseReqID(reqIDStr)
 		state := getRequestState(reqID)
 		if state == nil {
-			return throwError(iso, "tcpClose: invalid request state")
+			return
 		}
-
 		conn, ok := state.tcpSockets[socketID]
 		if !ok {
-			return throwError(iso, "tcpClose: unknown socket ID")
+			return
 		}
-
 		_ = conn.Close()
 		delete(state.tcpSockets, socketID)
 		delete(state.tcpSocketBuffers, socketID)
+	}, false)
 
-		val, _ := v8.NewValue(iso, true)
-		return val
-	}).GetFunction(ctx))
-
-	// __tcpStartTls(requestID, socketID, hostname) -> new socketID with TLS upgrade
-	_ = ctx.Global().Set("__tcpStartTls", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "tcpStartTls: requires 3 arguments")
-		}
-
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		socketID := args[1].String()
-		hostname := args[2].String()
-
+	// __tcpStartTls(reqIDStr, socketID, hostname) -> new socketID
+	registerGoFunc(vm, "__tcpStartTls", func(reqIDStr, socketID, hostname string) (string, error) {
+		reqID := parseReqID(reqIDStr)
 		state := getRequestState(reqID)
 		if state == nil {
-			return throwError(iso, "tcpStartTls: invalid request state")
+			return "", fmt.Errorf("tcpStartTls: invalid request state")
 		}
-
 		conn, ok := state.tcpSockets[socketID]
 		if !ok {
-			return throwError(iso, "tcpStartTls: unknown socket ID")
+			return "", fmt.Errorf("tcpStartTls: unknown socket ID")
 		}
 
-		// Remove old socket from maps (don't close - we're upgrading it).
 		delete(state.tcpSockets, socketID)
 		delete(state.tcpSocketBuffers, socketID)
 
-		// Upgrade the raw connection to TLS.
 		tlsConn := tls.Client(conn, &tls.Config{
 			ServerName: hostname,
 		})
 		if err := tlsConn.Handshake(); err != nil {
 			_ = conn.Close()
-			return throwError(iso, fmt.Sprintf("tcpStartTls: TLS handshake failed: %s", err.Error()))
+			return "", fmt.Errorf("tcpStartTls: TLS handshake failed: %s", err.Error())
 		}
 
-		// Store new TLS connection.
 		state.nextTCPSocketID++
 		newSocketID := fmt.Sprintf("tcp_%d", state.nextTCPSocketID)
 		state.tcpSockets[newSocketID] = tlsConn
@@ -507,20 +416,16 @@ func setupTCPSocket(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		state.tcpSocketBuffers[newSocketID] = buf
 		go buf.readLoop()
 
-		val, _ := v8.NewValue(iso, newSocketID)
-		return val
-	}).GetFunction(ctx))
+		return newSocketID, nil
+	}, false)
 
-	// Evaluate the JS polyfill.
-	if _, err := ctx.RunScript(tcpSocketJS, "tcpsocket.js"); err != nil {
+	if err := evalDiscard(vm, tcpSocketJS); err != nil {
 		return fmt.Errorf("evaluating tcpsocket.js: %w", err)
 	}
-
 	return nil
 }
 
 // tcpSSRFEnabled controls SSRF protection for TCP socket connections.
-// Tests can set this to false to allow connections to loopback/private IPs.
 var tcpSSRFEnabled = true
 
 // ssrfSafeTCPDial performs SSRF-safe TCP connection by resolving DNS once
@@ -530,29 +435,24 @@ func ssrfSafeTCPDial(ctx context.Context, hostname, port string) (net.Conn, erro
 		return net.Dial("tcp", net.JoinHostPort(hostname, port))
 	}
 
-	// Check literal localhost hostnames.
 	lower := strings.ToLower(hostname)
 	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") {
 		return nil, fmt.Errorf("connections to private addresses are not allowed")
 	}
 
-	// Check if hostname is a literal IP.
 	if ip := net.ParseIP(hostname); ip != nil {
 		if isPrivateIP(ip) {
 			return nil, fmt.Errorf("connections to private addresses are not allowed")
 		}
-		// Connect directly to the literal IP.
 		dialer := &net.Dialer{}
 		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(hostname, port))
 	}
 
-	// Resolve DNS once.
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
 	if err != nil {
 		return nil, fmt.Errorf("DNS lookup failed: %w", err)
 	}
 
-	// Find the first non-private IP.
 	var safeIP net.IPAddr
 	found := false
 	for _, ip := range ips {
@@ -566,13 +466,11 @@ func ssrfSafeTCPDial(ctx context.Context, hostname, port string) (net.Conn, erro
 		return nil, fmt.Errorf("connections to private addresses are not allowed")
 	}
 
-	// Connect directly to the validated IP (no re-resolution).
 	dialer := &net.Dialer{}
 	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(safeIP.IP.String(), port))
 }
 
 // cleanupTCPSockets closes all TCP sockets for a request state.
-// Called during clearRequestState cleanup.
 func cleanupTCPSockets(state *requestState) {
 	if state.tcpSockets == nil {
 		return

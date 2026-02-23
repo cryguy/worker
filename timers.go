@@ -3,77 +3,61 @@ package worker
 import (
 	"time"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
+// timersJS is the JavaScript polyfill for setTimeout/setInterval/clearTimeout/clearInterval.
+// It stores callbacks in globalThis.__timerCallbacks and delegates scheduling to Go via
+// __timerRegister/__timerClear registered functions.
+const timersJS = `
+(function() {
+	globalThis.__timerCallbacks = {};
+	globalThis.setTimeout = function(fn, delay) {
+		if (arguments.length === 0 || typeof fn !== 'function') {
+			return 0;
+		}
+		var args = [];
+		for (var i = 2; i < arguments.length; i++) args.push(arguments[i]);
+		var id = __timerRegister(delay || 0, false);
+		globalThis.__timerCallbacks[id] = { fn: fn, args: args };
+		return id;
+	};
+	globalThis.setInterval = function(fn, interval) {
+		if (arguments.length === 0 || typeof fn !== 'function') {
+			return 0;
+		}
+		var args = [];
+		for (var i = 2; i < arguments.length; i++) args.push(arguments[i]);
+		var id = __timerRegister(interval || 0, true);
+		globalThis.__timerCallbacks[id] = { fn: fn, args: args, interval: true };
+		return id;
+	};
+	globalThis.clearTimeout = globalThis.clearInterval = function(id) {
+		if (arguments.length === 0 || typeof id !== 'number') {
+			return;
+		}
+		__timerClear(id);
+		delete globalThis.__timerCallbacks[id];
+	};
+})();
+`
+
 // setupTimers registers Go-backed setTimeout/setInterval/clearTimeout/clearInterval.
-// Unlike the previous JS microtask-based implementation, these use real wall-clock
-// delays via the eventLoop. Timer callbacks fire during eventLoop.drain() which is
-// called by Engine.Execute after the fetch handler returns.
-func setupTimers(iso *v8.Isolate, ctx *v8.Context, el *eventLoop) error {
-	// setTimeout(fn, delay) -> timerID
-	setTimeoutFT := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 1 || !args[0].IsFunction() {
-			val, _ := v8.NewValue(iso, int32(0))
-			return val
-		}
-		fn, err := args[0].AsFunction()
-		if err != nil {
-			val, _ := v8.NewValue(iso, int32(0))
-			return val
-		}
-		var delay time.Duration
-		if len(args) > 1 {
-			delay = time.Duration(args[1].Int32()) * time.Millisecond
-		}
-		id := el.setTimeout(fn, delay)
-		val, _ := v8.NewValue(iso, int32(id))
-		return val
-	})
-	_ = ctx.Global().Set("setTimeout", setTimeoutFT.GetFunction(ctx))
+// Timer callbacks are stored on the JS side in __timerCallbacks; Go only tracks
+// scheduling metadata (delay, interval, deadline). Callbacks fire during
+// eventLoop.drain() which is called by Engine.Execute after the handler returns.
+func setupTimers(vm *quickjs.VM, el *eventLoop) error {
+	// __timerRegister(delayMs, isInterval) -> timerID
+	registerGoFunc(vm, "__timerRegister", func(delayMs int, isInterval bool) int {
+		delay := time.Duration(delayMs) * time.Millisecond
+		return el.registerTimer(delay, isInterval)
+	}, false)
 
-	// clearTimeout(id)
-	clearTimeoutFT := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) > 0 {
-			el.clearTimer(int(args[0].Int32()))
-		}
-		return v8.Undefined(iso)
-	})
-	_ = ctx.Global().Set("clearTimeout", clearTimeoutFT.GetFunction(ctx))
+	// __timerClear(id)
+	registerGoFunc(vm, "__timerClear", func(id int) {
+		el.clearTimer(id)
+	}, false)
 
-	// setInterval(fn, interval) -> timerID
-	setIntervalFT := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 1 || !args[0].IsFunction() {
-			val, _ := v8.NewValue(iso, int32(0))
-			return val
-		}
-		fn, err := args[0].AsFunction()
-		if err != nil {
-			val, _ := v8.NewValue(iso, int32(0))
-			return val
-		}
-		interval := 10 * time.Millisecond // minimum interval
-		if len(args) > 1 && args[1].Int32() > 0 {
-			interval = time.Duration(args[1].Int32()) * time.Millisecond
-		}
-		id := el.setInterval(fn, interval)
-		val, _ := v8.NewValue(iso, int32(id))
-		return val
-	})
-	_ = ctx.Global().Set("setInterval", setIntervalFT.GetFunction(ctx))
-
-	// clearInterval(id)  Esame semantics as clearTimeout.
-	clearIntervalFT := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) > 0 {
-			el.clearTimer(int(args[0].Int32()))
-		}
-		return v8.Undefined(iso)
-	})
-	_ = ctx.Global().Set("clearInterval", clearIntervalFT.GetFunction(ctx))
-
-	return nil
+	// Install the JS polyfill that wraps these Go functions.
+	return evalDiscard(vm, timersJS)
 }

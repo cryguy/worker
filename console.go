@@ -2,48 +2,51 @@ package worker
 
 import (
 	"fmt"
-	"strconv"
-	"strings"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // setupConsole replaces globalThis.console with a Go-backed version
 // that captures output into the per-request log buffer.
-func setupConsole(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	console, err := newJSObject(iso, ctx)
-	if err != nil {
-		return fmt.Errorf("creating console object: %w", err)
+func setupConsole(vm *quickjs.VM, _ *eventLoop) error {
+	// Register Go-backed __console function.
+	registerGoFunc(vm, "__console", func(reqIDStr, level, message string) {
+		reqID := uint64(0)
+		if reqIDStr != "" && reqIDStr != "undefined" {
+			fmt.Sscanf(reqIDStr, "%d", &reqID)
+		}
+		addLog(reqID, level, message)
+	}, false)
+
+	// Build console object in JS that calls __console.
+	consoleJS := `
+(function() {
+	var levels = ['log', 'info', 'warn', 'error', 'debug'];
+	var con = {};
+	for (var i = 0; i < levels.length; i++) {
+		(function(lvl) {
+			con[lvl] = function() {
+				var parts = [];
+				for (var j = 0; j < arguments.length; j++) {
+					var arg = arguments[j];
+					if (typeof arg === 'object' && arg !== null) {
+						parts.push('[object Object]');
+					} else {
+						parts.push(String(arg));
+					}
+				}
+				var reqID = globalThis.__requestID || '';
+				__console(reqID, lvl, parts.join(' '));
+			};
+		})(levels[i]);
 	}
-
-	levels := []string{"log", "info", "warn", "error", "debug"}
-	for _, level := range levels {
-		lvl := level // capture for closure
-		ft := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-			reqIDVal, _ := ctx.Global().Get("__requestID")
-			var reqID uint64
-			if reqIDVal != nil && !reqIDVal.IsUndefined() && !reqIDVal.IsNull() {
-				reqID, _ = strconv.ParseUint(reqIDVal.String(), 10, 64)
-			}
-
-			args := info.Args()
-			parts := make([]string, 0, len(args))
-			for _, arg := range args {
-				parts = append(parts, arg.String())
-			}
-			msg := strings.Join(parts, " ")
-			addLog(reqID, lvl, msg)
-			return v8.Undefined(iso)
-		})
-		_ = console.Set(lvl, ft.GetFunction(ctx))
-	}
-
-	_ = ctx.Global().Set("console", console)
-	return nil
+	globalThis.console = con;
+})();
+`
+	return evalDiscard(vm, consoleJS)
 }
 
 // consoleExtJS adds extended console methods (time, count, assert, table, etc.)
-// as pure JS on top of the Go-backed base console.
 const consoleExtJS = `
 (function() {
 var __timers = {};
@@ -116,10 +119,6 @@ console.dir = function(obj) {
 `
 
 // setupConsoleExt evaluates the extended console methods polyfill.
-// Must be called AFTER setupConsole so the base console object exists.
-func setupConsoleExt(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(consoleExtJS, "console_ext.js"); err != nil {
-		return fmt.Errorf("evaluating console_ext.js: %w", err)
-	}
-	return nil
+func setupConsoleExt(vm *quickjs.VM, _ *eventLoop) error {
+	return evalDiscard(vm, consoleExtJS)
 }

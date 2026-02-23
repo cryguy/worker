@@ -8,7 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // aesKeyWrap implements RFC 3394 AES Key Wrap.
@@ -199,101 +199,73 @@ subtle.unwrapKey = async function(format, wrappedKey, unwrappingKey, unwrapAlgor
 
 // setupCryptoAesCtrKw registers AES-CTR and AES-KW Go functions and evaluates
 // the JS patches. Must run after setupCryptoRSA (or at least after setupCryptoExt).
-func setupCryptoAesCtrKw(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupCryptoAesCtrKw(vm *quickjs.VM, _ *eventLoop) error {
 	// __cryptoEncryptAesCtr(keyID, dataB64, counterB64, length) -> resultB64
-	_ = ctx.Global().Set("__cryptoEncryptAesCtr", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "encryptAesCtr requires 4 argument(s)")
-		}
-		keyID := args[0].Integer()
-		dataB64 := args[1].String()
-		counterB64 := args[2].String()
-		_ = int(args[3].Int32()) // length param (bits of counter block to use)
-
+	registerGoFunc(vm, "__cryptoEncryptAesCtr", func(keyID int, dataB64, counterB64 string, length int) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "encryptAesCtr: invalid base64 data")
+			return "", fmt.Errorf("encryptAesCtr: invalid base64 data")
 		}
 		counter, err := base64.StdEncoding.DecodeString(counterB64)
 		if err != nil {
-			return throwError(iso, "encryptAesCtr: invalid counter base64")
+			return "", fmt.Errorf("encryptAesCtr: invalid counter base64")
 		}
 		if len(counter) != 16 {
-			return throwError(iso, fmt.Sprintf("encryptAesCtr: counter must be exactly 16 bytes, got %d", len(counter)))
+			return "", fmt.Errorf("encryptAesCtr: counter must be exactly 16 bytes, got %d", len(counter))
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "encryptAesCtr: key not found")
+			return "", fmt.Errorf("encryptAesCtr: key not found")
 		}
 
 		block, err := aes.NewCipher(entry.data)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("encryptAesCtr: %s", err.Error()))
+			return "", fmt.Errorf("encryptAesCtr: %s", err.Error())
 		}
 
 		ct := make([]byte, len(data))
 		stream := cipher.NewCTR(block, counter)
 		stream.XORKeyStream(ct, data)
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(ct))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(ct), nil
+	}, false)
 
 	// __cryptoDecryptAesCtr(keyID, dataB64, counterB64, length) -> resultB64
-	_ = ctx.Global().Set("__cryptoDecryptAesCtr", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 4 {
-			return throwError(iso, "decryptAesCtr requires 4 argument(s)")
-		}
-		keyID := args[0].Integer()
-		dataB64 := args[1].String()
-		counterB64 := args[2].String()
-		_ = int(args[3].Int32()) // length param
-
+	registerGoFunc(vm, "__cryptoDecryptAesCtr", func(keyID int, dataB64, counterB64 string, length int) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "decryptAesCtr: invalid base64 data")
+			return "", fmt.Errorf("decryptAesCtr: invalid base64 data")
 		}
 		counter, err := base64.StdEncoding.DecodeString(counterB64)
 		if err != nil {
-			return throwError(iso, "decryptAesCtr: invalid counter base64")
+			return "", fmt.Errorf("decryptAesCtr: invalid counter base64")
 		}
 		if len(counter) != 16 {
-			return throwError(iso, fmt.Sprintf("decryptAesCtr: counter must be exactly 16 bytes, got %d", len(counter)))
+			return "", fmt.Errorf("decryptAesCtr: counter must be exactly 16 bytes, got %d", len(counter))
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "decryptAesCtr: key not found")
+			return "", fmt.Errorf("decryptAesCtr: key not found")
 		}
 
 		block, err := aes.NewCipher(entry.data)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("decryptAesCtr: %s", err.Error()))
+			return "", fmt.Errorf("decryptAesCtr: %s", err.Error())
 		}
 
 		pt := make([]byte, len(data))
 		stream := cipher.NewCTR(block, counter)
 		stream.XORKeyStream(pt, data)
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(pt))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(pt), nil
+	}, false)
 
 	// __cryptoGenerateKeyAes(algoName, length, extractable) -> JSON { keyId } or { error }
-	_ = ctx.Global().Set("__cryptoGenerateKeyAes", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "generateKeyAes requires 3 argument(s)")
-		}
-		algoName := args[0].String()
-		bitLength := int(args[1].Int32())
-		extractableVal := args[2].Boolean()
-
+	registerGoFunc(vm, "__cryptoGenerateKeyAes", func(algoName string, bitLength int, extractableVal bool) (string, error) {
 		var byteLength int
 		switch bitLength {
 		case 128:
@@ -303,20 +275,17 @@ func setupCryptoAesCtrKw(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		case 256:
 			byteLength = 32
 		default:
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"generateKey: unsupported key length %d for %s"}`, bitLength, algoName))
-			return val
+			return fmt.Sprintf(`{"error":"generateKey: unsupported key length %d for %s"}`, bitLength, algoName), nil
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		keyData := make([]byte, byteLength)
 		if _, err := rand.Read(keyData); err != nil {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()))
-			return val
+			return fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()), nil
 		}
 
 		id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
@@ -325,78 +294,61 @@ func setupCryptoAesCtrKw(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			keyType:     "secret",
 			extractable: extractableVal,
 		})
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d}`, id))
-		return val
-	}).GetFunction(ctx))
+		return fmt.Sprintf(`{"keyId":%d}`, id), nil
+	}, false)
 
 	// __cryptoWrapKeyAESKW(wrappingKeyID, dataB64) -> wrappedB64
-	_ = ctx.Global().Set("__cryptoWrapKeyAESKW", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "wrapKeyAESKW requires 2 argument(s)")
-		}
-		wrappingKeyID := args[0].Integer()
-		dataB64 := args[1].String()
-
+	registerGoFunc(vm, "__cryptoWrapKeyAESKW", func(wrappingKeyID int, dataB64 string) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "wrapKeyAESKW: invalid base64 data")
+			return "", fmt.Errorf("wrapKeyAESKW: invalid base64 data")
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		wrappingEntry := getCryptoKey(reqID, wrappingKeyID)
 		if wrappingEntry == nil {
-			return throwError(iso, "wrapKeyAESKW: wrapping key not found")
+			return "", fmt.Errorf("wrapKeyAESKW: wrapping key not found")
 		}
 
 		// Key data to wrap must be a multiple of 8 bytes
 		if len(data)%8 != 0 {
-			return throwError(iso, "wrapKeyAESKW: key data must be a multiple of 8 bytes")
+			return "", fmt.Errorf("wrapKeyAESKW: key data must be a multiple of 8 bytes")
 		}
 		if len(data) < 16 {
-			return throwError(iso, "wrapKeyAESKW: key data must be at least 16 bytes")
+			return "", fmt.Errorf("wrapKeyAESKW: key data must be at least 16 bytes")
 		}
 
 		wrapped, err := aesKeyWrap(wrappingEntry.data, data)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("wrapKeyAESKW: %s", err.Error()))
+			return "", fmt.Errorf("wrapKeyAESKW: %s", err.Error())
 		}
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(wrapped))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(wrapped), nil
+	}, false)
 
 	// __cryptoUnwrapKeyAESKW(unwrappingKeyID, wrappedB64) -> unwrappedB64
-	_ = ctx.Global().Set("__cryptoUnwrapKeyAESKW", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "unwrapKeyAESKW requires 2 argument(s)")
-		}
-		unwrappingKeyID := args[0].Integer()
-		wrappedB64 := args[1].String()
-
+	registerGoFunc(vm, "__cryptoUnwrapKeyAESKW", func(unwrappingKeyID int, wrappedB64 string) (string, error) {
 		wrappedData, err := base64.StdEncoding.DecodeString(wrappedB64)
 		if err != nil {
-			return throwError(iso, "unwrapKeyAESKW: invalid base64 data")
+			return "", fmt.Errorf("unwrapKeyAESKW: invalid base64 data")
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		unwrappingEntry := getCryptoKey(reqID, unwrappingKeyID)
 		if unwrappingEntry == nil {
-			return throwError(iso, "unwrapKeyAESKW: unwrapping key not found")
+			return "", fmt.Errorf("unwrapKeyAESKW: unwrapping key not found")
 		}
 
 		unwrapped, err := aesKeyUnwrap(unwrappingEntry.data, wrappedData)
 		if err != nil {
-			return throwError(iso, fmt.Sprintf("unwrapKeyAESKW: %s", err.Error()))
+			return "", fmt.Errorf("unwrapKeyAESKW: %s", err.Error())
 		}
 
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(unwrapped))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(unwrapped), nil
+	}, false)
 
 	// Evaluate the JS patches.
-	if _, err := ctx.RunScript(cryptoAesCtrKwJS, "crypto_kw.js"); err != nil {
+	if err := evalDiscard(vm, cryptoAesCtrKwJS); err != nil {
 		return fmt.Errorf("evaluating crypto_kw.js: %w", err)
 	}
 

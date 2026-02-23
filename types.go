@@ -3,7 +3,7 @@ package worker
 import (
 	"time"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // WorkerRequest represents an incoming HTTP request to a worker.
@@ -51,10 +51,14 @@ type TailEvent struct {
 }
 
 // EnvBindingFunc creates a JS value to be set on the worker's env object.
-// It receives the V8 isolate and context for the current execution.
+// It receives the QuickJS VM for the current execution.
 // Downstream users can use this to register custom bindings (objects, functions,
 // etc.) that their worker scripts can access via env.<name>.
-type EnvBindingFunc func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error)
+//
+// The returned Value is owned by the caller (buildEnvObject) and will be freed
+// after being set on the env object. If the binding needs to persist, it should
+// be constructed via vm.EvalValue so QuickJS manages its lifetime.
+type EnvBindingFunc func(vm *quickjs.VM) (quickjs.Value, error)
 
 // Env holds all bindings passed to the worker as the second argument.
 type Env struct {
@@ -72,7 +76,7 @@ type Env struct {
 
 	// CustomBindings allows downstream users to add arbitrary bindings
 	// to the env object. Each function is called per-request and its
-	// returned V8 value is set on env under the map key name.
+	// returned QuickJS value is set on env under the map key name.
 	CustomBindings map[string]EnvBindingFunc
 
 	// D1 configuration

@@ -35,8 +35,8 @@ type requestState struct {
 	fetchCount int
 	maxFetches int
 	env        *Env
-	cryptoKeys map[int64]*cryptoKeyEntry
-	nextKeyID  int64
+	cryptoKeys map[int]*cryptoKeyEntry
+	nextKeyID  int
 
 	// WebSocket bridge state (set when status 101 response is returned).
 	wsConn   *websocket.Conn
@@ -150,7 +150,7 @@ func clearRequestState(id uint64) *requestState {
 }
 
 // importCryptoKey stores key material scoped to the request and returns its ID.
-func importCryptoKey(reqID uint64, hashAlgo string, data []byte) int64 {
+func importCryptoKey(reqID uint64, hashAlgo string, data []byte) int {
 	state := getRequestState(reqID)
 	if state == nil {
 		return -1
@@ -158,14 +158,14 @@ func importCryptoKey(reqID uint64, hashAlgo string, data []byte) int64 {
 	state.nextKeyID++
 	id := state.nextKeyID
 	if state.cryptoKeys == nil {
-		state.cryptoKeys = make(map[int64]*cryptoKeyEntry)
+		state.cryptoKeys = make(map[int]*cryptoKeyEntry)
 	}
 	state.cryptoKeys[id] = &cryptoKeyEntry{data: data, hashAlgo: hashAlgo, extractable: true}
 	return id
 }
 
 // getCryptoKey retrieves key material scoped to the request.
-func getCryptoKey(reqID uint64, keyID int64) *cryptoKeyEntry {
+func getCryptoKey(reqID uint64, keyID int) *cryptoKeyEntry {
 	state := getRequestState(reqID)
 	if state == nil {
 		return nil

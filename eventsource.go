@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 const maxEventSources = 10
@@ -28,9 +28,9 @@ type sseEvent struct {
 // network I/O to Go-backed helpers.
 const eventSourceJS = `
 (function() {
-	const CONNECTING = 0;
-	const OPEN = 1;
-	const CLOSED = 2;
+	var CONNECTING = 0;
+	var OPEN = 1;
+	var CLOSED = 2;
 
 	class EventSource extends EventTarget {
 		constructor(url, options) {
@@ -44,33 +44,32 @@ const eventSourceJS = `
 			this._sourceID = null;
 			this._pollTimer = null;
 
-			const reqID = globalThis.__requestID;
-			const self = this;
+			var reqID = globalThis.__requestID;
 			try {
-				this._sourceID = __eventSourceConnect(reqID, this._url);
+				this._sourceID = __eventSourceConnect(String(reqID), this._url);
 				this._readyState = OPEN;
 				this.dispatchEvent(new Event('open'));
-				// Start polling for events.
-				this._startPolling(reqID);
+				this._startPolling(String(reqID));
 			} catch(e) {
 				this._readyState = CLOSED;
-				const errEvt = new Event('error');
+				var errEvt = new Event('error');
 				errEvt.message = e.message || String(e);
 				this.dispatchEvent(errEvt);
 			}
 		}
 
 		_startPolling(reqID) {
-			const self = this;
+			var self = this;
 			function poll() {
 				if (self._readyState === CLOSED || !self._sourceID) return;
 				try {
-					const eventsJSON = __eventSourcePoll(reqID, self._sourceID);
+					var eventsJSON = __eventSourcePoll(reqID, self._sourceID);
 					if (eventsJSON && eventsJSON !== '[]') {
-						const events = JSON.parse(eventsJSON);
-						for (const evt of events) {
+						var events = JSON.parse(eventsJSON);
+						for (var i = 0; i < events.length; i++) {
+							var evt = events[i];
 							if (evt.type === '__error__') {
-								const errEvt = new Event('error');
+								var errEvt = new Event('error');
 								errEvt.message = evt.data;
 								self.dispatchEvent(errEvt);
 								self._readyState = CLOSED;
@@ -80,15 +79,13 @@ const eventSourceJS = `
 								self._readyState = CLOSED;
 								return;
 							}
-							const me = new Event(evt.type || 'message');
+							var me = new Event(evt.type || 'message');
 							me.data = evt.data;
 							me.lastEventId = evt.id || '';
 							self.dispatchEvent(me);
 						}
 					}
-				} catch(e) {
-					// poll error, ignore
-				}
+				} catch(e) {}
 				if (self._readyState !== CLOSED) {
 					self._pollTimer = setTimeout(poll, 50);
 				}
@@ -130,8 +127,8 @@ const eventSourceJS = `
 			}
 			if (this._sourceID) {
 				try {
-					const reqID = globalThis.__requestID;
-					__eventSourceClose(reqID, this._sourceID);
+					var reqID = globalThis.__requestID;
+					__eventSourceClose(String(reqID), this._sourceID);
 				} catch(e) {}
 			}
 		}
@@ -150,28 +147,22 @@ const eventSourceJS = `
 
 // setupEventSource registers Go-backed helpers for EventSource SSE and
 // evaluates the JS wrapper.
-func setupEventSource(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	// __eventSourceConnect(requestID, url) -> sourceID
-	_ = ctx.Global().Set("__eventSourceConnect", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("__eventSourceConnect", 2).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		rawURL := args[1].String()
+func setupEventSource(vm *quickjs.VM, _ *eventLoop) error {
+	// __eventSourceConnect(reqIDStr, url) -> sourceID
+	registerGoFunc(vm, "__eventSourceConnect", func(reqIDStr, rawURL string) (string, error) {
+		reqID := parseReqID(reqIDStr)
 
-		// SSRF protection: block private IPs.
 		if eventSourceSSRFEnabled && isPrivateHostname(rawURL) {
-			return throwError(iso, "EventSource: connection to private IP addresses is not allowed")
+			return "", fmt.Errorf("EventSource: connection to private IP addresses is not allowed")
 		}
 
 		state := getRequestState(reqID)
 		if state == nil {
-			return throwError(iso, "EventSource: invalid request state")
+			return "", fmt.Errorf("EventSource: invalid request state")
 		}
 
 		if state.eventSources != nil && len(state.eventSources) >= maxEventSources {
-			return throwError(iso, "EventSource: maximum connection limit reached")
+			return "", fmt.Errorf("EventSource: maximum connection limit reached")
 		}
 
 		if state.eventSources == nil {
@@ -185,7 +176,6 @@ func setupEventSource(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		}
 		state.eventSources[sourceID] = es
 
-		// Start the SSE connection in a goroutine.
 		connCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		es.cancelFunc = cancel
 
@@ -221,7 +211,6 @@ func setupEventSource(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			es.connected = true
 			es.mu.Unlock()
 
-			// Parse SSE stream.
 			parseSSEStream(es, resp)
 		}()
 
@@ -239,32 +228,22 @@ func setupEventSource(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		es.mu.Unlock()
 
 		if hasError {
-			return throwError(iso, "EventSource: connection failed")
+			return "", fmt.Errorf("EventSource: connection failed")
 		}
 
-		val, _ := v8.NewValue(iso, sourceID)
-		return val
-	}).GetFunction(ctx))
+		return sourceID, nil
+	}, false)
 
-	// __eventSourcePoll(requestID, sourceID) -> JSON array of events
-	_ = ctx.Global().Set("__eventSourcePoll", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("__eventSourcePoll", 2).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		sourceID := args[1].String()
-
+	// __eventSourcePoll(reqIDStr, sourceID) -> JSON array of events
+	registerGoFunc(vm, "__eventSourcePoll", func(reqIDStr, sourceID string) (string, error) {
+		reqID := parseReqID(reqIDStr)
 		state := getRequestState(reqID)
 		if state == nil || state.eventSources == nil {
-			val, _ := v8.NewValue(iso, "[]")
-			return val
+			return "[]", nil
 		}
-
 		es, ok := state.eventSources[sourceID]
 		if !ok {
-			val, _ := v8.NewValue(iso, "[]")
-			return val
+			return "[]", nil
 		}
 
 		es.mu.Lock()
@@ -278,43 +257,27 @@ func setupEventSource(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		}
 
 		data, _ := json.Marshal(events)
-		val, _ := v8.NewValue(iso, string(data))
-		return val
-	}).GetFunction(ctx))
+		return string(data), nil
+	}, false)
 
-	// __eventSourceClose(requestID, sourceID)
-	_ = ctx.Global().Set("__eventSourceClose", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, errMissingArg("__eventSourceClose", 2).Error())
-		}
-		reqID, _ := strconv.ParseUint(args[0].String(), 10, 64)
-		sourceID := args[1].String()
-
+	// __eventSourceClose(reqIDStr, sourceID)
+	registerGoFunc(vm, "__eventSourceClose", func(reqIDStr, sourceID string) {
+		reqID := parseReqID(reqIDStr)
 		state := getRequestState(reqID)
 		if state == nil || state.eventSources == nil {
-			undef, _ := v8.NewValue(iso, true)
-			return undef
+			return
 		}
-
 		es, ok := state.eventSources[sourceID]
 		if !ok {
-			undef, _ := v8.NewValue(iso, true)
-			return undef
+			return
 		}
-
 		closeEventSource(es)
 		delete(state.eventSources, sourceID)
+	}, false)
 
-		undef, _ := v8.NewValue(iso, true)
-		return undef
-	}).GetFunction(ctx))
-
-	// Evaluate the JS wrapper.
-	if _, err := ctx.RunScript(eventSourceJS, "eventsource.js"); err != nil {
+	if err := evalDiscard(vm, eventSourceJS); err != nil {
 		return fmt.Errorf("evaluating eventsource.js: %w", err)
 	}
-
 	return nil
 }
 
@@ -328,16 +291,16 @@ func parseSSEStream(es *eventSourceState, resp *http.Response) {
 	}()
 
 	scanner := bufio.NewScanner(resp.Body)
-	var eventType, data, lastID string
+	var eventType string
 	var dataLines []string
+	var lastID string
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
 		if line == "" {
-			// Dispatch event.
 			if len(dataLines) > 0 {
-				data = strings.Join(dataLines, "\n")
+				data := strings.Join(dataLines, "\n")
 				if eventType == "" {
 					eventType = "message"
 				}
@@ -351,7 +314,7 @@ func parseSSEStream(es *eventSourceState, resp *http.Response) {
 					es.mu.Unlock()
 					eventType = ""
 					dataLines = nil
-					continue // drop event (backpressure)
+					continue
 				}
 				es.events = append(es.events, evt)
 				es.mu.Unlock()
@@ -362,7 +325,6 @@ func parseSSEStream(es *eventSourceState, resp *http.Response) {
 		}
 
 		if strings.HasPrefix(line, ":") {
-			// Comment, ignore.
 			continue
 		}
 
@@ -391,7 +353,7 @@ func parseSSEStream(es *eventSourceState, resp *http.Response) {
 
 	// Flush any remaining data.
 	if len(dataLines) > 0 {
-		data = strings.Join(dataLines, "\n")
+		data := strings.Join(dataLines, "\n")
 		if eventType == "" {
 			eventType = "message"
 		}
@@ -423,9 +385,6 @@ func closeEventSource(es *eventSourceState) {
 }
 
 // cleanupEventSources closes all open event sources for a request.
-// The main cleanup path is clearRequestState() in runtime.go which inlines
-// the logic directly on the extracted state. This function remains available
-// for explicit mid-request cleanup.
 func cleanupEventSources(reqID uint64) {
 	state := getRequestState(reqID)
 	if state == nil || state.eventSources == nil {
@@ -438,12 +397,9 @@ func cleanupEventSources(reqID uint64) {
 }
 
 // eventSourceSSRFEnabled controls SSRF protection for EventSource connections.
-// Tests can set this to false (along with eventSourceTransport) to allow
-// connections to httptest servers on 127.0.0.1.
 var eventSourceSSRFEnabled = true
 
 // eventSourceTransport is the HTTP transport used for EventSource connections.
-// Tests can override this to http.DefaultTransport to bypass SSRF dial checks.
 var eventSourceTransport http.RoundTripper = &http.Transport{
 	DialContext: ssrfSafeDialContext,
 }

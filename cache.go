@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // cacheJS defines the Cache and CacheStorage classes available to workers.
@@ -26,7 +26,8 @@ class Cache {
 			return Promise.resolve(undefined);
 		}
 
-		var result = __cache_match(this._name, url);
+		var reqID = String(globalThis.__requestID);
+		var result = __cache_match(reqID, this._name, url);
 		if (result === 'null' || result === null || result === undefined) {
 			return Promise.resolve(undefined);
 		}
@@ -87,7 +88,9 @@ class Cache {
 			body = String(response._body);
 		}
 
+		var reqID = String(globalThis.__requestID);
 		__cache_put(
+			reqID,
 			this._name,
 			url,
 			response.status || 200,
@@ -109,7 +112,8 @@ class Cache {
 			return Promise.resolve(false);
 		}
 
-		var result = __cache_delete(this._name, url);
+		var reqID = String(globalThis.__requestID);
+		var result = __cache_delete(reqID, this._name, url);
 		return Promise.resolve(result === 'true' || result === true);
 	}
 }
@@ -134,30 +138,18 @@ globalThis.caches = new CacheStorage();
 `
 
 // setupCache registers the Cache API JS classes and Go-backed functions.
-func setupCache(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	// We need a reference to the CacheStore from the request state.
-	// The cache store is read per-call from the env.
-
-	// __cache_match(cacheName, url) -> JSON string or "null"
-	matchFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			val, _ := v8.NewValue(iso, "null")
-			return val
-		}
-		cacheName := args[0].String()
-		url := args[1].String()
-
-		store := getCacheStore(info.Context())
-		if store == nil {
-			val, _ := v8.NewValue(iso, "null")
-			return val
+func setupCache(vm *quickjs.VM, el *eventLoop) error {
+	// __cache_match(reqIDStr, cacheName, url) -> JSON string or "null"
+	err := registerGoFunc(vm, "__cache_match", func(reqIDStr, cacheName, url string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.Cache == nil {
+			return "null", nil
 		}
 
-		entry, err := store.Match(cacheName, url)
+		entry, err := state.env.Cache.Match(cacheName, url)
 		if err != nil || entry == nil {
-			val, _ := v8.NewValue(iso, "null")
-			return val
+			return "null", nil
 		}
 
 		var headers map[string]string
@@ -174,93 +166,54 @@ func setupCache(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			"body":    string(entry.Body),
 		}
 		data, _ := json.Marshal(result)
-		val, _ := v8.NewValue(iso, string(data))
-		return val
-	})
-	if err := ctx.Global().Set("__cache_match", matchFn.GetFunction(ctx)); err != nil {
-		return fmt.Errorf("setting __cache_match: %w", err)
+		return string(data), nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __cache_match: %w", err)
 	}
 
-	// __cache_put(cacheName, url, status, headersJSON, body, ttl)
-	putFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 6 {
-			return v8.Undefined(iso)
-		}
-		cacheName := args[0].String()
-		url := args[1].String()
-		status := int(args[2].Int32())
-		headersJSON := args[3].String()
-		body := args[4].String()
-		ttlVal := int(args[5].Int32())
-
-		store := getCacheStore(info.Context())
-		if store == nil {
-			return v8.Undefined(iso)
+	// __cache_put(reqIDStr, cacheName, url, status, headersJSON, body, ttl)
+	err = registerGoFunc(vm, "__cache_put", func(reqIDStr, cacheName, url string, status int, headersJSON, body string, ttl int) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.Cache == nil {
+			return "", nil
 		}
 
-		var ttl *int
-		if ttlVal > 0 {
-			ttl = &ttlVal
+		var ttlPtr *int
+		if ttl > 0 {
+			ttlPtr = &ttl
 		}
 
-		_ = store.Put(cacheName, url, status, headersJSON, []byte(body), ttl)
-		return v8.Undefined(iso)
-	})
-	if err := ctx.Global().Set("__cache_put", putFn.GetFunction(ctx)); err != nil {
-		return fmt.Errorf("setting __cache_put: %w", err)
+		_ = state.env.Cache.Put(cacheName, url, status, headersJSON, []byte(body), ttlPtr)
+		return "", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __cache_put: %w", err)
 	}
 
-	// __cache_delete(cacheName, url) -> "true" or "false"
-	deleteFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			val, _ := v8.NewValue(iso, "false")
-			return val
-		}
-		cacheName := args[0].String()
-		url := args[1].String()
-
-		store := getCacheStore(info.Context())
-		if store == nil {
-			val, _ := v8.NewValue(iso, "false")
-			return val
+	// __cache_delete(reqIDStr, cacheName, url) -> "true" or "false"
+	err = registerGoFunc(vm, "__cache_delete", func(reqIDStr, cacheName, url string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.env == nil || state.env.Cache == nil {
+			return "false", nil
 		}
 
-		deleted, err := store.Delete(cacheName, url)
+		deleted, err := state.env.Cache.Delete(cacheName, url)
 		if err != nil || !deleted {
-			val, _ := v8.NewValue(iso, "false")
-			return val
+			return "false", nil
 		}
-
-		val, _ := v8.NewValue(iso, "true")
-		return val
-	})
-	if err := ctx.Global().Set("__cache_delete", deleteFn.GetFunction(ctx)); err != nil {
-		return fmt.Errorf("setting __cache_delete: %w", err)
+		return "true", nil
+	}, false)
+	if err != nil {
+		return fmt.Errorf("registering __cache_delete: %w", err)
 	}
 
-	// Evaluate JS classes.
-	if _, err := ctx.RunScript(cacheJS, "cache.js"); err != nil {
+	// Evaluate JS classes
+	if err := evalDiscard(vm, cacheJS); err != nil {
 		return fmt.Errorf("evaluating cache.js: %w", err)
 	}
+
 	return nil
-}
-
-// getCacheStore retrieves the CacheStore from the current request state.
-// The CacheStore is stored in the per-request Env.
-func getCacheStore(ctx *v8.Context) CacheStore {
-	reqIDVal, err := ctx.Global().Get("__requestID")
-	if err != nil || reqIDVal.IsUndefined() {
-		return nil
-	}
-
-	var reqID uint64
-	_, _ = fmt.Sscanf(reqIDVal.String(), "%d", &reqID)
-	state := getRequestState(reqID)
-	if state == nil || state.env == nil || state.env.Cache == nil {
-		return nil
-	}
-
-	return state.env.Cache
 }

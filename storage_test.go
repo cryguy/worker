@@ -1,13 +1,431 @@
 package worker
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
+
+// ---------------------------------------------------------------------------
+// QuickJS test helpers for storage_test.go
+// ---------------------------------------------------------------------------
+
+// buildStorageBinding creates a test R2 bucket binding for the given store.
+// It sets up the VM with storage support and returns a bucket object.
+func buildStorageBinding(vm *quickjs.VM, store R2Store) (quickjs.Value, error) {
+	el := newEventLoop()
+
+	// Register __r2_* Go globals
+	if err := setupStorage(vm, el); err != nil {
+		return quickjs.Value{}, err
+	}
+
+	// Create request state with the store
+	env := &Env{
+		Vars:    make(map[string]string),
+		Secrets: make(map[string]string),
+		Storage: map[string]R2Store{"TEST_BUCKET": store},
+	}
+	reqID := newRequestState(10, env)
+
+	// Set __requestID on VM
+	if err := setGlobal(vm, "__requestID", reqID); err != nil {
+		return quickjs.Value{}, err
+	}
+
+	// Build the JS R2 binding object (copied from assets.go buildEnvObject)
+	storageJS := fmt.Sprintf(`
+		(function() {
+			return {
+				get: function(key) {
+					if (!key) return Promise.reject(new Error("get requires a key"));
+					var reqID = String(globalThis.__requestID);
+					var resultStr = __r2_get(reqID, %s, String(key));
+					return new Promise(function(resolve, reject) {
+						try {
+							if (resultStr === "null") {
+								resolve(null);
+								return;
+							}
+							var obj = JSON.parse(resultStr);
+							var bodyBytes = Uint8Array.from(atob(obj.bodyB64), function(c) { return c.charCodeAt(0); });
+							var bodyUsed = false;
+							var consumeBody = function(method) {
+								if (bodyUsed) {
+									return Promise.reject(new Error("body already consumed"));
+								}
+								bodyUsed = true;
+								return method();
+							};
+							resolve({
+								key: obj.key,
+								size: obj.size,
+								etag: obj.etag,
+								httpEtag: '"' + obj.etag + '"',
+								version: obj.etag,
+								storageClass: "STANDARD",
+								httpMetadata: { contentType: obj.contentType || null },
+								customMetadata: obj.customMetadata || {},
+								checksums: {},
+								uploaded: new Date(obj.uploaded),
+								get bodyUsed() { return bodyUsed; },
+								text: function() { return consumeBody(function() { return Promise.resolve(new TextDecoder().decode(bodyBytes)); }); },
+								arrayBuffer: function() { return consumeBody(function() { return Promise.resolve(bodyBytes.buffer); }); },
+								json: function() { return consumeBody(function() {
+									var text = new TextDecoder().decode(bodyBytes);
+									try {
+										return Promise.resolve(JSON.parse(text));
+									} catch(e) {
+										return Promise.reject(new Error("invalid JSON"));
+									}
+								}); }
+							});
+						} catch(e) {
+							reject(e);
+						}
+					});
+				},
+				put: function(key, value, opts) {
+					if (!key || value === undefined) return Promise.reject(new Error("put requires key and value"));
+					var reqID = String(globalThis.__requestID);
+					return new Promise(function(resolve, reject) {
+						try {
+							var bytes;
+							if (typeof value === "string") {
+								bytes = new TextEncoder().encode(value);
+							} else if (value instanceof ArrayBuffer) {
+								bytes = new Uint8Array(value);
+							} else if (ArrayBuffer.isView(value)) {
+								bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+							} else {
+								reject(new Error("unsupported body type"));
+								return;
+							}
+							var bodyB64 = btoa(String.fromCharCode.apply(null, bytes));
+							var optsJSON = opts ? JSON.stringify({
+								httpMetadata: { contentType: (opts.httpMetadata && opts.httpMetadata.contentType) || null },
+								customMetadata: opts.customMetadata || {}
+							}) : "{}";
+							var resultStr = __r2_put(reqID, %s, String(key), bodyB64, optsJSON);
+							var obj = JSON.parse(resultStr);
+							resolve({
+								key: obj.key,
+								size: obj.size,
+								etag: obj.etag,
+								httpEtag: '"' + obj.etag + '"',
+								version: obj.etag,
+								httpMetadata: { contentType: obj.contentType || null },
+								customMetadata: obj.customMetadata || {}
+							});
+						} catch(e) {
+							reject(new Error("error putting object: " + e.message));
+						}
+					});
+				},
+				delete: function(keys) {
+					if (!keys) return Promise.reject(new Error("delete requires a key"));
+					var reqID = String(globalThis.__requestID);
+					var keysArray = Array.isArray(keys) ? keys : [String(keys)];
+					return new Promise(function(resolve, reject) {
+						try {
+							__r2_delete(reqID, %s, JSON.stringify(keysArray));
+							resolve();
+						} catch(e) {
+							reject(e);
+						}
+					});
+				},
+				head: function(key) {
+					if (!key) return Promise.reject(new Error("head requires a key"));
+					var reqID = String(globalThis.__requestID);
+					var resultStr = __r2_head(reqID, %s, String(key));
+					return new Promise(function(resolve, reject) {
+						try {
+							if (resultStr === "null") {
+								resolve(null);
+								return;
+							}
+							var obj = JSON.parse(resultStr);
+							resolve({
+								key: obj.key,
+								size: obj.size,
+								etag: obj.etag,
+								httpEtag: '"' + obj.etag + '"',
+								version: obj.etag,
+								storageClass: "STANDARD",
+								httpMetadata: { contentType: obj.contentType || null },
+								customMetadata: obj.customMetadata || {},
+								checksums: {},
+								uploaded: new Date(obj.uploaded)
+							});
+						} catch(e) {
+							reject(e);
+						}
+					});
+				},
+				list: function(opts) {
+					var reqID = String(globalThis.__requestID);
+					var optsJSON = opts ? JSON.stringify({
+						prefix: opts.prefix || "",
+						cursor: opts.cursor || "",
+						delimiter: opts.delimiter || "",
+						limit: opts.limit || 1000
+					}) : "{}";
+					return new Promise(function(resolve, reject) {
+						try {
+							var resultStr = __r2_list(reqID, %s, optsJSON);
+							var result = JSON.parse(resultStr);
+							resolve({
+								objects: (result.objects || []).map(function(o) {
+									return {
+										key: o.key,
+										size: o.size,
+										etag: o.etag,
+										httpEtag: '"' + o.etag + '"',
+										uploaded: new Date(o.uploaded)
+									};
+								}),
+								truncated: result.truncated,
+								cursor: result.cursor,
+								delimitedPrefixes: result.delimitedPrefixes || []
+							});
+						} catch(e) {
+							reject(e);
+						}
+					});
+				},
+				createSignedUrl: function(key, opts) {
+					if (!key) return Promise.reject(new Error("createSignedUrl requires a key"));
+					var reqID = String(globalThis.__requestID);
+					var expiresIn = (opts && opts.expiresIn) || 3600;
+					return new Promise(function(resolve, reject) {
+						try {
+							var url = __r2_presigned_url(reqID, %s, String(key), expiresIn);
+							resolve(url);
+						} catch(e) {
+							reject(e);
+						}
+					});
+				},
+				publicUrl: function(key) {
+					if (!key) throw new Error("publicUrl requires a key");
+					var reqID = String(globalThis.__requestID);
+					return __r2_public_url(reqID, %s, String(key));
+				}
+			};
+		})()
+	`, jsEscape("TEST_BUCKET"), jsEscape("TEST_BUCKET"), jsEscape("TEST_BUCKET"),
+	   jsEscape("TEST_BUCKET"), jsEscape("TEST_BUCKET"), jsEscape("TEST_BUCKET"), jsEscape("TEST_BUCKET"))
+
+	val, err := vm.EvalValue(storageJS, quickjs.EvalGlobal)
+	if err != nil {
+		return quickjs.Value{}, err
+	}
+	return val, nil
+}
+
+// buildR2Object creates a QuickJS R2Object metadata-only object (no body).
+func buildR2Object(vm *quickjs.VM, key string, size int64, etag string, contentType string, customMeta map[string]string) (struct{ Value quickjs.Value }, error) {
+	customMetaJSON := "{}"
+	if customMeta != nil {
+		data, _ := json.Marshal(customMeta)
+		customMetaJSON = string(data)
+	}
+
+	contentTypeJS := "undefined"
+	if contentType != "" {
+		contentTypeJS = jsEscape(contentType)
+	}
+
+	jsCode := fmt.Sprintf(`
+		({
+			key: %s,
+			size: %d,
+			etag: %s,
+			httpEtag: %s,
+			version: %s,
+			storageClass: "STANDARD",
+			httpMetadata: { contentType: %s },
+			customMetadata: %s,
+			checksums: {}
+		})
+	`, jsEscape(key), size, jsEscape(etag), jsEscape(`"`+etag+`"`), jsEscape(etag),
+		contentTypeJS, customMetaJSON)
+
+	val, err := vm.EvalValue(jsCode, quickjs.EvalGlobal)
+	if err != nil {
+		return struct{ Value quickjs.Value }{}, err
+	}
+	return struct{ Value quickjs.Value }{Value: val}, nil
+}
+
+// buildR2ObjectBody creates a QuickJS R2ObjectBody (with body methods).
+func buildR2ObjectBody(vm *quickjs.VM, key string, data []byte, r2obj *R2Object) (struct{ Value quickjs.Value }, error) {
+	bodyB64 := ""
+	if len(data) > 0 {
+		// Encode data to base64 for transfer to JS
+		bodyB64 = encodeToBase64(data)
+	}
+
+	customMetaJSON := "{}"
+	if r2obj.CustomMetadata != nil {
+		metaData, _ := json.Marshal(r2obj.CustomMetadata)
+		customMetaJSON = string(metaData)
+	}
+
+	contentTypeJS := "undefined"
+	if r2obj.ContentType != "" {
+		contentTypeJS = jsEscape(r2obj.ContentType)
+	}
+
+	jsCode := fmt.Sprintf(`
+		(function() {
+			var bodyBytes = Uint8Array.from(atob(%s), function(c) { return c.charCodeAt(0); });
+			var bodyUsed = false;
+			var consumeBody = function(method) {
+				if (bodyUsed) {
+					return Promise.reject(new Error("body already consumed"));
+				}
+				bodyUsed = true;
+				return method();
+			};
+			return {
+				key: %s,
+				size: %d,
+				etag: %s,
+				httpEtag: %s,
+				version: %s,
+				storageClass: "STANDARD",
+				httpMetadata: { contentType: %s },
+				customMetadata: %s,
+				checksums: {},
+				uploaded: new Date(%d),
+				get bodyUsed() { return bodyUsed; },
+				text: function() { return consumeBody(function() { return Promise.resolve(new TextDecoder().decode(bodyBytes)); }); },
+				arrayBuffer: function() { return consumeBody(function() { return Promise.resolve(bodyBytes.buffer); }); },
+				json: function() { return consumeBody(function() {
+					var text = new TextDecoder().decode(bodyBytes);
+					try {
+						return Promise.resolve(JSON.parse(text));
+					} catch(e) {
+						return Promise.reject(new Error("invalid JSON"));
+					}
+				}); }
+			};
+		})()
+	`, jsEscape(bodyB64), jsEscape(key), r2obj.Size, jsEscape(r2obj.ETag),
+		jsEscape(`"`+r2obj.ETag+`"`), jsEscape(r2obj.ETag), contentTypeJS,
+		customMetaJSON, r2obj.LastModified.UnixMilli())
+
+	val, err := vm.EvalValue(jsCode, quickjs.EvalGlobal)
+	if err != nil {
+		return struct{ Value quickjs.Value }{}, err
+	}
+	return struct{ Value quickjs.Value }{Value: val}, nil
+}
+
+// quickjsValueIsNull checks if a QuickJS value is null using the VM.
+func quickjsValueIsNull(vm *quickjs.VM, val quickjs.Value) bool {
+	tmpName := fmt.Sprintf("__null_check_%d", time.Now().UnixNano())
+	if err := setGlobal(vm, tmpName, val); err != nil {
+		return false
+	}
+	defer evalDiscard(vm, "delete globalThis."+tmpName)
+	result, err := evalBool(vm, fmt.Sprintf("globalThis.%s === null", tmpName))
+	if err != nil {
+		return false
+	}
+	return result
+}
+
+// quickjsValueIsUndefined checks if a QuickJS value is undefined using the VM.
+func quickjsValueIsUndefined(vm *quickjs.VM, val quickjs.Value) bool {
+	tmpName := fmt.Sprintf("__undef_check_%d", time.Now().UnixNano())
+	if err := setGlobal(vm, tmpName, val); err != nil {
+		return false
+	}
+	defer evalDiscard(vm, "delete globalThis."+tmpName)
+	result, err := evalBool(vm, fmt.Sprintf("typeof globalThis.%s === 'undefined'", tmpName))
+	if err != nil {
+		return false
+	}
+	return result
+}
+
+// quickjsValueToString converts a QuickJS value to a Go string.
+func quickjsValueToString(vm *quickjs.VM, val quickjs.Value) (string, error) {
+	tmpName := fmt.Sprintf("__str_check_%d", time.Now().UnixNano())
+	if err := setGlobal(vm, tmpName, val); err != nil {
+		return "", err
+	}
+	defer evalDiscard(vm, "delete globalThis."+tmpName)
+	return evalString(vm, fmt.Sprintf("String(globalThis.%s)", tmpName))
+}
+
+// awaitValue awaits a promise stored in a global variable.
+// This is a wrapper around the new awaitValue(vm, globalVar, deadline) signature.
+func awaitValueCompat(vm *quickjs.VM, promiseVal quickjs.Value, deadline time.Time) (quickjs.Value, error) {
+	// Store the promise in a temporary global
+	tmpVar := fmt.Sprintf("__test_promise_%d", time.Now().UnixNano())
+	if err := setGlobal(vm, tmpVar, promiseVal); err != nil {
+		return quickjs.Value{}, err
+	}
+	defer evalDiscard(vm, "delete globalThis."+tmpVar)
+
+	// Await it
+	if err := awaitValue(vm, tmpVar, deadline); err != nil {
+		return quickjs.Value{}, err
+	}
+
+	// Read back the result
+	val, err := vm.EvalValue("globalThis."+tmpVar, quickjs.EvalGlobal)
+	if err != nil {
+		return quickjs.Value{}, err
+	}
+	return val, nil
+}
+
+// encodeToBase64 encodes bytes to base64 string.
+func encodeToBase64(data []byte) string {
+	const base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	if len(data) == 0 {
+		return ""
+	}
+
+	var result strings.Builder
+	result.Grow((len(data) + 2) / 3 * 4)
+
+	for i := 0; i < len(data); i += 3 {
+		b0 := data[i]
+		b1 := byte(0)
+		b2 := byte(0)
+		if i+1 < len(data) {
+			b1 = data[i+1]
+		}
+		if i+2 < len(data) {
+			b2 = data[i+2]
+		}
+
+		result.WriteByte(base64Chars[b0>>2])
+		result.WriteByte(base64Chars[((b0&0x03)<<4)|(b1>>4)])
+		if i+1 < len(data) {
+			result.WriteByte(base64Chars[((b1&0x0f)<<2)|(b2>>6)])
+		} else {
+			result.WriteByte('=')
+		}
+		if i+2 < len(data) {
+			result.WriteByte(base64Chars[b2&0x3f])
+		} else {
+			result.WriteByte('=')
+		}
+	}
+
+	return result.String()
+}
 
 // ---------------------------------------------------------------------------
 // Error-returning R2Store variants for testing error paths.
@@ -105,50 +523,55 @@ func (n *noPresignR2Store) PresignedGetURL(key string, expiry time.Duration) (st
 	return "", fmt.Errorf("presign client not configured")
 }
 
-// newV8TestContext creates an isolate+context with encoding support (atob/btoa)
-// needed by R2ObjectBody.arrayBuffer(). Cleaned up automatically via t.Cleanup.
-func newV8TestContext(t *testing.T) (*v8.Isolate, *v8.Context) {
+// newV8TestContext creates a VM with encoding support (atob/btoa)
+// and TextDecoder/TextEncoder needed by R2ObjectBody methods. Cleaned up automatically via t.Cleanup.
+func newV8TestContext(t *testing.T) *quickjs.VM {
 	t.Helper()
-	iso := v8.NewIsolate()
-	ctx := v8.NewContext(iso)
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
 	el := newEventLoop()
-	if err := setupEncoding(iso, ctx, el); err != nil {
-		ctx.Close()
-		iso.Dispose()
+	if err := setupEncoding(vm, el); err != nil {
+		vm.Close()
 		t.Fatalf("setupEncoding: %v", err)
 	}
+	if err := setupWebAPIs(vm, el); err != nil {
+		vm.Close()
+		t.Fatalf("setupWebAPIs: %v", err)
+	}
 	t.Cleanup(func() {
-		ctx.Close()
-		iso.Dispose()
+		vm.Close()
 	})
-	return iso, ctx
+	return vm
 }
 
 func TestStorageBinding_Put_UnsupportedTypeRejected(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, newMockR2Store())
+	bucketVal, err := buildStorageBinding(vm, newMockR2Store())
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
 
-	_ = ctx.Global().Set("__bucket", bucketVal)
-	result, err := ctx.RunScript("__bucket.put('k', {})", "test_put.js")
+	setGlobal(vm, "__bucket", bucketVal)
+	result, err := vm.EvalValue("__bucket.put('k', {})", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript put: %v", err)
+		t.Fatalf("EvalValue put: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "unsupported body type") {
 		t.Fatalf("expected unsupported-value rejection, got %v", err)
 	}
 }
 
 func TestStorageBinding_ArrayBuffer_ReturnsData(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	obj, err := buildR2ObjectBody(iso, ctx, "k", []byte("hello"), &R2Object{
+	obj, err := buildR2ObjectBody(vm, "k", []byte("hello"), &R2Object{
 		Size:         5,
 		ETag:         "etag",
 		ContentType:  "text/plain",
@@ -157,44 +580,46 @@ func TestStorageBinding_ArrayBuffer_ReturnsData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	result, err := ctx.RunScript("__obj.arrayBuffer()", "test_ab.js")
+	result, err := vm.EvalValue("__obj.arrayBuffer()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript arrayBuffer: %v", err)
+		t.Fatalf("EvalValue arrayBuffer: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await arrayBuffer: %v", err)
 	}
 
 	// Verify bodyUsed is set after consuming.
-	afterVal, err := ctx.RunScript("__obj.bodyUsed", "check_used.js")
+	afterVal, err := evalString(vm, "__obj.bodyUsed")
 	if err != nil {
 		t.Fatalf("checking bodyUsed: %v", err)
 	}
-	if afterVal.String() != "true" {
-		t.Fatalf("bodyUsed after arrayBuffer = %q, want true", afterVal.String())
+	if afterVal != "true" {
+		t.Fatalf("bodyUsed after arrayBuffer = %q, want true", afterVal)
 	}
 
 	// Verify the ArrayBuffer has the right byte length.
-	_ = ctx.Global().Set("__result", resolved)
-	blVal, err := ctx.RunScript("__result.byteLength", "check_bl.js")
+	setGlobal(vm, "__result", resolved)
+	blVal, err := evalInt(vm, "__result.byteLength")
 	if err != nil {
 		t.Fatalf("checking byteLength: %v", err)
 	}
-	if blVal.Int32() != 5 {
-		t.Fatalf("byteLength = %d, want 5", blVal.Int32())
+	if blVal != 5 {
+		t.Fatalf("byteLength = %d, want 5", blVal)
 	}
 
 	// Verify body cannot be consumed again.
-	result2, err := ctx.RunScript("__obj.arrayBuffer()", "test_ab2.js")
+	result2, err := vm.EvalValue("__obj.arrayBuffer()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript second arrayBuffer: %v", err)
+		t.Fatalf("EvalValue second arrayBuffer: %v", err)
 	}
-	_, err = awaitValue(ctx, result2, deadline)
+	defer result2.Free()
+	_, err = awaitValueCompat(vm, result2, deadline)
 	if err == nil || !strings.Contains(err.Error(), "already consumed") {
 		t.Fatalf("expected body consumed rejection, got %v", err)
 	}
@@ -208,9 +633,9 @@ func TestStorageBinding_ArrayBuffer_BinaryBlob(t *testing.T) {
 		0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk header
 	}
 
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	obj, err := buildR2ObjectBody(iso, ctx, "image.png", pngHeader, &R2Object{
+	obj, err := buildR2ObjectBody(vm, "image.png", pngHeader, &R2Object{
 		Size:         int64(len(pngHeader)),
 		ETag:         "png-etag",
 		ContentType:  "image/png",
@@ -219,37 +644,38 @@ func TestStorageBinding_ArrayBuffer_BinaryBlob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	result, err := ctx.RunScript("__obj.arrayBuffer()", "test_ab.js")
+	result, err := vm.EvalValue("__obj.arrayBuffer()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript arrayBuffer: %v", err)
+		t.Fatalf("EvalValue arrayBuffer: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await arrayBuffer: %v", err)
 	}
 
 	// Verify byte length matches the original blob.
-	_ = ctx.Global().Set("__testBuf", resolved)
-	blVal, err := ctx.RunScript("__testBuf.byteLength", "check_bl.js")
+	setGlobal(vm, "__testBuf", resolved)
+	blVal, err := evalInt(vm, "__testBuf.byteLength")
 	if err != nil {
 		t.Fatalf("checking byteLength: %v", err)
 	}
-	if blVal.Int32() != int32(len(pngHeader)) {
-		t.Fatalf("byteLength = %d, want %d", blVal.Int32(), len(pngHeader))
+	if blVal != len(pngHeader) {
+		t.Fatalf("byteLength = %d, want %d", blVal, len(pngHeader))
 	}
 
 	// Read back every byte via Uint8Array and compare to the Go source.
 	for i, expected := range pngHeader {
 		jsCode := fmt.Sprintf("new Uint8Array(__testBuf)[%d]", i)
-		v, err := ctx.RunScript(jsCode, "test_byte.js")
+		v, err := evalInt(vm, jsCode)
 		if err != nil {
 			t.Fatalf("eval byte[%d]: %v", i, err)
 		}
-		got := byte(v.Int32())
+		got := byte(v)
 		if got != expected {
 			t.Fatalf("byte[%d] = 0x%02X, want 0x%02X", i, got, expected)
 		}
@@ -257,9 +683,9 @@ func TestStorageBinding_ArrayBuffer_BinaryBlob(t *testing.T) {
 }
 
 func TestStorageBinding_ArrayBuffer_EmptyBlob(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	obj, err := buildR2ObjectBody(iso, ctx, "empty.bin", []byte{}, &R2Object{
+	obj, err := buildR2ObjectBody(vm, "empty.bin", []byte{}, &R2Object{
 		Size:         0,
 		ETag:         "empty-etag",
 		ContentType:  "application/octet-stream",
@@ -268,26 +694,27 @@ func TestStorageBinding_ArrayBuffer_EmptyBlob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	result, err := ctx.RunScript("__obj.arrayBuffer()", "test_ab.js")
+	result, err := vm.EvalValue("__obj.arrayBuffer()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript arrayBuffer: %v", err)
+		t.Fatalf("EvalValue arrayBuffer: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await arrayBuffer: %v", err)
 	}
 
-	_ = ctx.Global().Set("__result", resolved)
-	blVal, err := ctx.RunScript("__result.byteLength", "check_bl.js")
+	setGlobal(vm, "__result", resolved)
+	blVal, err := evalInt(vm, "__result.byteLength")
 	if err != nil {
 		t.Fatalf("checking byteLength: %v", err)
 	}
-	if blVal.Int32() != 0 {
-		t.Fatalf("byteLength = %d, want 0", blVal.Int32())
+	if blVal != 0 {
+		t.Fatalf("byteLength = %d, want 0", blVal)
 	}
 }
 
@@ -298,9 +725,9 @@ func TestStorageBinding_ArrayBuffer_AllByteValues(t *testing.T) {
 		blob[i] = byte(i)
 	}
 
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	obj, err := buildR2ObjectBody(iso, ctx, "allbytes.bin", blob, &R2Object{
+	obj, err := buildR2ObjectBody(vm, "allbytes.bin", blob, &R2Object{
 		Size:         256,
 		ETag:         "all-etag",
 		ContentType:  "application/octet-stream",
@@ -309,37 +736,38 @@ func TestStorageBinding_ArrayBuffer_AllByteValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	result, err := ctx.RunScript("__obj.arrayBuffer()", "test_ab.js")
+	result, err := vm.EvalValue("__obj.arrayBuffer()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript arrayBuffer: %v", err)
+		t.Fatalf("EvalValue arrayBuffer: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await arrayBuffer: %v", err)
 	}
 
-	_ = ctx.Global().Set("__testBuf", resolved)
-	blVal, err := ctx.RunScript("__testBuf.byteLength", "check_bl.js")
+	setGlobal(vm, "__testBuf", resolved)
+	blVal, err := evalInt(vm, "__testBuf.byteLength")
 	if err != nil {
 		t.Fatalf("checking byteLength: %v", err)
 	}
-	if blVal.Int32() != 256 {
-		t.Fatalf("byteLength = %d, want 256", blVal.Int32())
+	if blVal != 256 {
+		t.Fatalf("byteLength = %d, want 256", blVal)
 	}
 
 	// Spot-check key byte values: null, high bytes, and boundaries.
 	checks := []int{0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF}
 	for _, idx := range checks {
 		jsCode := fmt.Sprintf("new Uint8Array(__testBuf)[%d]", idx)
-		v, err := ctx.RunScript(jsCode, "test_byte.js")
+		v, err := evalInt(vm, jsCode)
 		if err != nil {
 			t.Fatalf("eval byte[%d]: %v", idx, err)
 		}
-		got := byte(v.Int32())
+		got := byte(v)
 		if got != byte(idx) {
 			t.Fatalf("byte[%d] = 0x%02X, want 0x%02X", idx, got, byte(idx))
 		}
@@ -347,9 +775,9 @@ func TestStorageBinding_ArrayBuffer_AllByteValues(t *testing.T) {
 }
 
 func TestStorageBinding_ArrayBuffer_ThenTextRejects(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	obj, err := buildR2ObjectBody(iso, ctx, "img.png", []byte{0x89, 0x50, 0x4E, 0x47}, &R2Object{
+	obj, err := buildR2ObjectBody(vm, "img.png", []byte{0x89, 0x50, 0x4E, 0x47}, &R2Object{
 		Size:         4,
 		ETag:         "etag",
 		ContentType:  "image/png",
@@ -358,43 +786,46 @@ func TestStorageBinding_ArrayBuffer_ThenTextRejects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 	deadline := time.Now().Add(5 * time.Second)
 
 	// Consume via arrayBuffer().
-	result, err := ctx.RunScript("__obj.arrayBuffer()", "test_ab.js")
+	result, err := vm.EvalValue("__obj.arrayBuffer()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript arrayBuffer: %v", err)
+		t.Fatalf("EvalValue arrayBuffer: %v", err)
 	}
-	if _, err := awaitValue(ctx, result, deadline); err != nil {
+	defer result.Free()
+	if _, err := awaitValueCompat(vm, result, deadline); err != nil {
 		t.Fatalf("await arrayBuffer: %v", err)
 	}
 
 	// text() must reject after arrayBuffer() consumed the body.
-	r2, err := ctx.RunScript("__obj.text()", "test_text.js")
+	r2, err := vm.EvalValue("__obj.text()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript text: %v", err)
+		t.Fatalf("EvalValue text: %v", err)
 	}
-	_, err = awaitValue(ctx, r2, deadline)
+	defer r2.Free()
+	_, err = awaitValueCompat(vm, r2, deadline)
 	if err == nil || !strings.Contains(err.Error(), "already consumed") {
 		t.Fatalf("expected body consumed rejection from text(), got %v", err)
 	}
 
 	// json() must also reject.
-	r3, err := ctx.RunScript("__obj.json()", "test_json.js")
+	r3, err := vm.EvalValue("__obj.json()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript json: %v", err)
+		t.Fatalf("EvalValue json: %v", err)
 	}
-	_, err = awaitValue(ctx, r3, deadline)
+	defer r3.Free()
+	_, err = awaitValueCompat(vm, r3, deadline)
 	if err == nil || !strings.Contains(err.Error(), "already consumed") {
 		t.Fatalf("expected body consumed rejection from json(), got %v", err)
 	}
 }
 
 func TestStorageBinding_Text_ThenArrayBufferRejects(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	obj, err := buildR2ObjectBody(iso, ctx, "doc.txt", []byte("hello world"), &R2Object{
+	obj, err := buildR2ObjectBody(vm, "doc.txt", []byte("hello world"), &R2Object{
 		Size:         11,
 		ETag:         "etag",
 		ContentType:  "text/plain",
@@ -403,33 +834,35 @@ func TestStorageBinding_Text_ThenArrayBufferRejects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 	deadline := time.Now().Add(5 * time.Second)
 
 	// Consume via text().
-	result, err := ctx.RunScript("__obj.text()", "test_text.js")
+	result, err := vm.EvalValue("__obj.text()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript text: %v", err)
+		t.Fatalf("EvalValue text: %v", err)
 	}
-	if _, err := awaitValue(ctx, result, deadline); err != nil {
+	defer result.Free()
+	if _, err := awaitValueCompat(vm, result, deadline); err != nil {
 		t.Fatalf("await text: %v", err)
 	}
 
 	// arrayBuffer() must reject after text() consumed the body.
-	r2, err := ctx.RunScript("__obj.arrayBuffer()", "test_ab.js")
+	r2, err := vm.EvalValue("__obj.arrayBuffer()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript arrayBuffer: %v", err)
+		t.Fatalf("EvalValue arrayBuffer: %v", err)
 	}
-	_, err = awaitValue(ctx, r2, deadline)
+	defer r2.Free()
+	_, err = awaitValueCompat(vm, r2, deadline)
 	if err == nil || !strings.Contains(err.Error(), "already consumed") {
 		t.Fatalf("expected body consumed rejection from arrayBuffer(), got %v", err)
 	}
 }
 
 func TestStorageBinding_BodyUsed_TransitionsAfterRead(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	obj, err := buildR2ObjectBody(iso, ctx, "k", []byte("hello"), &R2Object{
+	obj, err := buildR2ObjectBody(vm, "k", []byte("hello"), &R2Object{
 		Size:         5,
 		ETag:         "etag",
 		ContentType:  "text/plain",
@@ -438,55 +871,61 @@ func TestStorageBinding_BodyUsed_TransitionsAfterRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 	deadline := time.Now().Add(5 * time.Second)
 
 	// Initial bodyUsed should be false.
-	initial, err := ctx.RunScript("__obj.bodyUsed", "check_init.js")
+	initial, err := evalString(vm, "__obj.bodyUsed")
 	if err != nil {
 		t.Fatalf("checking initial bodyUsed: %v", err)
 	}
-	if initial.String() != "false" {
-		t.Fatalf("initial bodyUsed = %q, want false", initial.String())
+	if initial != "false" {
+		t.Fatalf("initial bodyUsed = %q, want false", initial)
 	}
 
 	// Call text().
-	result, err := ctx.RunScript("__obj.text()", "test_text.js")
+	result, err := vm.EvalValue("__obj.text()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript text: %v", err)
+		t.Fatalf("EvalValue text: %v", err)
 	}
-	resolved, err := awaitValue(ctx, result, deadline)
+	defer result.Free()
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await text: %v", err)
 	}
-	if resolved.String() != "hello" {
-		t.Fatalf("text result = %q, want hello", resolved.String())
+	resolvedStr, err := quickjsValueToString(vm, resolved)
+	if err != nil {
+		t.Fatalf("converting resolved value: %v", err)
+	}
+	if resolvedStr != "hello" {
+		t.Fatalf("text result = %q, want hello", resolvedStr)
 	}
 
 	// bodyUsed should be true after consuming.
-	after, err := ctx.RunScript("__obj.bodyUsed", "check_after.js")
+	after, err := evalString(vm, "__obj.bodyUsed")
 	if err != nil {
 		t.Fatalf("checking bodyUsed after text: %v", err)
 	}
-	if after.String() != "true" {
-		t.Fatalf("bodyUsed after text = %q, want true", after.String())
+	if after != "true" {
+		t.Fatalf("bodyUsed after text = %q, want true", after)
 	}
 
 	// Second text() call must reject.
-	result2, err := ctx.RunScript("__obj.text()", "test_text2.js")
+	result2, err := vm.EvalValue("__obj.text()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript second text: %v", err)
+		t.Fatalf("EvalValue second text: %v", err)
 	}
-	_, err = awaitValue(ctx, result2, deadline)
+	defer result2.Free()
+	_, err = awaitValueCompat(vm, result2, deadline)
 	if err == nil || !strings.Contains(err.Error(), "already consumed") {
 		t.Fatalf("expected body consumed rejection, got %v", err)
 	}
 }
 
 func TestStorageBinding_JSON_InvalidJSONRejects(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	obj, err := buildR2ObjectBody(iso, ctx, "k", []byte("{not-json"), &R2Object{
+	obj, err := buildR2ObjectBody(vm, "k", []byte("{not-json"), &R2Object{
 		Size:         9,
 		ETag:         "etag",
 		ContentType:  "application/json",
@@ -495,15 +934,16 @@ func TestStorageBinding_JSON_InvalidJSONRejects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	result, err := ctx.RunScript("__obj.json()", "test_json.js")
+	result, err := vm.EvalValue("__obj.json()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript json: %v", err)
+		t.Fatalf("EvalValue json: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
 		t.Fatalf("expected invalid JSON rejection, got %v", err)
 	}
@@ -583,9 +1023,9 @@ func TestEscapePathSegments(t *testing.T) {
 }
 
 func TestStorageBinding_JSON_ValidJSON(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	obj, err := buildR2ObjectBody(iso, ctx, "k", []byte(`{"name":"test","count":42}`), &R2Object{
+	obj, err := buildR2ObjectBody(vm, "k", []byte(`{"name":"test","count":42}`), &R2Object{
 		Size:         25,
 		ETag:         "etag",
 		ContentType:  "application/json",
@@ -594,252 +1034,299 @@ func TestStorageBinding_JSON_ValidJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	result, err := ctx.RunScript("__obj.json()", "test_json.js")
+	result, err := vm.EvalValue("__obj.json()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript json: %v", err)
+		t.Fatalf("EvalValue json: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await json: %v", err)
 	}
 
-	_ = ctx.Global().Set("__result", resolved)
-	nameVal, err := ctx.RunScript("__result.name", "check_name.js")
+	setGlobal(vm, "__result", resolved)
+	nameVal, err := evalString(vm, "__result.name")
 	if err != nil {
 		t.Fatalf("checking name: %v", err)
 	}
-	if nameVal.String() != "test" {
-		t.Errorf("json name = %q, want test", nameVal.String())
+	if nameVal != "test" {
+		t.Errorf("json name = %q, want test", nameVal)
 	}
 
-	countVal, err := ctx.RunScript("__result.count", "check_count.js")
+	countVal, err := evalInt(vm, "__result.count")
 	if err != nil {
 		t.Fatalf("checking count: %v", err)
 	}
-	if countVal.Int32() != 42 {
-		t.Errorf("json count = %d, want 42", countVal.Int32())
+	if countVal != 42 {
+		t.Errorf("json count = %d, want 42", countVal)
 	}
 }
 
 func TestBuildR2Object(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+	defer vm.Close()
 
 	customMeta := map[string]string{"author": "test", "version": "1"}
-	obj, err := buildR2Object(iso, ctx, "test-key", 100, "etag123", "text/plain", customMeta)
+	obj, err := buildR2Object(vm, "test-key", 100, "etag123", "text/plain", customMeta)
 	if err != nil {
 		t.Fatalf("buildR2Object: %v", err)
 	}
 
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	keyVal, _ := ctx.RunScript("__obj.key", "k.js")
-	if keyVal.String() != "test-key" {
-		t.Errorf("key = %q, want test-key", keyVal.String())
+	keyVal, err := evalString(vm, "__obj.key")
+	if err != nil {
+		t.Fatalf("checking key: %v", err)
+	}
+	if keyVal != "test-key" {
+		t.Errorf("key = %q, want test-key", keyVal)
 	}
 
-	etagVal, _ := ctx.RunScript("__obj.etag", "e.js")
-	if etagVal.String() != "etag123" {
-		t.Errorf("etag = %q, want etag123", etagVal.String())
+	etagVal, err := evalString(vm, "__obj.etag")
+	if err != nil {
+		t.Fatalf("checking etag: %v", err)
+	}
+	if etagVal != "etag123" {
+		t.Errorf("etag = %q, want etag123", etagVal)
 	}
 
-	httpEtagVal, _ := ctx.RunScript("__obj.httpEtag", "he.js")
-	if httpEtagVal.String() != `"etag123"` {
-		t.Errorf("httpEtag = %q, want quoted etag", httpEtagVal.String())
+	httpEtagVal, err := evalString(vm, "__obj.httpEtag")
+	if err != nil {
+		t.Fatalf("checking httpEtag: %v", err)
+	}
+	if httpEtagVal != `"etag123"` {
+		t.Errorf("httpEtag = %q, want quoted etag", httpEtagVal)
 	}
 
-	scVal, _ := ctx.RunScript("__obj.storageClass", "sc.js")
-	if scVal.String() != "STANDARD" {
-		t.Errorf("storageClass = %q, want STANDARD", scVal.String())
+	scVal, err := evalString(vm, "__obj.storageClass")
+	if err != nil {
+		t.Fatalf("checking storageClass: %v", err)
+	}
+	if scVal != "STANDARD" {
+		t.Errorf("storageClass = %q, want STANDARD", scVal)
 	}
 
-	ctVal, _ := ctx.RunScript("__obj.httpMetadata.contentType", "ct.js")
-	if ctVal.String() != "text/plain" {
-		t.Errorf("contentType = %q, want text/plain", ctVal.String())
+	ctVal, err := evalString(vm, "__obj.httpMetadata.contentType")
+	if err != nil {
+		t.Fatalf("checking contentType: %v", err)
+	}
+	if ctVal != "text/plain" {
+		t.Errorf("contentType = %q, want text/plain", ctVal)
 	}
 
-	authorVal, _ := ctx.RunScript("__obj.customMetadata.author", "auth.js")
-	if authorVal.String() != "test" {
-		t.Errorf("customMetadata.author = %q, want test", authorVal.String())
+	authorVal, err := evalString(vm, "__obj.customMetadata.author")
+	if err != nil {
+		t.Fatalf("checking author: %v", err)
+	}
+	if authorVal != "test" {
+		t.Errorf("customMetadata.author = %q, want test", authorVal)
 	}
 }
 
 func TestBuildR2Object_EmptyMetadata(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+	defer vm.Close()
 
-	obj, err := buildR2Object(iso, ctx, "empty-meta", 0, "etag-0", "", nil)
+	obj, err := buildR2Object(vm, "empty-meta", 0, "etag-0", "", nil)
 	if err != nil {
 		t.Fatalf("buildR2Object: %v", err)
 	}
 
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	keyVal, _ := ctx.RunScript("__obj.key", "k.js")
-	if keyVal.String() != "empty-meta" {
-		t.Errorf("key = %q, want empty-meta", keyVal.String())
+	keyVal, err := evalString(vm, "__obj.key")
+	if err != nil {
+		t.Fatalf("checking key: %v", err)
+	}
+	if keyVal != "empty-meta" {
+		t.Errorf("key = %q, want empty-meta", keyVal)
 	}
 
-	sizeVal, _ := ctx.RunScript("__obj.size", "s.js")
-	if sizeVal.Int32() != 0 {
-		t.Errorf("size = %d, want 0", sizeVal.Int32())
+	sizeVal, err := evalInt(vm, "__obj.size")
+	if err != nil {
+		t.Fatalf("checking size: %v", err)
+	}
+	if sizeVal != 0 {
+		t.Errorf("size = %d, want 0", sizeVal)
 	}
 
 	// httpMetadata should exist but contentType should be undefined
-	ctVal, _ := ctx.RunScript("__obj.httpMetadata.contentType", "ct.js")
-	if ctVal.String() != "undefined" {
-		t.Errorf("contentType = %q, want undefined (no contentType set)", ctVal.String())
+	ctVal, err := evalString(vm, "__obj.httpMetadata.contentType")
+	if err != nil {
+		t.Fatalf("checking contentType: %v", err)
+	}
+	if ctVal != "undefined" {
+		t.Errorf("contentType = %q, want undefined (no contentType set)", ctVal)
 	}
 
 	// customMetadata should be an empty object
-	cmType, _ := ctx.RunScript("typeof __obj.customMetadata", "cm.js")
-	if cmType.String() != "object" {
-		t.Errorf("customMetadata type = %q, want object", cmType.String())
+	cmType, err := evalString(vm, "typeof __obj.customMetadata")
+	if err != nil {
+		t.Fatalf("checking customMetadata type: %v", err)
+	}
+	if cmType != "object" {
+		t.Errorf("customMetadata type = %q, want object", cmType)
 	}
 
 	// checksums should exist
-	ckType, _ := ctx.RunScript("typeof __obj.checksums", "ck.js")
-	if ckType.String() != "object" {
-		t.Errorf("checksums type = %q, want object", ckType.String())
+	ckType, err := evalString(vm, "typeof __obj.checksums")
+	if err != nil {
+		t.Fatalf("checking checksums type: %v", err)
+	}
+	if ckType != "object" {
+		t.Errorf("checksums type = %q, want object", ckType)
 	}
 }
 
 func TestBuildR2Object_SizeAndVersion(t *testing.T) {
-	iso := v8.NewIsolate()
-	defer iso.Dispose()
-	ctx := v8.NewContext(iso)
-	defer ctx.Close()
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+	defer vm.Close()
 
-	obj, err := buildR2Object(iso, ctx, "large-file", 1048576, "abc123", "application/octet-stream", nil)
+	obj, err := buildR2Object(vm, "large-file", 1048576, "abc123", "application/octet-stream", nil)
 	if err != nil {
 		t.Fatalf("buildR2Object: %v", err)
 	}
 
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	sizeVal, _ := ctx.RunScript("__obj.size", "s.js")
-	if sizeVal.Integer() != 1048576 {
-		t.Errorf("size = %d, want 1048576", sizeVal.Integer())
+	sizeVal, err := evalInt(vm, "__obj.size")
+	if err != nil {
+		t.Fatalf("checking size: %v", err)
+	}
+	if sizeVal != 1048576 {
+		t.Errorf("size = %d, want 1048576", sizeVal)
 	}
 
-	versionVal, _ := ctx.RunScript("__obj.version", "v.js")
-	if versionVal.String() != "abc123" {
-		t.Errorf("version = %q, want abc123", versionVal.String())
+	versionVal, err := evalString(vm, "__obj.version")
+	if err != nil {
+		t.Fatalf("checking version: %v", err)
+	}
+	if versionVal != "abc123" {
+		t.Errorf("version = %q, want abc123", versionVal)
 	}
 }
 
 func TestStorageBinding_PutRequiresKey(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, newMockR2Store())
+	bucketVal, err := buildStorageBinding(vm, newMockR2Store())
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
 
-	_ = ctx.Global().Set("__bucket", bucketVal)
-	result, err := ctx.RunScript("__bucket.put()", "test_put_noargs.js")
+	setGlobal(vm, "__bucket", bucketVal)
+	result, err := vm.EvalValue("__bucket.put()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript put: %v", err)
+		t.Fatalf("EvalValue put: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "requires key and value") {
 		t.Fatalf("expected key/value rejection, got %v", err)
 	}
 }
 
 func TestStorageBinding_GetRequiresKey(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, newMockR2Store())
+	bucketVal, err := buildStorageBinding(vm, newMockR2Store())
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
 
-	_ = ctx.Global().Set("__bucket", bucketVal)
-	result, err := ctx.RunScript("__bucket.get()", "test_get_noargs.js")
+	setGlobal(vm, "__bucket", bucketVal)
+	result, err := vm.EvalValue("__bucket.get()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript get: %v", err)
+		t.Fatalf("EvalValue get: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "requires a key") {
 		t.Fatalf("expected key rejection, got %v", err)
 	}
 }
 
 func TestStorageBinding_DeleteRequiresKey(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, newMockR2Store())
+	bucketVal, err := buildStorageBinding(vm, newMockR2Store())
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
 
-	_ = ctx.Global().Set("__bucket", bucketVal)
-	result, err := ctx.RunScript("__bucket.delete()", "test_del_noargs.js")
+	setGlobal(vm, "__bucket", bucketVal)
+	result, err := vm.EvalValue("__bucket.delete()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript delete: %v", err)
+		t.Fatalf("EvalValue delete: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "requires a key") {
 		t.Fatalf("expected key rejection, got %v", err)
 	}
 }
 
 func TestStorageBinding_HeadRequiresKey(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, newMockR2Store())
+	bucketVal, err := buildStorageBinding(vm, newMockR2Store())
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
 
-	_ = ctx.Global().Set("__bucket", bucketVal)
-	result, err := ctx.RunScript("__bucket.head()", "test_head_noargs.js")
+	setGlobal(vm, "__bucket", bucketVal)
+	result, err := vm.EvalValue("__bucket.head()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript head: %v", err)
+		t.Fatalf("EvalValue head: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "requires a key") {
 		t.Fatalf("expected key rejection, got %v", err)
 	}
 }
 
 func TestStorageBinding_BindingHasMethods(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, newMockR2Store())
+	bucketVal, err := buildStorageBinding(vm, newMockR2Store())
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
 
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// Verify all expected methods exist
 	methods := []string{"get", "put", "delete", "head", "list", "publicUrl"}
 	for _, m := range methods {
 		jsCode := fmt.Sprintf("typeof __bucket.%s", m)
-		val, err := ctx.RunScript(jsCode, "check_"+m+".js")
+		val, err := evalString(vm, jsCode)
 		if err != nil {
 			t.Fatalf("checking %s: %v", m, err)
 		}
-		if val.String() != "function" {
-			t.Errorf("%s type = %q, want 'function'", m, val.String())
+		if val != "function" {
+			t.Errorf("%s type = %q, want 'function'", m, val)
 		}
 	}
 }
@@ -889,10 +1376,10 @@ func TestBuildPublicObjectURL_SpecialChars(t *testing.T) {
 }
 
 func TestBuildR2ObjectBody_TextReturnsCorrectData(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
 	content := "Hello, World! Special chars: <>&\""
-	obj, err := buildR2ObjectBody(iso, ctx, "greeting.txt", []byte(content), &R2Object{
+	obj, err := buildR2ObjectBody(vm, "greeting.txt", []byte(content), &R2Object{
 		Size:         int64(len(content)),
 		ETag:         "text-etag",
 		ContentType:  "text/plain",
@@ -901,20 +1388,25 @@ func TestBuildR2ObjectBody_TextReturnsCorrectData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildR2ObjectBody: %v", err)
 	}
-	_ = ctx.Global().Set("__obj", obj.Value)
+	setGlobal(vm, "__obj", obj.Value)
 
-	result, err := ctx.RunScript("__obj.text()", "test_text.js")
+	result, err := vm.EvalValue("__obj.text()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript text: %v", err)
+		t.Fatalf("EvalValue text: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await text: %v", err)
 	}
-	if resolved.String() != content {
-		t.Errorf("text() = %q, want %q", resolved.String(), content)
+	resolvedStr, err := quickjsValueToString(vm, resolved)
+	if err != nil {
+		t.Fatalf("converting resolved value: %v", err)
+	}
+	if resolvedStr != content {
+		t.Errorf("text() = %q, want %q", resolvedStr, content)
 	}
 }
 
@@ -923,47 +1415,50 @@ func TestBuildR2ObjectBody_TextReturnsCorrectData(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestStorageBinding_GetWithKeyReturnsNullOnError(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
-	result, err := ctx.RunScript("__bucket.get('nonexistent-key')", "test_get.js")
+	result, err := vm.EvalValue("__bucket.get('nonexistent-key')", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript get: %v", err)
+		t.Fatalf("EvalValue get: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await get: %v", err)
 	}
-	if !resolved.IsNull() {
-		t.Errorf("get with error store should resolve null, got %v", resolved.String())
+	if !quickjsValueIsNull(vm, resolved) {
+		resolvedStr, _ := quickjsValueToString(vm, resolved)
+		t.Errorf("get with error store should resolve null, got %v", resolvedStr)
 	}
 }
 
 func TestStorageBinding_PutWithStringBody(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// put with string value exercises the JS coercion "string" path
 	// then fails at Put with connection error
-	result, err := ctx.RunScript("__bucket.put('my-key', 'hello world')", "test_put_string.js")
+	result, err := vm.EvalValue("__bucket.put('my-key', 'hello world')", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript put: %v", err)
+		t.Fatalf("EvalValue put: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil {
 		t.Fatal("expected put to reject with connection error")
 	}
@@ -973,27 +1468,28 @@ func TestStorageBinding_PutWithStringBody(t *testing.T) {
 }
 
 func TestStorageBinding_PutWithArrayBufferBody(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// put with ArrayBuffer exercises the JS coercion "binary" path + base64 decode
-	result, err := ctx.RunScript(`(function() {
+	result, err := vm.EvalValue(`(function() {
 		var buf = new ArrayBuffer(4);
 		var view = new Uint8Array(buf);
 		view[0] = 1; view[1] = 2; view[2] = 3; view[3] = 4;
 		return __bucket.put('binary-key', buf);
-	})()`, "test_put_ab.js")
+	})()`, quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript put AB: %v", err)
+		t.Fatalf("EvalValue put AB: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil {
 		t.Fatal("expected put to reject with connection error")
 	}
@@ -1003,38 +1499,39 @@ func TestStorageBinding_PutWithArrayBufferBody(t *testing.T) {
 }
 
 func TestStorageBinding_PutWithTypedArrayBody(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// put with Uint8Array (TypedArray view) exercises the ArrayBuffer.isView path
-	result, err := ctx.RunScript("__bucket.put('typed-key', new Uint8Array([10, 20, 30]))", "test_put_typed.js")
+	result, err := vm.EvalValue("__bucket.put('typed-key', new Uint8Array([10, 20, 30]))", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript put typed: %v", err)
+		t.Fatalf("EvalValue put typed: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil {
 		t.Fatal("expected put to reject with connection error")
 	}
 }
 
 func TestStorageBinding_PutWithOptions(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// put with options exercises the httpMetadata and customMetadata extraction paths
-	result, err := ctx.RunScript(`__bucket.put('opts-key', 'data', {
+	result, err := vm.EvalValue(`__bucket.put('opts-key', 'data', {
 		httpMetadata: {
 			contentType: 'text/plain',
 			contentEncoding: 'gzip',
@@ -1046,274 +1543,286 @@ func TestStorageBinding_PutWithOptions(t *testing.T) {
 			author: 'test',
 			version: '1.0',
 		},
-	})`, "test_put_opts.js")
+	})`, quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript put opts: %v", err)
+		t.Fatalf("EvalValue put opts: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil {
 		t.Fatal("expected put to reject with connection error")
 	}
 }
 
 func TestStorageBinding_DeleteSingleKey(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// delete with single key - errors are silently ignored, resolves undefined
-	result, err := ctx.RunScript("__bucket.delete('some-key')", "test_del.js")
+	result, err := vm.EvalValue("__bucket.delete('some-key')", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript delete: %v", err)
+		t.Fatalf("EvalValue delete: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await delete: %v", err)
 	}
-	if !resolved.IsUndefined() {
-		t.Errorf("delete should resolve undefined, got %v", resolved.String())
+	if !quickjsValueIsUndefined(vm, resolved) {
+		resolvedStr, _ := quickjsValueToString(vm, resolved)
+		t.Errorf("delete should resolve undefined, got %v", resolvedStr)
 	}
 }
 
 func TestStorageBinding_DeleteArrayOfKeys(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// delete with array of keys
-	result, err := ctx.RunScript("__bucket.delete(['k1', 'k2', 'k3'])", "test_del_arr.js")
+	result, err := vm.EvalValue("__bucket.delete(['k1', 'k2', 'k3'])", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript delete array: %v", err)
+		t.Fatalf("EvalValue delete array: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await delete array: %v", err)
 	}
-	if !resolved.IsUndefined() {
-		t.Errorf("delete array should resolve undefined, got %v", resolved.String())
+	if !quickjsValueIsUndefined(vm, resolved) {
+		resolvedStr, _ := quickjsValueToString(vm, resolved)
+		t.Errorf("delete array should resolve undefined, got %v", resolvedStr)
 	}
 }
 
 func TestStorageBinding_HeadReturnsNullOnError(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
-	result, err := ctx.RunScript("__bucket.head('missing-key')", "test_head.js")
+	result, err := vm.EvalValue("__bucket.head('missing-key')", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript head: %v", err)
+		t.Fatalf("EvalValue head: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await head: %v", err)
 	}
-	if !resolved.IsNull() {
-		t.Errorf("head with error store should resolve null, got %v", resolved.String())
+	if !quickjsValueIsNull(vm, resolved) {
+		resolvedStr, _ := quickjsValueToString(vm, resolved)
+		t.Errorf("head with error store should resolve null, got %v", resolvedStr)
 	}
 }
 
 func TestStorageBinding_ListReturnsEmptyOnError(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
-	result, err := ctx.RunScript("__bucket.list()", "test_list.js")
+	result, err := vm.EvalValue("__bucket.list()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript list: %v", err)
+		t.Fatalf("EvalValue list: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	resolved, err := awaitValue(ctx, result, deadline)
+	resolved, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await list: %v", err)
 	}
-	_ = ctx.Global().Set("__listResult", resolved)
+	setGlobal(vm, "__listResult", resolved)
 
 	// Verify we get back an object with objects array and truncated flag
-	truncVal, err := ctx.RunScript("__listResult.truncated", "check_trunc.js")
+	truncVal, err := evalString(vm, "__listResult.truncated")
 	if err != nil {
 		t.Fatalf("checking truncated: %v", err)
 	}
-	if truncVal.String() != "false" {
-		t.Errorf("truncated = %q, want false", truncVal.String())
+	if truncVal != "false" {
+		t.Errorf("truncated = %q, want false", truncVal)
 	}
 }
 
 func TestStorageBinding_ListWithOptions(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// list with full options exercises the options extraction path
-	result, err := ctx.RunScript(`__bucket.list({
+	result, err := vm.EvalValue(`__bucket.list({
 		prefix: 'uploads/',
 		cursor: 'last-key',
 		delimiter: '/',
 		limit: 5,
-	})`, "test_list_opts.js")
+	})`, quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript list opts: %v", err)
+		t.Fatalf("EvalValue list opts: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("await list opts: %v", err)
 	}
 }
 
 func TestStorageBinding_PublicUrl(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, newMockR2Store())
+	bucketVal, err := buildStorageBinding(vm, newMockR2Store())
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
-	result, err := ctx.RunScript("__bucket.publicUrl('images/photo.jpg')", "test_publicurl.js")
+	result, err := evalString(vm, "__bucket.publicUrl('images/photo.jpg')")
 	if err != nil {
-		t.Fatalf("RunScript publicUrl: %v", err)
+		t.Fatalf("EvalValue publicUrl: %v", err)
 	}
 
 	// mockR2Store.PublicURL returns "https://public.test/bucket/<key>"
-	if !strings.Contains(result.String(), "images/photo.jpg") {
-		t.Errorf("publicUrl should contain the key, got %q", result.String())
+	if !strings.Contains(result, "images/photo.jpg") {
+		t.Errorf("publicUrl should contain the key, got %q", result)
 	}
 }
 
 func TestStorageBinding_PublicUrl_RequiresArg(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, newMockR2Store())
+	bucketVal, err := buildStorageBinding(vm, newMockR2Store())
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// publicUrl() with no args should throw
-	_, err = ctx.RunScript(`try { __bucket.publicUrl(); 'ok'; } catch(e) { e.message; }`, "test_publicurl_noarg.js")
+	_, err = evalString(vm, `try { __bucket.publicUrl(); 'ok'; } catch(e) { e.message; }`)
 	if err != nil {
-		t.Fatalf("RunScript publicUrl noarg: %v", err)
+		t.Fatalf("EvalValue publicUrl noarg: %v", err)
 	}
 }
 
 func TestStorageBinding_PublicUrl_NotAvailableWithoutConfig(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
 	// Use errR2Store with no publicURL -> PublicURL returns error
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// publicUrl is always present on the binding (R2Store interface always has it),
 	// but calling it without configuration should throw an error.
-	result, err := ctx.RunScript(`(function() {
+	result, err := evalString(vm, `(function() {
 		try { __bucket.publicUrl('key'); return 'no error'; }
 		catch(e) { return e.message || String(e); }
-	})()`, "check_publicurl.js")
+	})()`)
 	if err != nil {
-		t.Fatalf("RunScript publicUrl: %v", err)
+		t.Fatalf("EvalValue publicUrl: %v", err)
 	}
-	if !strings.Contains(result.String(), "public") {
-		t.Errorf("publicUrl should error without config, got %q", result.String())
+	if !strings.Contains(result, "public") {
+		t.Errorf("publicUrl should error without config, got %q", result)
 	}
 }
 
 func TestStorageBinding_CreateSignedUrl_NilClients(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
 	// createSignedUrl is always present on the binding (R2Store interface always
 	// has PresignedGetURL), but calling it without a configured client should reject.
-	bucketVal, err := buildStorageBinding(iso, ctx, &nilConfigR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &nilConfigR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
-	result, err := ctx.RunScript("__bucket.createSignedUrl('key')", "test_sign.js")
+	result, err := vm.EvalValue("__bucket.createSignedUrl('key')", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript: %v", err)
+		t.Fatalf("EvalValue: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "storage client not configured") {
 		t.Fatalf("expected 'storage client not configured' error, got %v", err)
 	}
 }
 
 func TestStorageBinding_CreateSignedUrl_NoPresignButPublicURL(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
 	// Has a working store but PresignedGetURL returns "presign client not configured"
-	bucketVal, err := buildStorageBinding(iso, ctx, &noPresignR2Store{
+	bucketVal, err := buildStorageBinding(vm, &noPresignR2Store{
 		errR2Store: errR2Store{publicURL: "https://storage.example.com"},
 	})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
-	result, err := ctx.RunScript("__bucket.createSignedUrl('key')", "test_sign2.js")
+	result, err := vm.EvalValue("__bucket.createSignedUrl('key')", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript createSignedUrl: %v", err)
+		t.Fatalf("EvalValue createSignedUrl: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "presign client not configured") {
 		t.Fatalf("expected 'presign client not configured', got %v", err)
 	}
 }
 
 func TestStorageBinding_CreateSignedUrl_WithExpiryOptions(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// Test with custom expiry - will fail at PresignedGetURL but exercises options parsing
-	result, err := ctx.RunScript("__bucket.createSignedUrl('key', { expiresIn: 7200 })", "test_sign3.js")
+	result, err := vm.EvalValue("__bucket.createSignedUrl('key', { expiresIn: 7200 })", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript createSignedUrl opts: %v", err)
+		t.Fatalf("EvalValue createSignedUrl opts: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	// Should fail with connection error
 	if err == nil {
 		t.Fatal("expected createSignedUrl to reject with connection error")
@@ -1321,94 +1830,99 @@ func TestStorageBinding_CreateSignedUrl_WithExpiryOptions(t *testing.T) {
 }
 
 func TestStorageBinding_CreateSignedUrl_ExpiryClamp(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// Test expiry clamping: negative -> 1, excessive -> 604800
-	result, err := ctx.RunScript("__bucket.createSignedUrl('key', { expiresIn: -10 })", "test_sign_neg.js")
+	result, err := vm.EvalValue("__bucket.createSignedUrl('key', { expiresIn: -10 })", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript: %v", err)
+		t.Fatalf("EvalValue: %v", err)
 	}
+	defer result.Free()
 	deadline := time.Now().Add(5 * time.Second)
-	_, _ = awaitValue(ctx, result, deadline) // will error but that's fine
+	_, _ = awaitValueCompat(vm, result, deadline) // will error but that's fine
 
-	result2, err := ctx.RunScript("__bucket.createSignedUrl('key', { expiresIn: 9999999 })", "test_sign_max.js")
+	result2, err := vm.EvalValue("__bucket.createSignedUrl('key', { expiresIn: 9999999 })", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript: %v", err)
+		t.Fatalf("EvalValue: %v", err)
 	}
-	_, _ = awaitValue(ctx, result2, deadline) // will error but exercises the clamp path
+	defer result2.Free()
+	_, _ = awaitValueCompat(vm, result2, deadline) // will error but exercises the clamp path
 }
 
 func TestStorageBinding_CreateSignedUrl_RequiresArg(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &errR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &errR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
-	result, err := ctx.RunScript("__bucket.createSignedUrl()", "test_sign_noarg.js")
+	result, err := vm.EvalValue("__bucket.createSignedUrl()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript: %v", err)
+		t.Fatalf("EvalValue: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err == nil || !strings.Contains(err.Error(), "requires a key") {
 		t.Fatalf("expected 'requires a key' error, got %v", err)
 	}
 }
 
 func TestStorageBinding_ListErrorPath(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &failListR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &failListR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// list() should resolve with an empty result when the store returns an error.
-	result, err := ctx.RunScript("__bucket.list()", "test_list_err.js")
+	result, err := vm.EvalValue("__bucket.list()", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript: %v", err)
+		t.Fatalf("EvalValue: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	val, err := awaitValue(ctx, result, deadline)
+	val, err := awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("expected list to resolve, got error: %v", err)
 	}
 
 	// The result should be a valid object (empty list fallback).
-	if val.IsNullOrUndefined() {
+	if quickjsValueIsNull(vm, val) || quickjsValueIsUndefined(vm, val) {
 		t.Fatal("expected non-null list result")
 	}
 }
 
 func TestStorageBinding_DeleteErrorPath(t *testing.T) {
-	iso, ctx := newV8TestContext(t)
+	vm := newV8TestContext(t)
 
-	bucketVal, err := buildStorageBinding(iso, ctx, &failListR2Store{})
+	bucketVal, err := buildStorageBinding(vm, &failListR2Store{})
 	if err != nil {
 		t.Fatalf("buildStorageBinding: %v", err)
 	}
-	_ = ctx.Global().Set("__bucket", bucketVal)
+	setGlobal(vm, "__bucket", bucketVal)
 
 	// delete() should resolve even when the store returns an error.
-	result, err := ctx.RunScript("__bucket.delete('some-key')", "test_delete_err.js")
+	result, err := vm.EvalValue("__bucket.delete('some-key')", quickjs.EvalGlobal)
 	if err != nil {
-		t.Fatalf("RunScript: %v", err)
+		t.Fatalf("EvalValue: %v", err)
 	}
+	defer result.Free()
 
 	deadline := time.Now().Add(5 * time.Second)
-	_, err = awaitValue(ctx, result, deadline)
+	_, err = awaitValueCompat(vm, result, deadline)
 	if err != nil {
 		t.Fatalf("expected delete to resolve, got error: %v", err)
 	}

@@ -1,30 +1,46 @@
 package worker
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // timerEntry represents a pending setTimeout or setInterval callback.
+// Unlike the v8go version, the callback is NOT stored in Go — it lives
+// in globalThis.__timerCallbacks[id] on the JS side. Go only tracks
+// scheduling metadata.
 type timerEntry struct {
-	callback *v8.Function
 	deadline time.Time
 	interval time.Duration // 0 for setTimeout, >0 for setInterval
 	id       int
 	cleared  bool
 }
 
+// fetchResult holds the pre-serialized outcome of an in-flight HTTP fetch.
+// The fetch goroutine reads the response body, serializes headers, and encodes
+// the body as base64 before sending — so the event loop only passes strings to JS.
+type fetchResult struct {
+	status      int
+	statusText  string
+	headersJSON string
+	bodyB64     string
+	redirected  bool
+	finalURL    string
+	err         error
+}
+
 // pendingFetch represents an in-flight HTTP request whose result will be
-// delivered to V8 via the event loop when the response arrives.
+// delivered to JS via the event loop when the response arrives.
 type pendingFetch struct {
 	resultCh <-chan fetchResult
-	callback func(fetchResult) // closure that resolves/rejects on V8 thread
+	fetchID  string
 }
 
 // eventLoop manages Go-backed timers for setTimeout/setInterval and
-// pending fetch requests that need to be resolved on the V8 thread.
+// pending fetch requests that need to be resolved on the JS thread.
 // Provides real wall-clock delays backed by Go timers.
 type eventLoop struct {
 	mu             sync.Mutex
@@ -39,32 +55,24 @@ func newEventLoop() *eventLoop {
 	}
 }
 
-// setTimeout registers a one-shot timer and returns its ID.
-func (el *eventLoop) setTimeout(callback *v8.Function, delay time.Duration) int {
+// registerTimer creates a timer entry and returns its ID.
+// The actual JS callback is stored in globalThis.__timerCallbacks[id].
+func (el *eventLoop) registerTimer(delay time.Duration, isInterval bool) int {
 	el.mu.Lock()
 	defer el.mu.Unlock()
 	el.nextID++
 	id := el.nextID
-	el.timers[id] = &timerEntry{
-		callback: callback,
+	entry := &timerEntry{
 		deadline: time.Now().Add(delay),
 		id:       id,
 	}
-	return id
-}
-
-// setInterval registers a repeating timer and returns its ID.
-func (el *eventLoop) setInterval(callback *v8.Function, interval time.Duration) int {
-	el.mu.Lock()
-	defer el.mu.Unlock()
-	el.nextID++
-	id := el.nextID
-	el.timers[id] = &timerEntry{
-		callback: callback,
-		deadline: time.Now().Add(interval),
-		interval: interval,
-		id:       id,
+	if isInterval {
+		if delay < 10*time.Millisecond {
+			delay = 10 * time.Millisecond // minimum interval
+		}
+		entry.interval = delay
 	}
+	el.timers[id] = entry
 	return id
 }
 
@@ -79,7 +87,7 @@ func (el *eventLoop) clearTimer(id int) {
 }
 
 // addPendingFetch registers a pending fetch whose result will be delivered
-// to V8 when the HTTP response arrives.
+// to JS when the HTTP response arrives.
 func (el *eventLoop) addPendingFetch(pf *pendingFetch) {
 	el.mu.Lock()
 	defer el.mu.Unlock()
@@ -87,9 +95,9 @@ func (el *eventLoop) addPendingFetch(pf *pendingFetch) {
 }
 
 // drainPendingFetches does non-blocking reads on all pending fetch channels.
-// For each completed fetch, it calls the callback on the V8 thread and removes
+// For each completed fetch, it resolves/rejects via JS globals and removes
 // it from the list. Returns true if any fetch was completed.
-func (el *eventLoop) drainPendingFetches(ctx *v8.Context) bool {
+func (el *eventLoop) drainPendingFetches(vm *quickjs.VM) bool {
 	el.mu.Lock()
 	if len(el.pendingFetches) == 0 {
 		el.mu.Unlock()
@@ -97,7 +105,7 @@ func (el *eventLoop) drainPendingFetches(ctx *v8.Context) bool {
 	}
 	// Snapshot the current list; we'll rebuild it without completed entries.
 	pending := el.pendingFetches
-	el.pendingFetches = nil // clear before releasing lock
+	el.pendingFetches = nil
 	el.mu.Unlock()
 
 	var remaining []*pendingFetch
@@ -105,8 +113,25 @@ func (el *eventLoop) drainPendingFetches(ctx *v8.Context) bool {
 	for _, pf := range pending {
 		select {
 		case result := <-pf.resultCh:
-			pf.callback(result)
-			ctx.PerformMicrotaskCheckpoint()
+			if result.err != nil {
+				js := fmt.Sprintf(`globalThis.__fetchReject(%q, %q)`,
+					pf.fetchID, result.err.Error())
+				v, err := vm.EvalValue(js, quickjs.EvalGlobal)
+				if err == nil {
+					v.Free()
+				}
+			} else {
+				js := fmt.Sprintf(`globalThis.__fetchResolve(%q, %d, %q, %q, %q, %v, %q)`,
+					pf.fetchID, result.status, result.statusText,
+					result.headersJSON, result.bodyB64,
+					result.redirected, result.finalURL)
+				v, err := vm.EvalValue(js, quickjs.EvalGlobal)
+				if err == nil {
+					v.Free()
+				}
+			}
+			// Microtask checkpoint after each fetch resolution.
+			executePendingJobs(vm)
 			didWork = true
 		default:
 			remaining = append(remaining, pf)
@@ -114,21 +139,34 @@ func (el *eventLoop) drainPendingFetches(ctx *v8.Context) bool {
 	}
 
 	el.mu.Lock()
-	// Callbacks may have added new pending fetches (via addPendingFetch)
-	// during PerformMicrotaskCheckpoint above, so prepend those to remaining.
+	// Callbacks may have added new pending fetches during resolution,
+	// so prepend those to remaining.
 	el.pendingFetches = append(remaining, el.pendingFetches...)
 	el.mu.Unlock()
 	return didWork
 }
 
+// fireTimer fires a timer callback by invoking the JS-side callback map.
+func (el *eventLoop) fireTimer(vm *quickjs.VM, id int) {
+	js := fmt.Sprintf(`(function() {
+		var entry = globalThis.__timerCallbacks[%d];
+		if (!entry) return;
+		if (!entry.interval) delete globalThis.__timerCallbacks[%d];
+		entry.fn.apply(null, entry.args || []);
+	})()`, id, id)
+	v, err := vm.EvalValue(js, quickjs.EvalGlobal)
+	if err == nil {
+		v.Free()
+	}
+}
+
 // drain fires all pending timers and resolves pending fetches until none remain
 // or the deadline is reached.
-// Must be called on the isolate's goroutine (V8 is single-threaded per isolate).
-func (el *eventLoop) drain(iso *v8.Isolate, ctx *v8.Context, deadline time.Time) {
+// Must be called on the VM's goroutine (QuickJS is single-threaded per VM).
+func (el *eventLoop) drain(vm *quickjs.VM, deadline time.Time) {
 	for {
 		// Always try to drain pending fetches first.
-		if el.drainPendingFetches(ctx) {
-			// A fetch completed — loop again to check for new timers/fetches.
+		if el.drainPendingFetches(vm) {
 			continue
 		}
 
@@ -167,8 +205,7 @@ func (el *eventLoop) drain(iso *v8.Isolate, ctx *v8.Context, deadline time.Time)
 			continue
 		}
 
-		// Wait until timer fires or execution deadline, but use short polls
-		// if fetches are pending so they can be resolved promptly.
+		// Wait until timer fires or execution deadline.
 		now := time.Now()
 		if next.deadline.After(now) {
 			wait := next.deadline.Sub(now)
@@ -177,7 +214,7 @@ func (el *eventLoop) drain(iso *v8.Isolate, ctx *v8.Context, deadline time.Time)
 				// polling until deadline; otherwise return.
 				if hasFetches {
 					for time.Now().Before(deadline) {
-						if el.drainPendingFetches(ctx) {
+						if el.drainPendingFetches(vm) {
 							break
 						}
 						time.Sleep(1 * time.Millisecond)
@@ -190,7 +227,7 @@ func (el *eventLoop) drain(iso *v8.Isolate, ctx *v8.Context, deadline time.Time)
 				// fetches as they complete.
 				timerDeadline := now.Add(wait)
 				for time.Now().Before(timerDeadline) {
-					el.drainPendingFetches(ctx)
+					el.drainPendingFetches(vm)
 					remaining := time.Until(timerDeadline)
 					if remaining <= 0 {
 						break
@@ -215,18 +252,17 @@ func (el *eventLoop) drain(iso *v8.Isolate, ctx *v8.Context, deadline time.Time)
 			el.mu.Unlock()
 			continue
 		}
+		timerID := next.id
 		if next.interval > 0 {
 			next.deadline = time.Now().Add(next.interval)
 		} else {
 			delete(el.timers, next.id)
 		}
-		cb := next.callback
 		el.mu.Unlock()
 
-		// Call on the isolate's goroutine. Ignore errors from timer callbacks.
-		undefinedVal := v8.Undefined(iso)
-		_, _ = cb.Call(undefinedVal, undefinedVal)
-		ctx.PerformMicrotaskCheckpoint()
+		el.fireTimer(vm, timerID)
+		// Microtask checkpoint after timer callback.
+		executePendingJobs(vm)
 	}
 }
 

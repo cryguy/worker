@@ -1806,22 +1806,22 @@ func TestCrypto_DirectGoCallbackMoreErrors(t *testing.T) {
     catch(e) { results.digestUnsupported = true; }
 
     // Import a valid HMAC key, then test sign/verify/encrypt/decrypt with unsupported algo.
-    const keyID = __cryptoImportKey("HMAC", "SHA-256", btoa("my-secret-key-for-testing-purpose"));
+    const keyID = __cryptoImportKey("HMAC", "SHA-256", btoa("my-secret-key-for-testing-purpose"), "", true);
 
     // __cryptoSign with unsupported algorithm.
-    try { __cryptoSign("UNKNOWN-ALGO", keyID, btoa("data")); results.signUnsupportedAlgo = false; }
+    try { __cryptoSign("UNKNOWN-ALGO", keyID, btoa("data"), ""); results.signUnsupportedAlgo = false; }
     catch(e) { results.signUnsupportedAlgo = true; }
 
     // __cryptoVerify with unsupported algorithm.
-    try { __cryptoVerify("UNKNOWN-ALGO", keyID, btoa("sig"), btoa("data")); results.verifyUnsupportedAlgo = false; }
+    try { __cryptoVerify("UNKNOWN-ALGO", keyID, btoa("sig"), btoa("data"), ""); results.verifyUnsupportedAlgo = false; }
     catch(e) { results.verifyUnsupportedAlgo = true; }
 
     // __cryptoEncrypt with unsupported algorithm.
-    try { __cryptoEncrypt("UNKNOWN-ALGO", keyID, btoa("data"), btoa("iv")); results.encryptUnsupportedAlgo = false; }
+    try { __cryptoEncrypt("UNKNOWN-ALGO", keyID, btoa("data"), btoa("iv"), ""); results.encryptUnsupportedAlgo = false; }
     catch(e) { results.encryptUnsupportedAlgo = true; }
 
     // __cryptoDecrypt with unsupported algorithm.
-    try { __cryptoDecrypt("UNKNOWN-ALGO", keyID, btoa("data"), btoa("iv")); results.decryptUnsupportedAlgo = false; }
+    try { __cryptoDecrypt("UNKNOWN-ALGO", keyID, btoa("data"), btoa("iv"), ""); results.decryptUnsupportedAlgo = false; }
     catch(e) { results.decryptUnsupportedAlgo = true; }
 
     return Response.json(results);
@@ -1860,29 +1860,29 @@ func TestCrypto_AESGCMBadIVErrors(t *testing.T) {
     const keyBytes = new Uint8Array(16);
     crypto.getRandomValues(keyBytes);
     const keyB64 = btoa(String.fromCharCode(...keyBytes));
-    const keyID = __cryptoImportKey("AES-GCM", "SHA-256", keyB64);
+    const keyID = __cryptoImportKey("AES-GCM", "SHA-256", keyB64, "", true);
 
     // Encrypt with bad IV base64.
-    try { __cryptoEncrypt("AES-GCM", keyID, btoa("plaintext"), "bad-iv!!!"); results.encBadIVB64 = false; }
+    try { __cryptoEncrypt("AES-GCM", keyID, btoa("plaintext"), "bad-iv!!!", ""); results.encBadIVB64 = false; }
     catch(e) { results.encBadIVB64 = true; }
 
     // Encrypt with wrong IV length (5 bytes instead of 12).
-    try { __cryptoEncrypt("AES-GCM", keyID, btoa("plaintext"), btoa("short")); results.encBadIVLen = false; }
+    try { __cryptoEncrypt("AES-GCM", keyID, btoa("plaintext"), btoa("short"), ""); results.encBadIVLen = false; }
     catch(e) { results.encBadIVLen = true; }
 
     // Decrypt with bad IV base64.
-    try { __cryptoDecrypt("AES-GCM", keyID, btoa("ciphertext"), "bad-iv!!!"); results.decBadIVB64 = false; }
+    try { __cryptoDecrypt("AES-GCM", keyID, btoa("ciphertext"), "bad-iv!!!", ""); results.decBadIVB64 = false; }
     catch(e) { results.decBadIVB64 = true; }
 
     // Decrypt with wrong IV length.
-    try { __cryptoDecrypt("AES-GCM", keyID, btoa("ciphertext"), btoa("short")); results.decBadIVLen = false; }
+    try { __cryptoDecrypt("AES-GCM", keyID, btoa("ciphertext"), btoa("short"), ""); results.decBadIVLen = false; }
     catch(e) { results.decBadIVLen = true; }
 
     // Decrypt with correct IV length but corrupt ciphertext.
     const iv12 = new Uint8Array(12);
     crypto.getRandomValues(iv12);
     const ivB64 = btoa(String.fromCharCode(...iv12));
-    try { __cryptoDecrypt("AES-GCM", keyID, btoa("corrupt-ciphertext-data"), ivB64); results.decCorrupt = false; }
+    try { __cryptoDecrypt("AES-GCM", keyID, btoa("corrupt-ciphertext-data"), ivB64, ""); results.decCorrupt = false; }
     catch(e) { results.decCorrupt = true; }
 
     return Response.json(results);
@@ -1917,14 +1917,14 @@ func TestCrypto_HMACSignVerifyBadHash(t *testing.T) {
     const results = {};
 
     // Import key with a weird hash algo.
-    const keyID = __cryptoImportKey("HMAC", "MD5", btoa("key-data-for-test"));
+    const keyID = __cryptoImportKey("HMAC", "MD5", btoa("key-data-for-test"), "", true);
 
     // Sign with HMAC but key has unsupported hash.
-    try { __cryptoSign("HMAC", keyID, btoa("data")); results.signBadHash = false; }
+    try { __cryptoSign("HMAC", keyID, btoa("data"), ""); results.signBadHash = false; }
     catch(e) { results.signBadHash = true; }
 
     // Verify with HMAC but key has unsupported hash.
-    try { __cryptoVerify("HMAC", keyID, btoa("sig"), btoa("data")); results.verifyBadHash = false; }
+    try { __cryptoVerify("HMAC", keyID, btoa("sig"), btoa("data"), ""); results.verifyBadHash = false; }
     catch(e) { results.verifyBadHash = true; }
 
     return Response.json(results);
@@ -1957,7 +1957,7 @@ func TestCrypto_AESGCMRoundTripDirect(t *testing.T) {
     const keyBytes = new Uint8Array(32);
     crypto.getRandomValues(keyBytes);
     const keyB64 = btoa(String.fromCharCode(...keyBytes));
-    const keyID = __cryptoImportKey("AES-GCM", "", keyB64);
+    const keyID = __cryptoImportKey("AES-GCM", "", keyB64, "", true);
 
     // Generate 12-byte IV.
     const iv = new Uint8Array(12);
@@ -1967,10 +1967,10 @@ func TestCrypto_AESGCMRoundTripDirect(t *testing.T) {
     // Encrypt.
     const plaintext = "Hello, AES-GCM direct test!";
     const ptB64 = btoa(plaintext);
-    const ctB64 = __cryptoEncrypt("AES-GCM", keyID, ptB64, ivB64);
+    const ctB64 = __cryptoEncrypt("AES-GCM", keyID, ptB64, ivB64, "");
 
     // Decrypt.
-    const rtB64 = __cryptoDecrypt("AES-GCM", keyID, ctB64, ivB64);
+    const rtB64 = __cryptoDecrypt("AES-GCM", keyID, ctB64, ivB64, "");
     const roundTrip = atob(rtB64);
 
     return Response.json({
@@ -2005,17 +2005,17 @@ func TestCrypto_HMACSignVerifyDirect(t *testing.T) {
 	source := `export default {
   async fetch(request, env) {
     // Import HMAC key.
-    const keyID = __cryptoImportKey("HMAC", "SHA-256", btoa("my-hmac-key-data"));
+    const keyID = __cryptoImportKey("HMAC", "SHA-256", btoa("my-hmac-key-data"), "", true);
 
     // Sign.
     const data = btoa("message to sign");
-    const sigB64 = __cryptoSign("HMAC", keyID, data);
+    const sigB64 = __cryptoSign("HMAC", keyID, data, "");
 
     // Verify correct signature.
-    const valid = __cryptoVerify("HMAC", keyID, sigB64, data);
+    const valid = !!__cryptoVerify("HMAC", keyID, sigB64, data, "");
 
     // Verify wrong signature.
-    const invalid = __cryptoVerify("HMAC", keyID, btoa("wrong-sig"), data);
+    const invalid = !!__cryptoVerify("HMAC", keyID, btoa("wrong-sig"), data, "");
 
     // Export key.
     const exportedB64 = __cryptoExportKey(keyID);
@@ -2320,14 +2320,14 @@ func TestCrypto_EncryptBadBase64Data(t *testing.T) {
     );
     const rawKey = await crypto.subtle.exportKey("raw", key);
     const keyB64 = btoa(String.fromCharCode(...new Uint8Array(rawKey)));
-    const keyId = __cryptoImportKey("AES-GCM", "", keyB64);
+    const keyId = __cryptoImportKey("AES-GCM", "", keyB64, "", true);
 
     // encrypt with bad data base64
-    try { __cryptoEncrypt("AES-GCM", keyId, "bad!!!", btoa("123456789012")); results.encBadData = false; }
+    try { __cryptoEncrypt("AES-GCM", keyId, "bad!!!", btoa("123456789012"), ""); results.encBadData = false; }
     catch(e) { results.encBadData = true; }
 
     // decrypt with bad data base64
-    try { __cryptoDecrypt("AES-GCM", keyId, "bad!!!", btoa("123456789012")); results.decBadData = false; }
+    try { __cryptoDecrypt("AES-GCM", keyId, "bad!!!", btoa("123456789012"), ""); results.decBadData = false; }
     catch(e) { results.decBadData = true; }
 
     return Response.json(results);

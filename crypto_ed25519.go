@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // cryptoEd25519JS patches crypto.subtle to support Ed25519 sign/verify/import/export/generate.
@@ -35,7 +35,7 @@ subtle.sign = async function(algorithm, key, data) {
 subtle.verify = async function(algorithm, key, signature, data) {
 	var algo = typeof algorithm === 'string' ? { name: algorithm } : algorithm;
 	if (algo.name === 'Ed25519') {
-		return __cryptoVerifyEd25519(key._id, __bufferSourceToB64(signature), __bufferSourceToB64(data));
+		return !!__cryptoVerifyEd25519(key._id, __bufferSourceToB64(signature), __bufferSourceToB64(data));
 	}
 	return _prevVerify.call(this, algorithm, key, signature, data);
 };
@@ -90,60 +90,44 @@ subtle.generateKey = async function(algorithm, extractable, usages) {
 
 // setupCryptoEd25519 registers Ed25519 sign/verify/import/export/generate.
 // Must run after setupCryptoExt.
-func setupCryptoEd25519(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
+func setupCryptoEd25519(vm *quickjs.VM, _ *eventLoop) error {
 	// __cryptoSignEd25519(keyID, dataB64) -> sigB64
-	_ = ctx.Global().Set("__cryptoSignEd25519", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "signEd25519 requires 2 argument(s)")
-		}
-		keyID := args[0].Integer()
-		dataB64 := args[1].String()
-
+	registerGoFunc(vm, "__cryptoSignEd25519", func(keyID int, dataB64 string) (string, error) {
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "signEd25519: invalid base64")
+			return "", fmt.Errorf("signEd25519: invalid base64")
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "signEd25519: key not found")
+			return "", fmt.Errorf("signEd25519: key not found")
 		}
 
 		privKey, ok := entry.ecKey.(ed25519.PrivateKey)
 		if !ok {
-			return throwError(iso, "signEd25519: key is not an Ed25519 private key")
+			return "", fmt.Errorf("signEd25519: key is not an Ed25519 private key")
 		}
 
 		sig := ed25519.Sign(privKey, data)
-		val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(sig))
-		return val
-	}).GetFunction(ctx))
+		return base64.StdEncoding.EncodeToString(sig), nil
+	}, false)
 
 	// __cryptoVerifyEd25519(keyID, sigB64, dataB64) -> bool
-	_ = ctx.Global().Set("__cryptoVerifyEd25519", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "verifyEd25519 requires 3 argument(s)")
-		}
-		keyID := args[0].Integer()
-		sigB64 := args[1].String()
-		dataB64 := args[2].String()
-
+	registerGoFunc(vm, "__cryptoVerifyEd25519", func(keyID int, sigB64, dataB64 string) (int, error) {
 		sig, err := base64.StdEncoding.DecodeString(sigB64)
 		if err != nil {
-			return throwError(iso, "verifyEd25519: invalid signature base64")
+			return 0, fmt.Errorf("verifyEd25519: invalid signature base64")
 		}
 		data, err := base64.StdEncoding.DecodeString(dataB64)
 		if err != nil {
-			return throwError(iso, "verifyEd25519: invalid data base64")
+			return 0, fmt.Errorf("verifyEd25519: invalid data base64")
 		}
 
-		reqID := getReqIDFromJS(ctx)
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "verifyEd25519: key not found")
+			return 0, fmt.Errorf("verifyEd25519: key not found")
 		}
 
 		var pubKey ed25519.PublicKey
@@ -153,31 +137,22 @@ func setupCryptoEd25519(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 		case ed25519.PrivateKey:
 			pubKey = k.Public().(ed25519.PublicKey)
 		default:
-			return throwError(iso, "verifyEd25519: key is not an Ed25519 key")
+			return 0, fmt.Errorf("verifyEd25519: key is not an Ed25519 key")
 		}
 
-		val, _ := v8.NewValue(iso, ed25519.Verify(pubKey, data, sig))
-		return val
-	}).GetFunction(ctx))
+		return boolToInt(ed25519.Verify(pubKey, data, sig)), nil
+	}, false)
 
 	// __cryptoGenerateKeyEd25519(extractable) -> JSON { privateKeyId, publicKeyId }
-	_ = ctx.Global().Set("__cryptoGenerateKeyEd25519", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		extractableVal := false
-		if len(args) > 0 {
-			extractableVal = args[0].Boolean()
-		}
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoGenerateKeyEd25519", func(extractableVal bool) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()))
-			return val
+			return fmt.Sprintf(`{"error":"key generation failed: %s"}`, err.Error()), nil
 		}
 
 		privID := importCryptoKeyFull(reqID, &cryptoKeyEntry{
@@ -187,40 +162,28 @@ func setupCryptoEd25519(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 			algoName: "Ed25519", keyType: "public", ecKey: pubKey, extractable: extractableVal,
 		})
 
-		val, _ := v8.NewValue(iso, fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID))
-		return val
-	}).GetFunction(ctx))
+		return fmt.Sprintf(`{"privateKeyId":%d,"publicKeyId":%d}`, privID, pubID), nil
+	}, false)
 
 	// __cryptoImportKeyEd25519(format, dataStr, extractable) -> JSON { keyId, keyType }
-	_ = ctx.Global().Set("__cryptoImportKeyEd25519", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 3 {
-			return throwError(iso, "importKeyEd25519 requires 3 argument(s)")
-		}
-		format := args[0].String()
-		dataStr := args[1].String()
-		extractableVal := args[2].Boolean()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoImportKeyEd25519", func(format, dataStr string, extractableVal bool) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		if getRequestState(reqID) == nil {
-			val, _ := v8.NewValue(iso, `{"error":"no active request state"}`)
-			return val
+			return `{"error":"no active request state"}`, nil
 		}
 
 		switch format {
 		case "raw":
 			keyData, err := base64.StdEncoding.DecodeString(dataStr)
 			if err != nil {
-				val, _ := v8.NewValue(iso, `{"error":"invalid base64"}`)
-				return val
+				return `{"error":"invalid base64"}`, nil
 			}
 			if len(keyData) == ed25519.PublicKeySize {
 				id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 					algoName: "Ed25519", keyType: "public",
 					ecKey: ed25519.PublicKey(keyData), extractable: extractableVal,
 				})
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id))
-				return val
+				return fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id), nil
 			}
 			if len(keyData) == ed25519.SeedSize {
 				privKey := ed25519.NewKeyFromSeed(keyData)
@@ -228,97 +191,78 @@ func setupCryptoEd25519(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 					algoName: "Ed25519", keyType: "private",
 					ecKey: privKey, extractable: extractableVal,
 				})
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id))
-				return val
+				return fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id), nil
 			}
 			if len(keyData) == ed25519.PrivateKeySize {
 				id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 					algoName: "Ed25519", keyType: "private",
 					ecKey: ed25519.PrivateKey(keyData), extractable: extractableVal,
 				})
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id))
-				return val
+				return fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id), nil
 			}
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"invalid Ed25519 key length: %d"}`, len(keyData)))
-			return val
+			return fmt.Sprintf(`{"error":"invalid Ed25519 key length: %d"}`, len(keyData)), nil
 
 		case "jwk":
 			var jwk map[string]interface{}
 			if err := json.Unmarshal([]byte(dataStr), &jwk); err != nil {
-				val, _ := v8.NewValue(iso, `{"error":"invalid JWK JSON"}`)
-				return val
+				return `{"error":"invalid JWK JSON"}`, nil
 			}
 			kty, _ := jwk["kty"].(string)
 			crv, _ := jwk["crv"].(string)
 			if kty != "OKP" || crv != "Ed25519" {
-				val, _ := v8.NewValue(iso, `{"error":"JWK must have kty=OKP and crv=Ed25519"}`)
-				return val
+				return `{"error":"JWK must have kty=OKP and crv=Ed25519"}`, nil
 			}
 			xB64, _ := jwk["x"].(string)
 			xBytes, err := base64.RawURLEncoding.DecodeString(xB64)
 			if err != nil || len(xBytes) != ed25519.PublicKeySize {
-				val, _ := v8.NewValue(iso, `{"error":"invalid JWK x value"}`)
-				return val
+				return `{"error":"invalid JWK x value"}`, nil
 			}
 
 			dB64, hasD := jwk["d"].(string)
 			if hasD && dB64 != "" {
 				dBytes, err := base64.RawURLEncoding.DecodeString(dB64)
 				if err != nil || len(dBytes) != ed25519.SeedSize {
-					val, _ := v8.NewValue(iso, `{"error":"invalid JWK d value"}`)
-					return val
+					return `{"error":"invalid JWK d value"}`, nil
 				}
 				privKey := ed25519.NewKeyFromSeed(dBytes)
 				id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 					algoName: "Ed25519", keyType: "private", ecKey: privKey, extractable: extractableVal,
 				})
-				val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id))
-				return val
+				return fmt.Sprintf(`{"keyId":%d,"keyType":"private"}`, id), nil
 			}
 
 			id := importCryptoKeyFull(reqID, &cryptoKeyEntry{
 				algoName: "Ed25519", keyType: "public",
 				ecKey: ed25519.PublicKey(xBytes), extractable: extractableVal,
 			})
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id))
-			return val
+			return fmt.Sprintf(`{"keyId":%d,"keyType":"public"}`, id), nil
 
 		default:
-			val, _ := v8.NewValue(iso, fmt.Sprintf(`{"error":"unsupported format %q"}`, format))
-			return val
+			return fmt.Sprintf(`{"error":"unsupported format %q"}`, format), nil
 		}
-	}).GetFunction(ctx))
+	}, false)
 
 	// __cryptoExportKeyEd25519(keyID, format) -> base64 or JSON string
-	_ = ctx.Global().Set("__cryptoExportKeyEd25519", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			return throwError(iso, "exportKeyEd25519 requires 2 argument(s)")
-		}
-		keyID := args[0].Integer()
-		format := args[1].String()
-
-		reqID := getReqIDFromJS(ctx)
+	registerGoFunc(vm, "__cryptoExportKeyEd25519", func(keyID int, format string) (string, error) {
+		reqID := getReqIDFromJS(vm)
 		entry := getCryptoKey(reqID, keyID)
 		if entry == nil {
-			return throwError(iso, "exportKeyEd25519: key not found")
+			return "", fmt.Errorf("exportKeyEd25519: key not found")
 		}
 		if !entry.extractable {
-			return throwError(iso, "key is not extractable")
+			return "", fmt.Errorf("key is not extractable")
 		}
 
 		switch format {
 		case "raw":
 			switch k := entry.ecKey.(type) {
 			case ed25519.PublicKey:
-				val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(k))
-				return val
+				return base64.StdEncoding.EncodeToString(k), nil
 			case ed25519.PrivateKey:
 				// Export the seed (first 32 bytes) for raw private key export
-				val, _ := v8.NewValue(iso, base64.StdEncoding.EncodeToString(k.Seed()))
-				return val
+				return base64.StdEncoding.EncodeToString(k.Seed()), nil
 			default:
-				return throwError(iso, "exportKeyEd25519: not an Ed25519 key")
+				return "", fmt.Errorf("exportKeyEd25519: not an Ed25519 key")
 			}
 
 		case "jwk":
@@ -334,18 +278,17 @@ func setupCryptoEd25519(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 				jwk["x"] = base64.RawURLEncoding.EncodeToString(pubKey)
 				jwk["d"] = base64.RawURLEncoding.EncodeToString(k.Seed())
 			default:
-				return throwError(iso, "exportKeyEd25519: not an Ed25519 key")
+				return "", fmt.Errorf("exportKeyEd25519: not an Ed25519 key")
 			}
 			data, _ := json.Marshal(jwk)
-			val, _ := v8.NewValue(iso, string(data))
-			return val
+			return string(data), nil
 
 		default:
-			return throwError(iso, fmt.Sprintf("exportKeyEd25519: unsupported format %q", format))
+			return "", fmt.Errorf("exportKeyEd25519: unsupported format %q", format)
 		}
-	}).GetFunction(ctx))
+	}, false)
 
-	if _, err := ctx.RunScript(cryptoEd25519JS, "crypto_ed25519.js"); err != nil {
+	if err := evalDiscard(vm, cryptoEd25519JS); err != nil {
 		return fmt.Errorf("evaluating crypto_ed25519.js: %w", err)
 	}
 	return nil

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 
 	// Pure-Go SQLite driver for database/sql (used by D1Bridge).
 	_ "github.com/glebarez/sqlite"
@@ -194,249 +194,50 @@ func (d *D1Bridge) Exec(sqlStr string, bindings []interface{}) (*D1ExecResult, e
 	}, nil
 }
 
-// buildD1Binding creates a D1Database JS object with prepare(), batch(), exec(),
-// and dump() methods backed by the given D1Bridge.
-func buildD1Binding(iso *v8.Isolate, ctx *v8.Context, bridge *D1Bridge) (*v8.Value, error) {
-	dbIDVal, _ := v8.NewValue(iso, bridge.DatabaseID)
-	_ = ctx.Global().Set("__d1_db_id_"+bridge.DatabaseID, dbIDVal)
-
-	execFnName := "__d1_exec_" + bridge.DatabaseID
-	_ = ctx.Global().Set(execFnName, v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-		args := info.Args()
-		if len(args) < 2 {
-			errVal, _ := v8.NewValue(iso, `{"error":"__d1_exec requires sql and bindings arguments"}`)
-			return errVal
+// setupD1 registers global Go functions for D1 database operations.
+func setupD1(vm *quickjs.VM, el *eventLoop) error {
+	// __d1_exec(reqIDStr, databaseID, sqlStr, bindingsJSON) -> JSON result or error JSON
+	err := registerGoFunc(vm, "__d1_exec", func(reqIDStr, databaseID, sqlStr, bindingsJSON string) (string, error) {
+		reqID := parseReqID(reqIDStr)
+		state := getRequestState(reqID)
+		if state == nil || state.d1Bridges == nil {
+			return "", fmt.Errorf("D1 not available")
 		}
-		sqlStr := args[0].String()
-		bindingsJSON := args[1].String()
+
+		// Find the D1Bridge with matching DatabaseID
+		var bridge *D1Bridge
+		for _, b := range state.d1Bridges {
+			if b.DatabaseID == databaseID {
+				bridge = b
+				break
+			}
+		}
+		if bridge == nil {
+			return "", fmt.Errorf("D1 database %q not found", databaseID)
+		}
 
 		var bindings []interface{}
 		if bindingsJSON != "" && bindingsJSON != "[]" {
 			if err := json.Unmarshal([]byte(bindingsJSON), &bindings); err != nil {
-				errStr, _ := json.Marshal(map[string]string{"error": "invalid bindings JSON: " + err.Error()})
-				errVal, _ := v8.NewValue(iso, string(errStr))
-				return errVal
+				errResult := map[string]string{"error": "invalid bindings JSON: " + err.Error()}
+				data, _ := json.Marshal(errResult)
+				return string(data), nil
 			}
 		}
 
 		result, err := bridge.Exec(sqlStr, bindings)
 		if err != nil {
-			errStr, _ := json.Marshal(map[string]string{"error": err.Error()})
-			errVal, _ := v8.NewValue(iso, string(errStr))
-			return errVal
+			errResult := map[string]string{"error": err.Error()}
+			data, _ := json.Marshal(errResult)
+			return string(data), nil
 		}
 
 		data, _ := json.Marshal(result)
-		resultVal, _ := v8.NewValue(iso, string(data))
-		return resultVal
-	}).GetFunction(ctx))
-
-	polyfill := fmt.Sprintf(`(function() {
-	var execFn = globalThis[%q];
-
-	function D1PreparedStatement(sql) {
-		this._sql = sql;
-		this._bindings = [];
-	}
-
-	D1PreparedStatement.prototype.bind = function() {
-		var stmt = new D1PreparedStatement(this._sql);
-		stmt._bindings = Array.prototype.slice.call(arguments);
-		return stmt;
-	};
-
-	D1PreparedStatement.prototype._exec = function() {
-		var bindingsJSON = JSON.stringify(this._bindings);
-		var resultStr = execFn(this._sql, bindingsJSON);
-		var result = JSON.parse(resultStr);
-		if (result.error) {
-			throw new Error(result.error);
-		}
-		return result;
-	};
-
-	D1PreparedStatement.prototype.all = function() {
-		var self = this;
-		return new Promise(function(resolve, reject) {
-			try {
-				var result = self._exec();
-				var results = [];
-				if (result.columns && result.rows) {
-					for (var i = 0; i < result.rows.length; i++) {
-						var obj = {};
-						for (var j = 0; j < result.columns.length; j++) {
-							obj[result.columns[j]] = result.rows[i][j];
-						}
-						results.push(obj);
-					}
-				}
-				resolve({
-					results: results,
-					success: true,
-					meta: result.meta || {}
-				});
-			} catch(e) {
-				reject(e);
-			}
-		});
-	};
-
-	D1PreparedStatement.prototype.first = function(column) {
-		var self = this;
-		return new Promise(function(resolve, reject) {
-			try {
-				var result = self._exec();
-				if (!result.rows || result.rows.length === 0) {
-					resolve(null);
-					return;
-				}
-				var row = {};
-				for (var j = 0; j < result.columns.length; j++) {
-					row[result.columns[j]] = result.rows[0][j];
-				}
-				if (column !== undefined && column !== null) {
-					resolve(row[column] !== undefined ? row[column] : null);
-				} else {
-					resolve(row);
-				}
-			} catch(e) {
-				reject(e);
-			}
-		});
-	};
-
-	D1PreparedStatement.prototype.raw = function(options) {
-		var self = this;
-		return new Promise(function(resolve, reject) {
-			try {
-				var result = self._exec();
-				var rows = result.rows || [];
-				if (options && options.columnNames) {
-					rows = [result.columns].concat(rows);
-				}
-				resolve(rows);
-			} catch(e) {
-				reject(e);
-			}
-		});
-	};
-
-	D1PreparedStatement.prototype.run = function() {
-		var self = this;
-		return new Promise(function(resolve, reject) {
-			try {
-				var result = self._exec();
-				resolve({
-					results: [],
-					success: true,
-					meta: result.meta || {}
-				});
-			} catch(e) {
-				reject(e);
-			}
-		});
-	};
-
-	function D1Database() {}
-
-	D1Database.prototype.prepare = function(sql) {
-		return new D1PreparedStatement(sql);
-	};
-
-	D1Database.prototype.batch = function(statements) {
-		return new Promise(function(resolve, reject) {
-			try {
-				var results = [];
-				for (var i = 0; i < statements.length; i++) {
-					var stmt = statements[i];
-					var result = stmt._exec();
-					var rows = [];
-					if (result.columns && result.rows) {
-						for (var r = 0; r < result.rows.length; r++) {
-							var obj = {};
-							for (var c = 0; c < result.columns.length; c++) {
-								obj[result.columns[c]] = result.rows[r][c];
-							}
-							rows.push(obj);
-						}
-					}
-					results.push({
-						results: rows,
-						success: true,
-						meta: result.meta || {}
-					});
-				}
-				resolve(results);
-			} catch(e) {
-				reject(e);
-			}
-		});
-	};
-
-	D1Database.prototype.exec = function(sql) {
-		var self = this;
-		return new Promise(function(resolve, reject) {
-			try {
-				// Split on semicolons, respecting single-quoted strings
-				var statements = [];
-				var current = '';
-				var inStr = false;
-				for (var i = 0; i < sql.length; i++) {
-					var ch = sql[i];
-					if (ch === "'" && !inStr) {
-						inStr = true;
-						current += ch;
-					} else if (ch === "'" && inStr) {
-						if (i + 1 < sql.length && sql[i + 1] === "'") {
-							current += "''";
-							i++;
-						} else {
-							inStr = false;
-							current += ch;
-						}
-					} else if (ch === ';' && !inStr) {
-						if (current.trim().length > 0) statements.push(current.trim());
-						current = '';
-					} else {
-						current += ch;
-					}
-				}
-				if (current.trim().length > 0) statements.push(current.trim());
-
-				var count = 0;
-				for (var i = 0; i < statements.length; i++) {
-					var bindingsJSON = "[]";
-					var resultStr = execFn(statements[i], bindingsJSON);
-					var result = JSON.parse(resultStr);
-					if (result.error) {
-						throw new Error(result.error);
-					}
-					count++;
-				}
-				resolve({ count: count, duration: 0 });
-			} catch(e) {
-				reject(e);
-			}
-		});
-	};
-
-	D1Database.prototype.dump = function() {
-		return Promise.reject(new Error("D1 dump() is not supported in this runtime"));
-	};
-
-	return new D1Database();
-})()`, execFnName)
-
-	jsVal, err := ctx.RunScript(polyfill, "d1_polyfill.js")
+		return string(data), nil
+	}, false)
 	if err != nil {
-		return nil, fmt.Errorf("D1 polyfill error: %w", err)
+		return fmt.Errorf("registering __d1_exec: %w", err)
 	}
 
-	return jsVal, nil
-}
-
-// setupD1 is a no-op setup function for the D1 binding.
-// The actual bindings are created per-database in buildD1Binding.
-func setupD1(_ *v8.Isolate, _ *v8.Context, _ *eventLoop) error {
 	return nil
 }

@@ -3,7 +3,7 @@ package worker
 import (
 	"fmt"
 
-	v8 "github.com/tommie/v8go"
+	"modernc.org/quickjs"
 )
 
 // schedulerJS defines globalThis.scheduler with a wait() method
@@ -19,8 +19,8 @@ globalThis.scheduler = {
 `
 
 // setupScheduler registers the scheduler global with wait().
-func setupScheduler(_ *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
-	if _, err := ctx.RunScript(schedulerJS, "scheduler.js"); err != nil {
+func setupScheduler(vm *quickjs.VM, _ *eventLoop) error {
+	if err := evalDiscard(vm, schedulerJS); err != nil {
 		return fmt.Errorf("evaluating scheduler.js: %w", err)
 	}
 	return nil
