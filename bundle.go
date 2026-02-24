@@ -9,6 +9,8 @@ import (
 	"sync"
 
 	esbuild "github.com/evanw/esbuild/pkg/api"
+
+	"github.com/cryguy/worker/internal/webapi"
 )
 
 // DataDir is the base directory for cached polyfills. Defaults to "./data".
@@ -135,7 +137,7 @@ func findUnenvPath() string {
 		}
 
 		// Auto-download unenv polyfills if not cached.
-		unenvDir, err := EnsureUnenv(DataDir)
+		unenvDir, err := webapi.EnsureUnenv(DataDir)
 		if err != nil {
 			log.Printf("WARNING: failed to ensure unenv polyfills: %v", err)
 			return

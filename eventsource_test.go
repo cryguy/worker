@@ -6,19 +6,24 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/cryguy/worker/internal/webapi"
 )
+
+const maxEventSources = 10
+const maxSSEEvents = 1000
 
 // disableEventSourceSSRF temporarily disables SSRF protection so tests can
 // connect to httptest servers on 127.0.0.1. Restored via t.Cleanup.
 func disableEventSourceSSRF(t *testing.T) {
 	t.Helper()
-	origSSRF := eventSourceSSRFEnabled
-	origTransport := eventSourceTransport
-	eventSourceSSRFEnabled = false
-	eventSourceTransport = http.DefaultTransport
+	origSSRF := webapi.EventSourceSSRFEnabled
+	origTransport := webapi.EventSourceTransport
+	webapi.EventSourceSSRFEnabled = false
+	webapi.EventSourceTransport = http.DefaultTransport
 	t.Cleanup(func() {
-		eventSourceSSRFEnabled = origSSRF
-		eventSourceTransport = origTransport
+		webapi.EventSourceSSRFEnabled = origSSRF
+		webapi.EventSourceTransport = origTransport
 	})
 }
 

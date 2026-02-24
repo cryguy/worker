@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-
-	v8 "github.com/tommie/v8go"
 )
 
 // ---------------------------------------------------------------------------
@@ -24,8 +22,8 @@ func TestCustomBinding_StringValue(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"MY_CUSTOM": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "custom-value")
+		"MY_CUSTOM": func(rt JSRuntime) (any, error) {
+			return "custom-value", nil
 		},
 	}
 
@@ -49,17 +47,17 @@ func TestCustomBinding_FunctionBinding(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"greet": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			fn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				args := info.Args()
-				name := "stranger"
-				if len(args) > 0 {
-					name = args[0].String()
-				}
-				val, _ := v8.NewValue(iso, "Hello, "+name+"!")
-				return val
-			})
-			return fn.GetFunction(ctx).Value, nil
+		"greet": func(rt JSRuntime) (any, error) {
+			// Register Go function and construct a JS wrapper.
+			if err := rt.RegisterFunc("__custom_greet", func(name string) string {
+				return "Hello, " + name + "!"
+			}); err != nil {
+				return nil, err
+			}
+			if err := rt.Eval("globalThis.__tmp_custom_val = function(name) { return __custom_greet(name); };"); err != nil {
+				return nil, err
+			}
+			return nil, nil
 		},
 	}
 
@@ -83,25 +81,16 @@ func TestCustomBinding_ObjectWithMethods(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"math": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			obj, err := NewJSObject(iso, ctx)
-			if err != nil {
+		"math": func(rt JSRuntime) (any, error) {
+			if err := rt.RegisterFunc("__custom_math_add", func(a, b int) int {
+				return a + b
+			}); err != nil {
 				return nil, err
 			}
-
-			addFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				args := info.Args()
-				if len(args) < 2 {
-					return v8.Undefined(iso)
-				}
-				a := args[0].Int32()
-				b := args[1].Int32()
-				val, _ := v8.NewValue(iso, int32(a+b))
-				return val
-			})
-			_ = obj.Set("add", addFn.GetFunction(ctx))
-
-			return obj.Value, nil
+			if err := rt.Eval("globalThis.__tmp_custom_val = { add: function(a, b) { return __custom_math_add(a, b); } };"); err != nil {
+				return nil, err
+			}
+			return nil, nil
 		},
 	}
 
@@ -124,7 +113,7 @@ func TestCustomBinding_ErrorInBindingFunc(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"BAD": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
+		"BAD": func(rt JSRuntime) (any, error) {
 			return nil, fmt.Errorf("binding setup failed")
 		},
 	}
@@ -151,8 +140,8 @@ func TestCustomBinding_CoexistsWithBuiltinBindings(t *testing.T) {
 	env := defaultEnv()
 	env.Vars["MY_VAR"] = "from-vars"
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"custom_val": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "from-custom")
+		"custom_val": func(rt JSRuntime) (any, error) {
+			return "from-custom", nil
 		},
 	}
 
@@ -175,15 +164,9 @@ func TestCustomBinding_MultipleBindings(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"A": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "alpha")
-		},
-		"B": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "beta")
-		},
-		"C": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			return v8.NewValue(iso, "gamma")
-		},
+		"A": func(rt JSRuntime) (any, error) { return "alpha", nil },
+		"B": func(rt JSRuntime) (any, error) { return "beta", nil },
+		"C": func(rt JSRuntime) (any, error) { return "gamma", nil },
 	}
 
 	r := execJS(t, e, source, env, getReq("http://localhost/"))
@@ -288,14 +271,16 @@ func TestExecuteFunction_WithCustomBindings(t *testing.T) {
 
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"db": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			obj, _ := NewJSObject(iso, ctx)
-			getFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				val, _ := v8.NewValue(iso, "value-for-"+info.Args()[0].String())
-				return val
-			})
-			_ = obj.Set("get", getFn.GetFunction(ctx))
-			return obj.Value, nil
+		"db": func(rt JSRuntime) (any, error) {
+			if err := rt.RegisterFunc("__custom_db_get", func(key string) string {
+				return "value-for-" + key
+			}); err != nil {
+				return nil, err
+			}
+			if err := rt.Eval("globalThis.__tmp_custom_val = { get: function(k) { return __custom_db_get(k); } };"); err != nil {
+				return nil, err
+			}
+			return nil, nil
 		},
 	}
 
@@ -465,23 +450,24 @@ func TestExecuteFunction_PluginCallsBackIntoGo(t *testing.T) {
 	var store []string
 	env := defaultEnv()
 	env.CustomBindings = map[string]EnvBindingFunc{
-		"store": func(iso *v8.Isolate, ctx *v8.Context) (*v8.Value, error) {
-			obj, _ := NewJSObject(iso, ctx)
-
-			saveFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				args := info.Args()
-				store = append(store, args[0].String()+"="+args[1].String())
-				return v8.Undefined(iso)
-			})
-			_ = obj.Set("save", saveFn.GetFunction(ctx))
-
-			countFn := v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
-				val, _ := v8.NewValue(iso, int32(len(store)))
-				return val
-			})
-			_ = obj.Set("count", countFn.GetFunction(ctx))
-
-			return obj.Value, nil
+		"store": func(rt JSRuntime) (any, error) {
+			if err := rt.RegisterFunc("__custom_store_save", func(name, value string) {
+				store = append(store, name+"="+value)
+			}); err != nil {
+				return nil, err
+			}
+			if err := rt.RegisterFunc("__custom_store_count", func() int {
+				return len(store)
+			}); err != nil {
+				return nil, err
+			}
+			if err := rt.Eval(`globalThis.__tmp_custom_val = {
+				save: function(name, value) { __custom_store_save(name, value); },
+				count: function() { return __custom_store_count(); }
+			};`); err != nil {
+				return nil, err
+			}
+			return nil, nil
 		},
 	}
 

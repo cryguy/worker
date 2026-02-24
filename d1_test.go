@@ -1043,7 +1043,7 @@ func TestOpenD1Database_Close(t *testing.T) {
 
 func TestOpenD1Database_CloseNilDB(t *testing.T) {
 	// A D1Bridge with nil db should not panic on Close.
-	bridge := &D1Bridge{db: nil, DatabaseID: "nil-test"}
+	bridge := &D1Bridge{DB: nil, DatabaseID: "nil-test"}
 	if err := bridge.Close(); err != nil {
 		t.Errorf("Close on nil db should not error: %v", err)
 	}

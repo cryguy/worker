@@ -63,8 +63,8 @@ func (kv *mockKVStore) GetWithMetadata(key string) (*KVValueWithMetadata, error)
 }
 
 func (kv *mockKVStore) Put(key, value string, metadata *string, ttl *int) error {
-	if len(value) > maxKVValueSize {
-		return fmt.Errorf("value exceeds maximum size of %d bytes", maxKVValueSize)
+	if len(value) > MaxKVValueSize {
+		return fmt.Errorf("value exceeds maximum size of %d bytes", MaxKVValueSize)
 	}
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -94,7 +94,7 @@ func (kv *mockKVStore) List(prefix string, limit int, cursor string) (*KVListRes
 	if limit <= 0 {
 		limit = 1000
 	}
-	offset := decodeCursor(cursor)
+	offset := DecodeCursor(cursor)
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -151,7 +151,7 @@ func (kv *mockKVStore) List(prefix string, limit int, cursor string) (*KVListRes
 		ListComplete: listComplete,
 	}
 	if !listComplete {
-		result.Cursor = encodeCursor(offset + limit)
+		result.Cursor = EncodeCursor(offset + limit)
 	}
 	return result, nil
 }

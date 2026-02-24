@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cryguy/worker/internal/webapi"
 )
 
 func TestIsPrivateIP(t *testing.T) {
@@ -48,9 +50,9 @@ func TestIsPrivateIP(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("failed to parse IP: %s", tt.ip)
 			}
-			got := isPrivateIP(ip)
+			got := webapi.IsPrivateIP(ip)
 			if got != tt.private {
-				t.Errorf("isPrivateIP(%s) = %v, want %v", tt.ip, got, tt.private)
+				t.Errorf("webapi.IsPrivateIP(%s) = %v, want %v", tt.ip, got, tt.private)
 			}
 		})
 	}
@@ -76,9 +78,9 @@ func TestIsPrivateIP_IPv6(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("failed to parse IP: %s", tt.ip)
 			}
-			got := isPrivateIP(ip)
+			got := webapi.IsPrivateIP(ip)
 			if got != tt.private {
-				t.Errorf("isPrivateIP(%s) = %v, want %v", tt.ip, got, tt.private)
+				t.Errorf("webapi.IsPrivateIP(%s) = %v, want %v", tt.ip, got, tt.private)
 			}
 		})
 	}
@@ -101,9 +103,9 @@ func TestIsPrivateHostname_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.url, func(t *testing.T) {
-			got := isPrivateHostname(tt.url)
+			got := webapi.IsPrivateHostname(tt.url)
 			if got != tt.private {
-				t.Errorf("isPrivateHostname(%q) = %v, want %v", tt.url, got, tt.private)
+				t.Errorf("webapi.IsPrivateHostname(%q) = %v, want %v", tt.url, got, tt.private)
 			}
 		})
 	}
@@ -129,9 +131,9 @@ func TestIsPrivateHostname(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.url, func(t *testing.T) {
-			got := isPrivateHostname(tt.url)
+			got := webapi.IsPrivateHostname(tt.url)
 			if got != tt.private {
-				t.Errorf("isPrivateHostname(%q) = %v, want %v", tt.url, got, tt.private)
+				t.Errorf("webapi.IsPrivateHostname(%q) = %v, want %v", tt.url, got, tt.private)
 			}
 		})
 	}
@@ -145,13 +147,13 @@ func TestIsPrivateHostname(t *testing.T) {
 // connect to httptest servers on 127.0.0.1. Restored via t.Cleanup.
 func disableFetchSSRF(t *testing.T) {
 	t.Helper()
-	origSSRF := fetchSSRFEnabled
-	origTransport := fetchTransport
-	fetchSSRFEnabled = false
-	fetchTransport = http.DefaultTransport
+	origSSRF := webapi.FetchSSRFEnabled
+	origTransport := webapi.FetchTransport
+	webapi.FetchSSRFEnabled = false
+	webapi.FetchTransport = http.DefaultTransport
 	t.Cleanup(func() {
-		fetchSSRFEnabled = origSSRF
-		fetchTransport = origTransport
+		webapi.FetchSSRFEnabled = origSSRF
+		webapi.FetchTransport = origTransport
 	})
 }
 
