@@ -158,17 +158,19 @@ const cryptoJS = `
 			throw new TypeError('expected BufferSource');
 		}
 		const len = arr.length;
-		let r = '';
+		const parts = [];
 		for (let i = 0; i < len; i += 3) {
 			const a = arr[i];
 			const b = i + 1 < len ? arr[i + 1] : 0;
 			const c = i + 2 < len ? arr[i + 2] : 0;
-			r += _b64e[a >> 2];
-			r += _b64e[((a & 3) << 4) | (b >> 4)];
-			r += i + 1 < len ? _b64e[((b & 15) << 2) | (c >> 6)] : '=';
-			r += i + 2 < len ? _b64e[c & 63] : '=';
+			parts.push(
+				_b64e[a >> 2],
+				_b64e[((a & 3) << 4) | (b >> 4)],
+				i + 1 < len ? _b64e[((b & 15) << 2) | (c >> 6)] : '=',
+				i + 2 < len ? _b64e[c & 63] : '='
+			);
 		}
-		return r;
+		return parts.join('');
 	}
 
 	// Helper: convert base64 to ArrayBuffer.
@@ -309,6 +311,75 @@ func setupCrypto(iso *v8.Isolate, ctx *v8.Context, _ *eventLoop) error {
 	if _, err := ctx.RunScript(cryptoJS, "crypto.js"); err != nil {
 		return fmt.Errorf("evaluating crypto.js: %w", err)
 	}
+
+	// Override __bufferSourceToB64 with a hybrid version: small buffers use
+	// the fast pure-JS path (O(n) with join), large buffers use the Go-backed
+	// SharedArrayBuffer bridge to avoid JS string overhead entirely.
+	_ = ctx.Global().Set("__bufferSourceToB64", v8.NewFunctionTemplate(iso, func(info *v8.FunctionCallbackInfo) *v8.Value {
+		args := info.Args()
+		if len(args) < 1 {
+			return throwError(iso, "expected BufferSource")
+		}
+		val := args[0]
+
+		// The JS coercion normalizes the input and checks the size.
+		// Buffers <= 64KB are encoded in pure JS (fast for small crypto ops).
+		// Buffers > 64KB are copied into a SharedArrayBuffer for Go to encode.
+		_ = ctx.Global().Set("__tmp_b64_src", val)
+		coerceResult, jsErr := ctx.RunScript(`(function() {
+			var v = globalThis.__tmp_b64_src;
+			delete globalThis.__tmp_b64_src;
+			var arr;
+			if (v instanceof ArrayBuffer) {
+				arr = new Uint8Array(v);
+			} else if (v && v.buffer instanceof ArrayBuffer) {
+				arr = new Uint8Array(v.buffer, v.byteOffset || 0, v.byteLength || v.length);
+			} else if (v && typeof v.length === 'number') {
+				arr = new Uint8Array(v.length);
+				for (var i = 0; i < v.length; i++) arr[i] = v[i];
+			} else {
+				return 'error';
+			}
+			if (arr.byteLength <= 65536) {
+				var s = '';
+				for (var i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+				return 'js:' + btoa(s);
+			}
+			var sab = new SharedArrayBuffer(arr.byteLength);
+			new Uint8Array(sab).set(arr);
+			globalThis.__tmp_b64_sab = sab;
+			return 'go';
+		})()`, "bufferSourceToB64_coerce.js")
+		if jsErr != nil {
+			return throwError(iso, fmt.Sprintf("bufferSourceToB64: %s", jsErr.Error()))
+		}
+		resultStr := coerceResult.String()
+		if resultStr == "error" {
+			return throwError(iso, "expected BufferSource")
+		}
+
+		// Small buffer: JS already encoded it.
+		if len(resultStr) >= 3 && resultStr[:3] == "js:" {
+			v, _ := v8.NewValue(iso, resultStr[3:])
+			return v
+		}
+
+		// Large buffer: read from SharedArrayBuffer and encode in Go.
+		sabVal, gErr := ctx.Global().Get("__tmp_b64_sab")
+		_, _ = ctx.RunScript("delete globalThis.__tmp_b64_sab", "b64_cleanup.js")
+		if gErr != nil || sabVal == nil {
+			return throwError(iso, "bufferSourceToB64: failed to retrieve SharedArrayBuffer")
+		}
+		data, release, sErr := sabVal.SharedArrayBufferGetContents()
+		if sErr != nil {
+			return throwError(iso, fmt.Sprintf("bufferSourceToB64: %s", sErr.Error()))
+		}
+		result := base64.StdEncoding.EncodeToString(data)
+		release()
+
+		v, _ := v8.NewValue(iso, result)
+		return v
+	}).GetFunction(ctx))
 
 	return nil
 }

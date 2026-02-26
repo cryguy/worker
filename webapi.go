@@ -1,7 +1,6 @@
 package worker
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -529,8 +528,9 @@ func jsResponseToGo(ctx *v8.Context, val *v8.Value) (*WorkerResponse, error) {
 			globalThis.__ws_check_resp = r.webSocket;
 		}
 		var body = '';
-		var bodyIsBase64 = false;
+		var bodyType = 'none';
 		if (r._body !== null && r._body !== undefined) {
+			var _src = null;
 			if (r._body instanceof ReadableStream) {
 				var _q = r._body._queue;
 				var _allBytes = [];
@@ -553,24 +553,28 @@ func jsResponseToGo(ctx *v8.Context, val *v8.Value) (*WorkerResponse, error) {
 				}
 				r._body._queue = [];
 				if (_allBytes.length > 0) {
-					body = __bufferSourceToB64(new Uint8Array(_allBytes));
-					bodyIsBase64 = true;
+					_src = new Uint8Array(_allBytes);
 				}
 			} else if (r._body instanceof ArrayBuffer) {
-				body = __bufferSourceToB64(r._body);
-				bodyIsBase64 = true;
+				_src = new Uint8Array(r._body);
 			} else if (ArrayBuffer.isView(r._body)) {
-				body = __bufferSourceToB64(r._body);
-				bodyIsBase64 = true;
-			} else {
+				_src = new Uint8Array(r._body.buffer, r._body.byteOffset, r._body.byteLength);
+			}
+			if (_src) {
+				var _sab = new SharedArrayBuffer(_src.byteLength);
+				new Uint8Array(_sab).set(_src);
+				globalThis.__tmp_resp_sab = _sab;
+				bodyType = 'binary';
+			} else if (!(r._body instanceof ReadableStream) && !(r._body instanceof ArrayBuffer) && !ArrayBuffer.isView(r._body)) {
 				body = String(r._body);
+				bodyType = 'string';
 			}
 		}
 		return JSON.stringify({
 			status: r.status || 200,
 			headers: headers,
 			body: body,
-			bodyIsBase64: bodyIsBase64,
+			bodyType: bodyType,
 			hasWebSocket: hasWebSocket,
 		});
 	})()`, "jsResponseToGo.js")
@@ -582,7 +586,7 @@ func jsResponseToGo(ctx *v8.Context, val *v8.Value) (*WorkerResponse, error) {
 		Status       int               `json:"status"`
 		Headers      map[string]string `json:"headers"`
 		Body         string            `json:"body"`
-		BodyIsBase64 bool              `json:"bodyIsBase64"`
+		BodyType     string            `json:"bodyType"`
 		HasWebSocket bool              `json:"hasWebSocket"`
 	}
 	if err := json.Unmarshal([]byte(result.String()), &resp); err != nil {
@@ -590,15 +594,22 @@ func jsResponseToGo(ctx *v8.Context, val *v8.Value) (*WorkerResponse, error) {
 	}
 
 	var body []byte
-	if resp.Body != "" {
-		if resp.BodyIsBase64 {
-			body, err = base64.StdEncoding.DecodeString(resp.Body)
-			if err != nil {
-				return nil, fmt.Errorf("decoding base64 body: %w", err)
-			}
-		} else {
-			body = []byte(resp.Body)
+	switch resp.BodyType {
+	case "binary":
+		sabVal, gErr := ctx.Global().Get("__tmp_resp_sab")
+		ctx.RunScript("delete globalThis.__tmp_resp_sab", "resp_cleanup.js")
+		if gErr != nil || sabVal == nil {
+			return nil, fmt.Errorf("extracting response: failed to retrieve SharedArrayBuffer")
 		}
+		data, release, sErr := sabVal.SharedArrayBufferGetContents()
+		if sErr != nil {
+			return nil, fmt.Errorf("extracting response: %w", sErr)
+		}
+		body = make([]byte, len(data))
+		copy(body, data)
+		release()
+	case "string":
+		body = []byte(resp.Body)
 	}
 
 	return &WorkerResponse{

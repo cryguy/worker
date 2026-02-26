@@ -1,7 +1,6 @@
 package worker
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -68,32 +67,32 @@ func buildStorageBinding(iso *v8.Isolate, ctx *v8.Context, store R2Store) (*v8.V
 		}
 		key := args[0].String()
 
-		// Coerce body to bytes via JS (handles string, ArrayBuffer, TypedArray, Blob).
+		// Coerce body to bytes via JS. Binary data (ArrayBuffer/TypedArray) is
+		// copied into a SharedArrayBuffer so Go can read the backing store
+		// directly — no base64 encoding or string serialisation needed.
 		_ = ctx.Global().Set("__tmp_put_body", args[1])
 		coerceResult, jsErr := ctx.RunScript(`(function() {
 			var v = globalThis.__tmp_put_body;
 			delete globalThis.__tmp_put_body;
-			if (typeof v === 'string') return JSON.stringify({type:'string',data:v});
-			if (v instanceof ArrayBuffer) {
-				var arr = new Uint8Array(v);
-				var s = '';
-				for (var i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
-				return JSON.stringify({type:'binary',data:btoa(s)});
-			}
-			if (ArrayBuffer.isView(v)) {
-				var arr = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
-				var s = '';
-				for (var i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
-				return JSON.stringify({type:'binary',data:btoa(s)});
+			if (typeof v === 'string') return 'string';
+			if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) {
+				var src = ArrayBuffer.isView(v)
+					? new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
+					: new Uint8Array(v);
+				var sab = new SharedArrayBuffer(src.byteLength);
+				new Uint8Array(sab).set(src);
+				globalThis.__tmp_put_sab = sab;
+				return 'binary';
 			}
 			if (typeof Blob !== 'undefined' && v instanceof Blob) {
 				var parts = v._parts;
-				if (!parts) return JSON.stringify({type:'error',data:'Blob has no _parts'});
+				if (!parts) return 'blob_error';
 				var result = '';
 				for (var i = 0; i < parts.length; i++) result += String(parts[i]);
-				return JSON.stringify({type:'string',data:result});
+				globalThis.__tmp_put_blob_str = result;
+				return 'blob';
 			}
-			return JSON.stringify({type:'error',data:'unsupported body type: use string, ArrayBuffer, TypedArray, or Blob'});
+			return 'unsupported';
 		})()`, "storage_coerce.js")
 		if jsErr != nil {
 			errVal, _ := v8.NewValue(iso, fmt.Sprintf("BUCKET.put body coercion: %s", jsErr.Error()))
@@ -101,30 +100,42 @@ func buildStorageBinding(iso *v8.Isolate, ctx *v8.Context, store R2Store) (*v8.V
 			return resolver.GetPromise().Value
 		}
 
-		var coerced struct {
-			Type string `json:"type"`
-			Data string `json:"data"`
-		}
-		if err := json.Unmarshal([]byte(coerceResult.String()), &coerced); err != nil {
-			errVal, _ := v8.NewValue(iso, "BUCKET.put: failed to parse coerced body")
-			resolver.Reject(errVal)
-			return resolver.GetPromise().Value
-		}
-
 		var valueBytes []byte
-		switch coerced.Type {
+		switch coerceResult.String() {
 		case "string":
-			valueBytes = []byte(coerced.Data)
+			valueBytes = []byte(args[1].String())
 		case "binary":
-			var decErr error
-			valueBytes, decErr = base64.StdEncoding.DecodeString(coerced.Data)
-			if decErr != nil {
-				errVal, _ := v8.NewValue(iso, "BUCKET.put: invalid binary body encoding")
+			sabVal, err := ctx.Global().Get("__tmp_put_sab")
+			_, _ = ctx.RunScript("delete globalThis.__tmp_put_sab", "storage_cleanup.js")
+			if err != nil || sabVal == nil {
+				errVal, _ := v8.NewValue(iso, "BUCKET.put: failed to retrieve SharedArrayBuffer")
 				resolver.Reject(errVal)
 				return resolver.GetPromise().Value
 			}
-		case "error":
-			errVal, _ := v8.NewValue(iso, fmt.Sprintf("BUCKET.put: %s", coerced.Data))
+			data, release, err := sabVal.SharedArrayBufferGetContents()
+			if err != nil {
+				errVal, _ := v8.NewValue(iso, fmt.Sprintf("BUCKET.put: %s", err.Error()))
+				resolver.Reject(errVal)
+				return resolver.GetPromise().Value
+			}
+			valueBytes = make([]byte, len(data))
+			copy(valueBytes, data)
+			release()
+		case "blob":
+			blobVal, err := ctx.Global().Get("__tmp_put_blob_str")
+			_, _ = ctx.RunScript("delete globalThis.__tmp_put_blob_str", "storage_cleanup.js")
+			if err != nil || blobVal == nil {
+				errVal, _ := v8.NewValue(iso, "BUCKET.put: failed to retrieve Blob string")
+				resolver.Reject(errVal)
+				return resolver.GetPromise().Value
+			}
+			valueBytes = []byte(blobVal.String())
+		case "blob_error":
+			errVal, _ := v8.NewValue(iso, "BUCKET.put: Blob has no _parts")
+			resolver.Reject(errVal)
+			return resolver.GetPromise().Value
+		case "unsupported":
+			errVal, _ := v8.NewValue(iso, "BUCKET.put: unsupported body type: use string, ArrayBuffer, TypedArray, or Blob")
 			resolver.Reject(errVal)
 			return resolver.GetPromise().Value
 		}
@@ -492,17 +503,32 @@ func buildR2ObjectBody(iso *v8.Isolate, ctx *v8.Context, key string, data []byte
 		bodyUsed = true
 		boolVal, _ := v8.NewValue(iso, true)
 		_ = obj.Set("bodyUsed", boolVal)
-		// Create ArrayBuffer via JS from base64.
-		b64 := base64.StdEncoding.EncodeToString(data)
-		b64Val, _ := v8.NewValue(iso, b64)
-		_ = ctx.Global().Set("__tmp_ab_b64", b64Val)
+		// Create ArrayBuffer via SharedArrayBuffer bridge: allocate a SAB
+		// in JS, write Go bytes directly into its backing store, then copy
+		// to a regular ArrayBuffer. No base64 round-trip needed.
+		lenVal, _ := v8.NewValue(iso, int32(len(data)))
+		_ = ctx.Global().Set("__tmp_ab_len", lenVal)
+		_, err := ctx.RunScript(`globalThis.__tmp_ab_sab = new SharedArrayBuffer(globalThis.__tmp_ab_len); delete globalThis.__tmp_ab_len;`, "r2_sab_alloc.js")
+		if err != nil {
+			errVal, _ := v8.NewValue(iso, fmt.Sprintf("BUCKET.get arrayBuffer: %s", err.Error()))
+			resolver.Reject(errVal)
+			return resolver.GetPromise().Value
+		}
+		sabVal, _ := ctx.Global().Get("__tmp_ab_sab")
+		sabBytes, release, sabErr := sabVal.SharedArrayBufferGetContents()
+		if sabErr != nil {
+			_, _ = ctx.RunScript("delete globalThis.__tmp_ab_sab", "r2_sab_cleanup.js")
+			errVal, _ := v8.NewValue(iso, fmt.Sprintf("BUCKET.get arrayBuffer: %s", sabErr.Error()))
+			resolver.Reject(errVal)
+			return resolver.GetPromise().Value
+		}
+		copy(sabBytes, data)
+		release()
 		abResult, err := ctx.RunScript(`(function() {
-			var b64 = globalThis.__tmp_ab_b64;
-			delete globalThis.__tmp_ab_b64;
-			var raw = atob(b64);
-			var buf = new ArrayBuffer(raw.length);
-			var arr = new Uint8Array(buf);
-			for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+			var sab = globalThis.__tmp_ab_sab;
+			delete globalThis.__tmp_ab_sab;
+			var buf = new ArrayBuffer(sab.byteLength);
+			new Uint8Array(buf).set(new Uint8Array(sab));
 			return buf;
 		})()`, "r2_arraybuffer.js")
 		if err != nil {
