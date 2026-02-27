@@ -168,12 +168,7 @@ func (e *Engine) Execute(siteID string, deployKey string, env *core.Env, req *co
 		return result
 	}
 
-	if env.Dispatcher == nil {
-		env.Dispatcher = e
-	}
-	if env.SiteID == "" {
-		env.SiteID = siteID
-	}
+	env.InitRuntime(e, siteID)
 
 	if err := e.EnsureSource(siteID, deployKey); err != nil {
 		result.Error = err
@@ -197,9 +192,12 @@ func (e *Engine) Execute(siteID string, deployKey string, env *core.Env, req *co
 
 	var keepWorker bool
 	var timedOut atomic.Bool
+	var vmMu sync.Mutex
 	timeout := time.Duration(e.config.ExecutionTimeout) * time.Millisecond
 	watchdog := time.AfterFunc(timeout, func() {
 		timedOut.Store(true)
+		vmMu.Lock()
+		defer vmMu.Unlock()
 		w.vm.Interrupt()
 	})
 
@@ -222,7 +220,9 @@ func (e *Engine) Execute(siteID string, deployKey string, env *core.Env, req *co
 			pool.put(w)
 		} else {
 			log.Printf("worker: discarding worker for site %s deploy %s (timed out or panicked)", siteID, deployKey)
+			vmMu.Lock()
 			w.vm.Close()
+			vmMu.Unlock()
 			key := poolKey{SiteID: siteID, DeployKey: deployKey}
 			if val, ok := e.pools.Load(key); ok {
 				sp := val.(*sitePool)
@@ -378,12 +378,7 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *core.Env
 		return result
 	}
 
-	if env.Dispatcher == nil {
-		env.Dispatcher = e
-	}
-	if env.SiteID == "" {
-		env.SiteID = siteID
-	}
+	env.InitRuntime(e, siteID)
 
 	if err := e.EnsureSource(siteID, deployKey); err != nil {
 		result.Error = err
@@ -406,9 +401,12 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *core.Env
 	}
 
 	var timedOut atomic.Bool
+	var vmMu sync.Mutex
 	timeout := time.Duration(e.config.ExecutionTimeout) * time.Millisecond
 	watchdog := time.AfterFunc(timeout, func() {
 		timedOut.Store(true)
+		vmMu.Lock()
+		defer vmMu.Unlock()
 		w.vm.Interrupt()
 	})
 
@@ -428,7 +426,9 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *core.Env
 			pool.put(w)
 		} else {
 			log.Printf("worker: discarding scheduled worker for site %s deploy %s (timed out or panicked)", siteID, deployKey)
+			vmMu.Lock()
 			w.vm.Close()
+			vmMu.Unlock()
 			key := poolKey{SiteID: siteID, DeployKey: deployKey}
 			if val, ok := e.pools.Load(key); ok {
 				sp := val.(*sitePool)
@@ -529,12 +529,7 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *core.Env, eve
 		return result
 	}
 
-	if env.Dispatcher == nil {
-		env.Dispatcher = e
-	}
-	if env.SiteID == "" {
-		env.SiteID = siteID
-	}
+	env.InitRuntime(e, siteID)
 
 	if err := e.EnsureSource(siteID, deployKey); err != nil {
 		result.Error = err
@@ -557,9 +552,12 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *core.Env, eve
 	}
 
 	var timedOut atomic.Bool
+	var vmMu sync.Mutex
 	timeout := time.Duration(e.config.ExecutionTimeout) * time.Millisecond
 	watchdog := time.AfterFunc(timeout, func() {
 		timedOut.Store(true)
+		vmMu.Lock()
+		defer vmMu.Unlock()
 		w.vm.Interrupt()
 	})
 
@@ -579,7 +577,9 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *core.Env, eve
 			pool.put(w)
 		} else {
 			log.Printf("worker: discarding tail worker for site %s deploy %s (timed out or panicked)", siteID, deployKey)
+			vmMu.Lock()
 			w.vm.Close()
+			vmMu.Unlock()
 			key := poolKey{SiteID: siteID, DeployKey: deployKey}
 			if val, ok := e.pools.Load(key); ok {
 				sp := val.(*sitePool)
@@ -697,12 +697,7 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *core.Env,
 		return result
 	}
 
-	if env.Dispatcher == nil {
-		env.Dispatcher = e
-	}
-	if env.SiteID == "" {
-		env.SiteID = siteID
-	}
+	env.InitRuntime(e, siteID)
 
 	if err := e.EnsureSource(siteID, deployKey); err != nil {
 		result.Error = err
@@ -725,9 +720,12 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *core.Env,
 	}
 
 	var timedOut atomic.Bool
+	var vmMu sync.Mutex
 	timeout := time.Duration(e.config.ExecutionTimeout) * time.Millisecond
 	watchdog := time.AfterFunc(timeout, func() {
 		timedOut.Store(true)
+		vmMu.Lock()
+		defer vmMu.Unlock()
 		w.vm.Interrupt()
 	})
 
@@ -747,7 +745,9 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *core.Env,
 			pool.put(w)
 		} else {
 			log.Printf("worker: discarding worker for site %s deploy %s (timed out or panicked)", siteID, deployKey)
+			vmMu.Lock()
 			w.vm.Close()
+			vmMu.Unlock()
 			key := poolKey{SiteID: siteID, DeployKey: deployKey}
 			if val, ok := e.pools.Load(key); ok {
 				sp := val.(*sitePool)

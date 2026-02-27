@@ -402,11 +402,12 @@ globalThis.__bufferSourceToB64 = function(data) {
 	} else {
 		bytes = new Uint8Array(data);
 	}
-	var binary = '';
-	for (var i = 0; i < bytes.length; i++) {
-		binary += String.fromCharCode(bytes[i]);
+	var parts = [];
+	for (var i = 0; i < bytes.length; i += 8192) {
+		var chunk = bytes.subarray(i, Math.min(i + 8192, bytes.length));
+		parts.push(String.fromCharCode.apply(null, chunk));
 	}
-	return btoa(binary);
+	return btoa(parts.join(''));
 };
 
 globalThis.__b64ToBuffer = function(b64) {

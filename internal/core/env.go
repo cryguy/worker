@@ -1,5 +1,7 @@
 package core
 
+import "sync"
+
 // EnvBindingFunc creates a JS binding to be set on the worker's env object.
 // It receives the JSRuntime for the current execution. The returned value
 // is a basic Go type (string, int, float64, bool, nil) that is set on the
@@ -17,8 +19,8 @@ type Env struct {
 	Cache           CacheStore
 	Storage         map[string]R2Store
 	Queues          map[string]QueueSender
-	D1Bindings      map[string]string   // binding name -> database ID
-	D1              map[string]D1Store  // binding name -> D1Store (opened by engine)
+	D1Bindings      map[string]string  // binding name -> database ID
+	D1              map[string]D1Store // binding name -> D1Store (opened by engine)
 	DurableObjects  map[string]DurableObjectStore
 	ServiceBindings map[string]ServiceBindingConfig
 
@@ -34,6 +36,23 @@ type Env struct {
 	Assets     AssetsFetcher
 	Dispatcher WorkerDispatcher // set by Engine before execution
 	SiteID     string           // site isolation key
+
+	// initOnce guards the one-time initialization of Dispatcher and SiteID
+	// so concurrent Execute calls sharing the same Env are race-free.
+	initOnce sync.Once
+}
+
+// InitRuntime sets Dispatcher and SiteID if not already set.
+// Safe to call concurrently from multiple goroutines.
+func (env *Env) InitRuntime(dispatcher WorkerDispatcher, siteID string) {
+	env.initOnce.Do(func() {
+		if env.Dispatcher == nil {
+			env.Dispatcher = dispatcher
+		}
+		if env.SiteID == "" {
+			env.SiteID = siteID
+		}
+	})
 }
 
 // AssetsFetcher is implemented by the static pipeline to handle env.ASSETS.fetch().

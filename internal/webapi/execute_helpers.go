@@ -47,6 +47,12 @@ func GoRequestToJS(rt core.JSRuntime, req *core.WorkerRequest) error {
 // JsResponseToGo extracts a Go WorkerResponse from the JS Response
 // in globalThis.__result.
 func JsResponseToGo(rt core.JSRuntime) (*core.WorkerResponse, error) {
+	// Set a temporary flag so JS knows the Go side supports binary transfer.
+	// The mode tells JS which buffer type to create: "sab" or "ab".
+	if bt, ok := rt.(core.BinaryTransferer); ok {
+		_ = rt.SetGlobal("__tmp_binary_mode", bt.BinaryMode())
+	}
+
 	resultJSON, err := rt.EvalString(`(function() {
 		var r = globalThis.__result;
 		delete globalThis.__result;
@@ -63,7 +69,9 @@ func JsResponseToGo(rt core.JSRuntime) (*core.WorkerResponse, error) {
 			globalThis.__ws_check_resp = r.webSocket;
 		}
 		var body = '';
-		var bodyIsBase64 = false;
+		var bodyType = 'string';
+		var _bm = globalThis.__tmp_binary_mode || '';
+		if (_bm) delete globalThis.__tmp_binary_mode;
 		if (r._body !== null && r._body !== undefined) {
 			if (r._body instanceof ReadableStream) {
 				var _q = r._body._queue;
@@ -87,15 +95,30 @@ func JsResponseToGo(rt core.JSRuntime) (*core.WorkerResponse, error) {
 				}
 				r._body._queue = [];
 				if (_allBytes.length > 0) {
-					body = __bufferSourceToB64(new Uint8Array(_allBytes));
-					bodyIsBase64 = true;
+					var _src = new Uint8Array(_allBytes);
+					if (_bm) {
+						var _buf = (_bm === 'sab') ? new SharedArrayBuffer(_src.byteLength) : new ArrayBuffer(_src.byteLength);
+						new Uint8Array(_buf).set(_src);
+						globalThis.__tmp_resp_sab = _buf;
+						bodyType = 'binary';
+					} else {
+						body = __bufferSourceToB64(_src);
+						bodyType = 'base64';
+					}
 				}
-			} else if (r._body instanceof ArrayBuffer) {
-				body = __bufferSourceToB64(r._body);
-				bodyIsBase64 = true;
-			} else if (ArrayBuffer.isView(r._body)) {
-				body = __bufferSourceToB64(r._body);
-				bodyIsBase64 = true;
+			} else if (r._body instanceof ArrayBuffer || ArrayBuffer.isView(r._body)) {
+				var _src2 = (r._body instanceof ArrayBuffer)
+					? new Uint8Array(r._body)
+					: new Uint8Array(r._body.buffer, r._body.byteOffset, r._body.byteLength);
+				if (_bm) {
+					var _buf2 = (_bm === 'sab') ? new SharedArrayBuffer(_src2.byteLength) : new ArrayBuffer(_src2.byteLength);
+					new Uint8Array(_buf2).set(_src2);
+					globalThis.__tmp_resp_sab = _buf2;
+					bodyType = 'binary';
+				} else {
+					body = __bufferSourceToB64(_src2);
+					bodyType = 'base64';
+				}
 			} else {
 				body = String(r._body);
 			}
@@ -104,7 +127,7 @@ func JsResponseToGo(rt core.JSRuntime) (*core.WorkerResponse, error) {
 			status: r.status || 200,
 			headers: headers,
 			body: body,
-			bodyIsBase64: bodyIsBase64,
+			bodyType: bodyType,
 			hasWebSocket: hasWebSocket,
 		});
 	})()`)
@@ -116,7 +139,7 @@ func JsResponseToGo(rt core.JSRuntime) (*core.WorkerResponse, error) {
 		Status       int               `json:"status"`
 		Headers      map[string]string `json:"headers"`
 		Body         string            `json:"body"`
-		BodyIsBase64 bool              `json:"bodyIsBase64"`
+		BodyType     string            `json:"bodyType"`
 		HasWebSocket bool              `json:"hasWebSocket"`
 		Error        string            `json:"error"`
 	}
@@ -128,13 +151,25 @@ func JsResponseToGo(rt core.JSRuntime) (*core.WorkerResponse, error) {
 	}
 
 	var body []byte
-	if resp.Body != "" {
-		if resp.BodyIsBase64 {
+	switch resp.BodyType {
+	case "binary":
+		if bt, ok := rt.(core.BinaryTransferer); ok {
+			body, err = bt.ReadBinaryFromJS("__tmp_resp_sab")
+			if err != nil {
+				return nil, fmt.Errorf("reading binary response body: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("binary response body requires BinaryTransferer runtime")
+		}
+	case "base64":
+		if resp.Body != "" {
 			body, err = base64.StdEncoding.DecodeString(resp.Body)
 			if err != nil {
 				return nil, fmt.Errorf("decoding base64 body: %w", err)
 			}
-		} else {
+		}
+	default:
+		if resp.Body != "" {
 			body = []byte(resp.Body)
 		}
 	}
@@ -306,4 +341,3 @@ func BuildExecContext(rt core.JSRuntime) error {
 		};
 	`)
 }
-

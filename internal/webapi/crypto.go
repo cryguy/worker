@@ -158,17 +158,19 @@ const cryptoJS = `
 			throw new TypeError('expected BufferSource');
 		}
 		const len = arr.length;
-		let r = '';
+		const parts = [];
 		for (let i = 0; i < len; i += 3) {
 			const a = arr[i];
 			const b = i + 1 < len ? arr[i + 1] : 0;
 			const c = i + 2 < len ? arr[i + 2] : 0;
-			r += _b64e[a >> 2];
-			r += _b64e[((a & 3) << 4) | (b >> 4)];
-			r += i + 1 < len ? _b64e[((b & 15) << 2) | (c >> 6)] : '=';
-			r += i + 2 < len ? _b64e[c & 63] : '=';
+			parts.push(
+				_b64e[a >> 2],
+				_b64e[((a & 3) << 4) | (b >> 4)],
+				i + 1 < len ? _b64e[((b & 15) << 2) | (c >> 6)] : '=',
+				i + 2 < len ? _b64e[c & 63] : '='
+			);
 		}
-		return r;
+		return parts.join('');
 	}
 
 	// Helper: convert base64 to ArrayBuffer.
@@ -266,6 +268,51 @@ func SetupCrypto(rt core.JSRuntime, _ *eventloop.EventLoop) error {
 	// Evaluate the JS wrapper that builds the crypto global.
 	if err := rt.Eval(cryptoJS); err != nil {
 		return fmt.Errorf("evaluating crypto.js: %w", err)
+	}
+
+	// Override __bufferSourceToB64 with a Go-backed hybrid when BinaryTransferer
+	// is available: small buffers (<=64KB) use fast pure-JS btoa, large buffers
+	// use the binary bridge with Go's base64.StdEncoding.EncodeToString.
+	if bt, ok := rt.(core.BinaryTransferer); ok {
+		_ = rt.SetGlobal("__binary_mode", bt.BinaryMode())
+
+		if err := rt.RegisterFunc("__bufferSourceToB64_go", func() (string, error) {
+			data, err := bt.ReadBinaryFromJS("__tmp_b64_buf")
+			if err != nil {
+				return "", fmt.Errorf("bufferSourceToB64: %w", err)
+			}
+			return base64.StdEncoding.EncodeToString(data), nil
+		}); err != nil {
+			return fmt.Errorf("registering __bufferSourceToB64_go: %w", err)
+		}
+
+		if err := rt.Eval(`globalThis.__bufferSourceToB64 = function(data) {
+			var arr;
+			if (data instanceof ArrayBuffer) {
+				arr = new Uint8Array(data);
+			} else if (data && data.buffer instanceof ArrayBuffer) {
+				arr = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length);
+			} else if (data && typeof data.length === 'number') {
+				arr = new Uint8Array(data.length);
+				for (var i = 0; i < data.length; i++) arr[i] = data[i];
+			} else {
+				throw new TypeError('expected BufferSource');
+			}
+			if (arr.byteLength <= 65536) {
+				var _parts = [];
+				for (var _i = 0; _i < arr.length; _i += 8192) {
+					_parts.push(String.fromCharCode.apply(null, arr.subarray(_i, Math.min(_i + 8192, arr.length))));
+				}
+				return btoa(_parts.join(''));
+			}
+			var _bm = globalThis.__binary_mode || 'sab';
+			var _buf = (_bm === 'sab') ? new SharedArrayBuffer(arr.byteLength) : new ArrayBuffer(arr.byteLength);
+			new Uint8Array(_buf).set(arr);
+			globalThis.__tmp_b64_buf = _buf;
+			return __bufferSourceToB64_go();
+		};`); err != nil {
+			return fmt.Errorf("overriding __bufferSourceToB64: %w", err)
+		}
 	}
 
 	return nil

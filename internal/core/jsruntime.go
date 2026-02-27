@@ -30,3 +30,21 @@ type JSRuntime interface {
 	// V8: PerformMicrotaskCheckpoint, QuickJS: ExecutePendingJob loop.
 	RunMicrotasks()
 }
+
+// BinaryTransferer is an optional interface that JSRuntime implementations
+// can provide for efficient binary data transfer between Go and JS.
+// V8 implements this using SharedArrayBuffer; QuickJS uses direct ArrayBuffer
+// access via the libquickjs C API.
+type BinaryTransferer interface {
+	// ReadBinaryFromJS reads binary data from a JS buffer stored at the
+	// given global variable name and returns it as Go bytes.
+	ReadBinaryFromJS(globalName string) ([]byte, error)
+
+	// WriteBinaryToJS writes Go bytes into a JS ArrayBuffer at the given
+	// global variable name.
+	WriteBinaryToJS(globalName string, data []byte) error
+
+	// BinaryMode returns the JS buffer type to use for binary transfer:
+	// "sab" for SharedArrayBuffer (V8), "ab" for ArrayBuffer (QuickJS).
+	BinaryMode() string
+}

@@ -19,6 +19,7 @@ type v8Runtime struct {
 }
 
 var _ core.JSRuntime = (*v8Runtime)(nil)
+var _ core.BinaryTransferer = (*v8Runtime)(nil)
 
 // Eval evaluates JavaScript and discards the result.
 func (r *v8Runtime) Eval(js string) error {
@@ -139,6 +140,69 @@ func (r *v8Runtime) SetGlobal(name string, value any) error {
 // RunMicrotasks pumps the V8 microtask queue.
 func (r *v8Runtime) RunMicrotasks() {
 	r.ctx.PerformMicrotaskCheckpoint()
+}
+
+// BinaryMode returns "sab" — V8 uses SharedArrayBuffer for binary transfer.
+func (r *v8Runtime) BinaryMode() string { return "sab" }
+
+// ReadBinaryFromJS reads a SharedArrayBuffer from a JS global and returns its contents as Go bytes.
+func (r *v8Runtime) ReadBinaryFromJS(globalName string) ([]byte, error) {
+	sabVal, err := r.ctx.Global().Get(globalName)
+	if err != nil {
+		return nil, fmt.Errorf("retrieving %s: %w", globalName, err)
+	}
+
+	data, release, err := sabVal.SharedArrayBufferGetContents()
+	if err != nil {
+		return nil, fmt.Errorf("reading SharedArrayBuffer %s: %w", globalName, err)
+	}
+	result := make([]byte, len(data))
+	copy(result, data)
+	release()
+
+	// Clean up the global.
+	_, _ = r.ctx.RunScript(fmt.Sprintf("delete globalThis[%q];", globalName), "sab_read_cleanup.js")
+
+	return result, nil
+}
+
+// WriteBinaryToJS writes Go bytes into a JS ArrayBuffer via SharedArrayBuffer bridge.
+func (r *v8Runtime) WriteBinaryToJS(globalName string, data []byte) error {
+	// Allocate a SharedArrayBuffer in JS.
+	allocScript := fmt.Sprintf("globalThis.__tmp_write_sab = new SharedArrayBuffer(%d);", len(data))
+	if _, err := r.ctx.RunScript(allocScript, "sab_alloc.js"); err != nil {
+		return fmt.Errorf("allocating SharedArrayBuffer: %w", err)
+	}
+
+	if len(data) > 0 {
+		sabVal, err := r.ctx.Global().Get("__tmp_write_sab")
+		if err != nil {
+			_, _ = r.ctx.RunScript("delete globalThis.__tmp_write_sab;", "sab_cleanup.js")
+			return fmt.Errorf("retrieving SharedArrayBuffer: %w", err)
+		}
+
+		sabBytes, release, err := sabVal.SharedArrayBufferGetContents()
+		if err != nil {
+			_, _ = r.ctx.RunScript("delete globalThis.__tmp_write_sab;", "sab_cleanup.js")
+			return fmt.Errorf("getting SharedArrayBuffer contents: %w", err)
+		}
+		copy(sabBytes, data)
+		release()
+	}
+
+	// Copy SAB to regular ArrayBuffer and store at globalName.
+	copyScript := fmt.Sprintf(`(function() {
+		var sab = globalThis.__tmp_write_sab;
+		delete globalThis.__tmp_write_sab;
+		var buf = new ArrayBuffer(sab.byteLength);
+		new Uint8Array(buf).set(new Uint8Array(sab));
+		globalThis[%q] = buf;
+	})()`, globalName)
+	if _, err := r.ctx.RunScript(copyScript, "sab_copy.js"); err != nil {
+		return fmt.Errorf("copying SharedArrayBuffer to ArrayBuffer: %w", err)
+	}
+
+	return nil
 }
 
 // Iso returns the underlying V8 isolate for engine-specific operations.

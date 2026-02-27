@@ -153,12 +153,7 @@ func (e *Engine) Execute(siteID string, deployKey string, env *core.Env, req *co
 		return result
 	}
 
-	if env.Dispatcher == nil {
-		env.Dispatcher = e
-	}
-	if env.SiteID == "" {
-		env.SiteID = siteID
-	}
+	env.InitRuntime(e, siteID)
 
 	if err := e.EnsureSource(siteID, deployKey); err != nil {
 		result.Error = err
@@ -351,12 +346,7 @@ func (e *Engine) ExecuteScheduled(siteID string, deployKey string, env *core.Env
 		return result
 	}
 
-	if env.Dispatcher == nil {
-		env.Dispatcher = e
-	}
-	if env.SiteID == "" {
-		env.SiteID = siteID
-	}
+	env.InitRuntime(e, siteID)
 
 	if err := e.EnsureSource(siteID, deployKey); err != nil {
 		result.Error = err
@@ -500,12 +490,7 @@ func (e *Engine) ExecuteTail(siteID string, deployKey string, env *core.Env, eve
 		return result
 	}
 
-	if env.Dispatcher == nil {
-		env.Dispatcher = e
-	}
-	if env.SiteID == "" {
-		env.SiteID = siteID
-	}
+	env.InitRuntime(e, siteID)
 
 	if err := e.EnsureSource(siteID, deployKey); err != nil {
 		result.Error = err
@@ -658,12 +643,7 @@ func (e *Engine) ExecuteFunction(siteID string, deployKey string, env *core.Env,
 		return result
 	}
 
-	if env.Dispatcher == nil {
-		env.Dispatcher = e
-	}
-	if env.SiteID == "" {
-		env.SiteID = siteID
-	}
+	env.InitRuntime(e, siteID)
 
 	if err := e.EnsureSource(siteID, deployKey); err != nil {
 		result.Error = err
