@@ -797,3 +797,28 @@ func TestBodyTypes_NullBodyReturnsEmpty(t *testing.T) {
 		t.Errorf("null body arrayBuffer length = %d, want 0", data.ABLen)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2: Content-Length header for string body
+// ---------------------------------------------------------------------------
+
+func TestBody_ContentLengthString(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    return new Response("hello", { headers: { "content-length": "5" } });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	cl := r.Response.Headers["content-length"]
+	if cl != "5" {
+		t.Errorf("content-length = %q, want '5'", cl)
+	}
+	if string(r.Response.Body) != "hello" {
+		t.Errorf("body = %q, want 'hello'", r.Response.Body)
+	}
+}

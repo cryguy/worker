@@ -255,26 +255,132 @@ if (typeof TextEncoder === 'undefined') {
 	};
 }
 
-if (typeof TextDecoder === 'undefined') {
-	globalThis.TextDecoder = class TextDecoder {
-		decode(buf) {
-			if (!buf) return '';
-			const bytes = new Uint8Array(buf.buffer || buf);
-			let result = '';
-			for (let i = 0; i < bytes.length;) {
-				const b = bytes[i];
-				if (b < 0x80) { result += String.fromCharCode(b); i++; }
-				else if ((b & 0xe0) === 0xc0) { result += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i+1] & 0x3f)); i += 2; }
-				else if ((b & 0xf0) === 0xe0) { result += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i+1] & 0x3f) << 6) | (bytes[i+2] & 0x3f)); i += 3; }
-				else if ((b & 0xf8) === 0xf0) {
-					const cp = ((b & 0x07) << 18) | ((bytes[i+1] & 0x3f) << 12) | ((bytes[i+2] & 0x3f) << 6) | (bytes[i+3] & 0x3f);
-					result += String.fromCodePoint(cp); i += 4;
-				} else { result += '\ufffd'; i++; }
+globalThis.TextDecoder = class TextDecoder {
+		constructor(encoding, options) {
+			var label = (encoding || 'utf-8').toLowerCase().trim();
+			// Normalize label aliases to canonical names.
+			if (label === 'utf8' || label === 'unicode-1-1-utf-8') label = 'utf-8';
+			else if (label === 'latin1' || label === 'iso-8859-1' || label === 'ascii' ||
+			         label === 'us-ascii' || label === 'iso8859-1' || label === 'iso_8859-1') label = 'windows-1252';
+			this._encoding = label;
+			this._fatal = !!(options && options.fatal);
+			this._ignoreBOM = !!(options && options.ignoreBOM);
+			this._bomSeen = false;
+			this._pending = [];
+		}
+		get encoding() { return this._encoding; }
+		get fatal() { return this._fatal; }
+		get ignoreBOM() { return this._ignoreBOM; }
+		decode(buf, options) {
+			var stream = !!(options && options.stream);
+			// Build byte array: pending bytes prepended to new input.
+			var incoming;
+			if (!buf) {
+				incoming = new Uint8Array(0);
+			} else if (buf instanceof ArrayBuffer) {
+				incoming = new Uint8Array(buf);
+			} else if (ArrayBuffer.isView(buf)) {
+				incoming = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+			} else {
+				incoming = new Uint8Array(buf);
+			}
+			// Prepend any pending bytes from previous stream call.
+			var bytes;
+			if (this._pending.length > 0) {
+				bytes = new Uint8Array(this._pending.length + incoming.length);
+				bytes.set(this._pending);
+				bytes.set(incoming, this._pending.length);
+				this._pending = [];
+			} else {
+				bytes = incoming;
+			}
+			var start = 0;
+			// BOM handling: strip UTF-8 BOM (EF BB BF) on first decode unless ignoreBOM.
+			// Only attempt BOM detection once we have at least 3 bytes, or on the
+			// final (non-stream) flush. While streaming with fewer than 3 bytes,
+			// defer the check by leaving _bomSeen false.
+			if (!this._bomSeen) {
+				if (bytes.length >= 3) {
+					// We have enough bytes to make the BOM decision.
+					if (!this._ignoreBOM &&
+					    bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+						start = 3;
+					}
+					this._bomSeen = true;
+				} else if (!stream) {
+					// Final flush with < 3 bytes: no BOM possible, mark seen.
+					this._bomSeen = true;
+				}
+				// else: streaming with < 3 bytes — keep _bomSeen false, buffer below.
+			}
+			var result = '';
+			var i = start;
+			while (i < bytes.length) {
+				var b = bytes[i];
+				if (b < 0x80) {
+					result += String.fromCharCode(b);
+					i++;
+				} else if ((b & 0xe0) === 0xc0) {
+					// 2-byte sequence
+					if (i + 1 >= bytes.length) {
+						// Incomplete: need 1 more byte
+						if (stream) { this._pending = Array.from(bytes.subarray(i)); break; }
+						if (this._fatal) throw new TypeError('The encoded data was not valid utf-8');
+						result += '\uFFFD'; i++;
+					} else {
+						var b1 = bytes[i+1];
+						if ((b1 & 0xc0) !== 0x80) {
+							if (this._fatal) throw new TypeError('The encoded data was not valid utf-8');
+							result += '\uFFFD'; i++;
+						} else {
+							result += String.fromCharCode(((b & 0x1f) << 6) | (b1 & 0x3f));
+							i += 2;
+						}
+					}
+				} else if ((b & 0xf0) === 0xe0) {
+					// 3-byte sequence
+					if (i + 2 >= bytes.length) {
+						// Incomplete
+						if (stream) { this._pending = Array.from(bytes.subarray(i)); break; }
+						if (this._fatal) throw new TypeError('The encoded data was not valid utf-8');
+						result += '\uFFFD'; i++;
+					} else {
+						var b1 = bytes[i+1], b2 = bytes[i+2];
+						if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80) {
+							if (this._fatal) throw new TypeError('The encoded data was not valid utf-8');
+							result += '\uFFFD'; i++;
+						} else {
+							result += String.fromCharCode(((b & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f));
+							i += 3;
+						}
+					}
+				} else if ((b & 0xf8) === 0xf0) {
+					// 4-byte sequence
+					if (i + 3 >= bytes.length) {
+						// Incomplete
+						if (stream) { this._pending = Array.from(bytes.subarray(i)); break; }
+						if (this._fatal) throw new TypeError('The encoded data was not valid utf-8');
+						result += '\uFFFD'; i++;
+					} else {
+						var b1 = bytes[i+1], b2 = bytes[i+2], b3 = bytes[i+3];
+						if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80 || (b3 & 0xc0) !== 0x80) {
+							if (this._fatal) throw new TypeError('The encoded data was not valid utf-8');
+							result += '\uFFFD'; i++;
+						} else {
+							var cp = ((b & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
+							result += String.fromCodePoint(cp);
+							i += 4;
+						}
+					}
+				} else {
+					// Invalid lead byte (continuation byte without lead, or 0xF8-0xFF)
+					if (this._fatal) throw new TypeError('The encoded data was not valid utf-8');
+					result += '\uFFFD'; i++;
+				}
 			}
 			return result;
 		}
 	};
-}
 
 globalThis.Headers = Headers;
 globalThis.URL = URL;

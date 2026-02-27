@@ -300,3 +300,28 @@ func TestEncoding_BtoaEmptyString(t *testing.T) {
 		t.Errorf("decoded = %q, want empty", data["decoded"])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2: Unicode / emoji encoding edge case
+// ---------------------------------------------------------------------------
+
+func TestEncoding_Emoji(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const text = "Hello \uD83C\uDF0D\uD83C\uDF89 \u65E5\u672C\u8A9E";
+    const encoded = new TextEncoder().encode(text);
+    const decoded = new TextDecoder().decode(encoded);
+    return new Response(decoded);
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	want := "Hello 🌍🎉 日本語"
+	if string(r.Response.Body) != want {
+		t.Errorf("body = %q, want %q", r.Response.Body, want)
+	}
+}

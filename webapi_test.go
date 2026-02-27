@@ -2003,3 +2003,112 @@ func TestRequest_ArrayBuffer(t *testing.T) {
 		t.Errorf("length = %d, want 5", data.Length)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 edge cases: Headers, Response, Request
+// ---------------------------------------------------------------------------
+
+func TestHeaders_CaseInsensitiveAppend(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const h = new Headers();
+    h.set("Content-Type", "text/plain");
+    h.append("content-type", "text/html");
+    return Response.json({ ct: h.get("content-type") });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		CT string `json:"ct"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Headers.append with same case-insensitive name should produce a
+	// comma-separated value containing both values.
+	if data.CT == "" {
+		t.Fatal("content-type header is empty")
+	}
+	if !containsAll(data.CT, "text/plain", "text/html") {
+		t.Errorf("content-type = %q, want both 'text/plain' and 'text/html'", data.CT)
+	}
+}
+
+// containsAll returns true if s contains all of the given substrings.
+func containsAll(s string, subs ...string) bool {
+	for _, sub := range subs {
+		found := false
+		for i := 0; i <= len(s)-len(sub); i++ {
+			if s[i:i+len(sub)] == sub {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func TestResponse_Redirect(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    return Response.redirect("https://example.com", 302);
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	if r.Response.StatusCode != 302 {
+		t.Errorf("status = %d, want 302", r.Response.StatusCode)
+	}
+	loc := r.Response.Headers["location"]
+	if loc != "https://example.com" {
+		t.Errorf("location = %q, want 'https://example.com'", loc)
+	}
+}
+
+func TestRequest_Clone(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const cloned = request.clone();
+    const t1 = await request.text();
+    const t2 = await cloned.text();
+    return Response.json({ same: t1 === t2, body: t1 });
+  },
+};`
+
+	req := &WorkerRequest{
+		Method:  "POST",
+		URL:     "http://localhost/",
+		Headers: map[string]string{"content-type": "text/plain"},
+		Body:    []byte("test body"),
+	}
+	r := execJS(t, e, source, defaultEnv(), req)
+	assertOK(t, r)
+
+	var data struct {
+		Same bool   `json:"same"`
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Same {
+		t.Error("cloned request body should equal original request body")
+	}
+	if data.Body != "test body" {
+		t.Errorf("body = %q, want 'test body'", data.Body)
+	}
+}

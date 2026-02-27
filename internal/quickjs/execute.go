@@ -106,6 +106,12 @@ func (e *Engine) CompileAndCache(siteID string, deployKey string, source string)
 	}
 	v.Free()
 
+	// Invalidate any existing pool so the next Execute creates a fresh one
+	// with the new source. Without this, a cached pool from a previous
+	// CompileAndCache call would continue executing the old source.
+	if val, ok := e.pools.Load(key); ok {
+		val.(*sitePool).markInvalid()
+	}
 	e.sources.Store(key, source)
 	return []byte(source), nil
 }

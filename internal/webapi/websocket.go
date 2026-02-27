@@ -19,11 +19,12 @@ const WsConnectionTimeout = 5 * time.Minute
 const MaxWSMessageBytes = 64 * 1024
 
 // webSocketJS defines the WebSocket and WebSocketPair classes available to workers.
-const webSocketJS = `
+// Note: the string is split to avoid a backtick inside a Go raw string literal.
+var webSocketJS = `
 (function() {
 
 class WebSocket {
-	constructor(url) {
+	constructor(url, protocols) {
 		this._listeners = {};
 		this._readyState = 0;
 		this._url = url || '';
@@ -31,6 +32,32 @@ class WebSocket {
 		this._extensions = '';
 		this._peer = null;
 		this.binaryType = 'arraybuffer';
+
+		// Normalize protocols to an array.
+		if (protocols === undefined || protocols === null) {
+			protocols = [];
+		} else if (typeof protocols === 'string') {
+			protocols = [protocols];
+		}
+
+		// Validate each protocol token: must be non-empty and contain only
+		// valid HTTP token characters (RFC 7230 §3.2.6 / WHATWG WebSocket spec).
+		var validToken = /^[!#$%&'*+\-.0-9A-Za-z^_` + "`" + `|~]+$/;
+		for (var i = 0; i < protocols.length; i++) {
+			var p = protocols[i];
+			if (typeof p !== 'string' || p.length === 0 || !validToken.test(p)) {
+				throw new SyntaxError('Invalid protocol: ' + p);
+			}
+		}
+
+		// Reject duplicate protocols.
+		var seen = {};
+		for (var j = 0; j < protocols.length; j++) {
+			if (seen[protocols[j]]) throw new SyntaxError('Duplicate protocol: ' + protocols[j]);
+			seen[protocols[j]] = true;
+		}
+
+		this._protocols = protocols;
 	}
 
 	accept() {
@@ -71,6 +98,18 @@ class WebSocket {
 
 	close(code, reason) {
 		if (this._readyState >= 2) return;
+		if (code !== undefined) {
+			code = Number(code);
+			if (code !== 1000 && !(code >= 3000 && code <= 4999)) {
+				throw new DOMException('Invalid close code: ' + code, 'InvalidAccessError');
+			}
+		}
+		if (reason !== undefined && reason !== '') {
+			var reasonBytes = new TextEncoder().encode(String(reason));
+			if (reasonBytes.byteLength > 123) {
+				throw new SyntaxError('Close reason must not exceed 123 UTF-8 bytes');
+			}
+		}
 		this._readyState = 2;
 		if (!this._isHTTPBridged && this._peer && this._peer._readyState < 2) {
 			var peer = this._peer;

@@ -177,7 +177,7 @@ func (el *EventLoop) Drain(rt core.JSRuntime, deadline time.Time) {
 			if t.cleared {
 				continue
 			}
-			if next == nil || t.deadline.Before(next.deadline) {
+			if next == nil || t.deadline.Before(next.deadline) || (t.deadline.Equal(next.deadline) && t.id < next.id) {
 				next = t
 			}
 		}
