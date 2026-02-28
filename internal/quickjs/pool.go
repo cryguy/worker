@@ -138,6 +138,14 @@ func newQJSWorker(source string, setupFns []setupFunc, memoryLimitMB int) (*qjsW
 	}
 
 	rt := &qjsRuntime{vm: vm}
+
+	// Extract C API pointers before setup functions, since
+	// SetupStorage and SetupCrypto check for BinaryTransferer.
+	if err := rt.initBinaryTransfer(); err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("init binary transfer: %w", err)
+	}
+
 	el := eventloop.New()
 
 	for _, setup := range setupFns {
