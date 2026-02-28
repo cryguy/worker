@@ -10,7 +10,7 @@ import (
 
 	esbuild "github.com/evanw/esbuild/pkg/api"
 
-	"github.com/cryguy/worker/internal/webapi"
+	"github.com/cryguy/worker/v2/internal/webapi"
 )
 
 // DataDir is the base directory for cached polyfills. Defaults to "./data".

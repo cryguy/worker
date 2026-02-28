@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"strconv"
 
-	"github.com/cryguy/worker/internal/core"
+	"github.com/cryguy/worker/v2/internal/core"
 	v8 "github.com/tommie/v8go"
 )
 

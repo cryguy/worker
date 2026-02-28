@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"net/url"
 
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // webAPIsJS defines the Web API classes (Headers, Request, Response, URL,

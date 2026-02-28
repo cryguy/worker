@@ -5,7 +5,7 @@ package quickjs
 import (
 	"fmt"
 
-	"github.com/cryguy/worker/internal/core"
+	"github.com/cryguy/worker/v2/internal/core"
 	"modernc.org/quickjs"
 )
 

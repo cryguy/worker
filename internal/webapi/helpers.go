@@ -1,6 +1,6 @@
 package webapi
 
-import "github.com/cryguy/worker/internal/core"
+import "github.com/cryguy/worker/v2/internal/core"
 
 // GetReqIDFromJS reads the __requestID global and parses it to uint64.
 func GetReqIDFromJS(rt core.JSRuntime) uint64 {

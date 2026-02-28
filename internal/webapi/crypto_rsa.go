@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // CryptoHashFromAlgo returns the crypto.Hash for the given algorithm name.

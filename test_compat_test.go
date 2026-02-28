@@ -17,8 +17,8 @@ import (
 
 	gohtml "golang.org/x/net/html"
 
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/webapi"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/webapi"
 )
 
 // ---------------------------------------------------------------------------

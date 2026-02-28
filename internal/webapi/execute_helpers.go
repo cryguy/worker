@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cryguy/worker/internal/core"
+	"github.com/cryguy/worker/v2/internal/core"
 )
 
 // GoRequestToJS converts a Go WorkerRequest into a JS Request object

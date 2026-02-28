@@ -8,8 +8,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // aesKeyWrap implements RFC 3394 AES Key Wrap.

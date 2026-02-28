@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // durableObjectID generates a deterministic hex ID from a namespace and name.

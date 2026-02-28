@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // cryptoEd25519JS patches crypto.subtle to support Ed25519 sign/verify/import/export/generate.

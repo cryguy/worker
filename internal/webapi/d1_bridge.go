@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cryguy/worker/internal/core"
+	"github.com/cryguy/worker/v2/internal/core"
 
 	// Pure-Go SQLite driver for database/sql (used by D1Bridge).
 	_ "github.com/glebarez/sqlite"

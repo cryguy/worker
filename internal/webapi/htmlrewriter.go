@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	gohtml "golang.org/x/net/html"
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // maxHTMLRewriterHandlers caps the number of selector handlers to prevent CPU DoS.

@@ -14,8 +14,8 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // cryptoExtJS patches crypto.subtle with JWK import/export, ECDSA, generateKey,

@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"hash"
 
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // cryptoJS wires up the global crypto object with getRandomValues and randomUUID

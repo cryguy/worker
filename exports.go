@@ -1,6 +1,6 @@
 package worker
 
-import "github.com/cryguy/worker/internal/core"
+import "github.com/cryguy/worker/v2/internal/core"
 
 // Type aliases re-exporting internal/core types so downstream code
 // can use worker.WorkerRequest, worker.Env, etc. without importing

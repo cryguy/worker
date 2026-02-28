@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cryguy/worker/internal/webapi"
+	"github.com/cryguy/worker/v2/internal/webapi"
 )
 
 func TestIsPrivateIP(t *testing.T) {

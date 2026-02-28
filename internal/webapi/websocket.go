@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // WsConnectionTimeout is the maximum duration for a WebSocket connection.

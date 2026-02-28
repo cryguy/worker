@@ -7,8 +7,8 @@ import (
 	"hash"
 	"math"
 
-	"github.com/cryguy/worker/internal/core"
-	"github.com/cryguy/worker/internal/eventloop"
+	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 )
 
 // hkdfDeriveBits implements HKDF (RFC 5869) Extract+Expand.

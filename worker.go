@@ -1,6 +1,6 @@
 package worker
 
-import "github.com/cryguy/worker/internal/core"
+import "github.com/cryguy/worker/v2/internal/core"
 
 // Engine wraps a backend JS engine (QuickJS by default, V8 with -tags v8).
 type Engine struct {

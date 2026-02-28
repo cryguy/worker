@@ -1,4 +1,4 @@
-module github.com/cryguy/worker
+module github.com/cryguy/worker/v2
 
 go 1.25
 

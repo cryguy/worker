@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/cryguy/worker/internal/webapi"
+	"github.com/cryguy/worker/v2/internal/webapi"
 )
 
 const maxEventSources = 10

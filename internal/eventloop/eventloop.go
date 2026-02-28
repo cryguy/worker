@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cryguy/worker/internal/core"
+	"github.com/cryguy/worker/v2/internal/core"
 )
 
 // FetchResult holds the pre-serialized outcome of an in-flight HTTP fetch.
