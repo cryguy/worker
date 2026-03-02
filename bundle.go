@@ -49,6 +49,14 @@ var (
 // If the source doesn't contain any import statements, it's returned as-is
 // to avoid unnecessary processing.
 func BundleWorkerScript(deployPath string) (string, error) {
+	if !filepath.IsAbs(deployPath) {
+		abs, err := filepath.Abs(deployPath)
+		if err != nil {
+			return "", fmt.Errorf("resolving absolute path for %q: %w", deployPath, err)
+		}
+		deployPath = abs
+	}
+
 	entryPoint := filepath.Join(deployPath, "_worker.js")
 
 	source, err := os.ReadFile(entryPoint)
