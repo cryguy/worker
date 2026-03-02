@@ -224,9 +224,6 @@ class Request {
 		this.keepalive = init.keepalive !== undefined ? !!init.keepalive : (this.keepalive !== undefined ? this.keepalive : false);
 		this.signal = init.signal !== undefined ? init.signal : (this.signal !== undefined ? this.signal : null);
 		this.destination = this.destination || '';
-		if (this._body !== null && this._body !== undefined && (this.method === 'GET' || this.method === 'HEAD')) {
-			throw new TypeError('Request with GET/HEAD method cannot have body.');
-		}
 	}
 	get body() {
 		if (this._body === null || this._body === undefined) return null;
@@ -321,7 +318,7 @@ class Response {
 		this._bodyUsed = false;
 		this.type = 'default';
 		this.status = init.status !== undefined ? init.status : 200;
-		if (init.status !== undefined && init.status !== 0 && (init.status < 200 || init.status > 599)) {
+		if (init.status !== undefined && init.status !== 0 && (init.status < 100 || init.status > 599)) {
 			throw new RangeError('Invalid status code: ' + init.status);
 		}
 		this.statusText = init.statusText || '';

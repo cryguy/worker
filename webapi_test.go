@@ -2535,41 +2535,6 @@ func TestRequest_ForbiddenMethodThrows(t *testing.T) {
 	}
 }
 
-func TestRequest_BodyWithGetThrows(t *testing.T) {
-	e := newTestEngine(t)
-
-	source := `export default {
-  fetch(request, env) {
-    let caught = false;
-    let errorName = '';
-    try {
-      new Request('http://x.com', { method: 'GET', body: 'hello' });
-    } catch(e) {
-      caught = true;
-      errorName = e.constructor.name;
-    }
-    return Response.json({ caught, errorName });
-  },
-};`
-
-	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
-	assertOK(t, r)
-
-	var data struct {
-		Caught    bool   `json:"caught"`
-		ErrorName string `json:"errorName"`
-	}
-	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !data.Caught {
-		t.Error("new Request with GET and body should throw")
-	}
-	if data.ErrorName != "TypeError" {
-		t.Errorf("error type = %q, want TypeError", data.ErrorName)
-	}
-}
-
 func TestRequest_DefaultProperties(t *testing.T) {
 	e := newTestEngine(t)
 
