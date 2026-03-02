@@ -37,6 +37,7 @@ class Headers {
 	entries() { return Object.entries(this._map)[Symbol.iterator](); }
 	keys() { return Object.keys(this._map)[Symbol.iterator](); }
 	values() { return Object.values(this._map)[Symbol.iterator](); }
+	[Symbol.iterator]() { return this.entries(); }
 }
 
 class URL {
@@ -97,6 +98,7 @@ class URLSearchParams {
 	entries() { return this._entries[Symbol.iterator](); }
 	keys() { return this._entries.map(([k]) => k)[Symbol.iterator](); }
 	values() { return this._entries.map(([, v]) => v)[Symbol.iterator](); }
+	[Symbol.iterator]() { return this.entries(); }
 }
 
 class Request {

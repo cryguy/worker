@@ -226,6 +226,150 @@ func TestURLSearchParams_URLIntegration(t *testing.T) {
 	}
 }
 
+func TestURLSearchParams_SymbolIterator(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const p = new URLSearchParams("a=1&b=2&c=3");
+    const pairs = [];
+    for (const [k, v] of p) {
+      pairs.push(k + "=" + v);
+    }
+    return Response.json({ result: pairs.join(",") });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Result != "a=1,b=2,c=3" {
+		t.Errorf("URLSearchParams iterator: got %q, want %q", data.Result, "a=1,b=2,c=3")
+	}
+}
+
+func TestURLSearchParams_SpreadOperator(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const p = new URLSearchParams("x=10&y=20");
+    const arr = [...p];
+    return Response.json({ length: arr.length, first: arr[0], second: arr[1] });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Length int      `json:"length"`
+		First  []string `json:"first"`
+		Second []string `json:"second"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Length != 2 {
+		t.Errorf("spread length: got %d, want 2", data.Length)
+	}
+	if len(data.First) != 2 || data.First[0] != "x" || data.First[1] != "10" {
+		t.Errorf("spread first: got %v, want [x 10]", data.First)
+	}
+}
+
+func TestHeaders_SymbolIterator(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const h = new Headers({ "content-type": "text/plain", "x-custom": "hello" });
+    const pairs = [];
+    for (const [k, v] of h) {
+      pairs.push(k + ":" + v);
+    }
+    pairs.sort();
+    return Response.json({ result: pairs.join(",") });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Result != "content-type:text/plain,x-custom:hello" {
+		t.Errorf("Headers iterator: got %q, want %q", data.Result, "content-type:text/plain,x-custom:hello")
+	}
+}
+
+func TestHeaders_SpreadOperator(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const h = new Headers({ "a": "1" });
+    const arr = [...h];
+    return Response.json({ length: arr.length, entry: arr[0] });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Length int      `json:"length"`
+		Entry  []string `json:"entry"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Length != 1 {
+		t.Errorf("spread length: got %d, want 1", data.Length)
+	}
+	if len(data.Entry) != 2 || data.Entry[0] != "a" || data.Entry[1] != "1" {
+		t.Errorf("spread entry: got %v, want [a 1]", data.Entry)
+	}
+}
+
+func TestURLSearchParams_URLSearchParamsIterable(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const url = new URL("https://example.com/?a=1&b=2");
+    const pairs = [];
+    for (const [k, v] of url.searchParams) {
+      pairs.push(k + "=" + v);
+    }
+    return Response.json({ result: pairs.join(",") });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Result != "a=1,b=2" {
+		t.Errorf("url.searchParams iterator: got %q, want %q", data.Result, "a=1,b=2")
+	}
+}
+
 func TestURLSearchParams_CombinedMutations(t *testing.T) {
 	e := newTestEngine(t)
 
