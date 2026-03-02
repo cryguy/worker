@@ -1190,6 +1190,71 @@ func TestWebSocketPair_Iterable(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestWebSocket_BufferedAmount(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    var pair = new WebSocketPair();
+    return Response.json({
+      clientBuffered: pair[0].bufferedAmount,
+      serverBuffered: pair[1].bufferedAmount,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		ClientBuffered int `json:"clientBuffered"`
+		ServerBuffered int `json:"serverBuffered"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.ClientBuffered != 0 {
+		t.Errorf("client bufferedAmount = %d, want 0", data.ClientBuffered)
+	}
+	if data.ServerBuffered != 0 {
+		t.Errorf("server bufferedAmount = %d, want 0", data.ServerBuffered)
+	}
+}
+
+func TestWebSocket_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    var pair = new WebSocketPair();
+    var wsTag = Object.prototype.toString.call(pair[0]);
+    var pairTag = Object.prototype.toString.call(pair);
+    return Response.json({ wsTag, pairTag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		WsTag   string `json:"wsTag"`
+		PairTag string `json:"pairTag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.WsTag != "[object WebSocket]" {
+		t.Errorf("WebSocket tag = %q, want '[object WebSocket]'", data.WsTag)
+	}
+	if data.PairTag != "[object WebSocketPair]" {
+		t.Errorf("WebSocketPair tag = %q, want '[object WebSocketPair]'", data.PairTag)
+	}
+}
+
 // setupWSTestContext creates a V8 context with WebSocket setup for direct callback testing.
 func setupWSTestContext(t *testing.T) (*v8.Isolate, *v8.Context, *eventLoop) {
 	t.Helper()

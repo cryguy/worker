@@ -822,3 +822,79 @@ func TestBody_ContentLengthString(t *testing.T) {
 		t.Errorf("body = %q, want 'hello'", r.Response.Body)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Body blob() method tests
+// ---------------------------------------------------------------------------
+
+func TestBodyTypes_ResponseBlob(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const r = new Response('hello world', { headers: { 'content-type': 'text/plain' } });
+    const blob = await r.blob();
+    const text = await blob.text();
+    return Response.json({ text, type: blob.type, size: blob.size });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Text string `json:"text"`
+		Type string `json:"type"`
+		Size int    `json:"size"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Text != "hello world" {
+		t.Errorf("blob text = %q, want 'hello world'", data.Text)
+	}
+	if data.Type != "text/plain" {
+		t.Errorf("blob type = %q, want 'text/plain'", data.Type)
+	}
+	if data.Size != 11 {
+		t.Errorf("blob size = %d, want 11", data.Size)
+	}
+}
+
+func TestBodyTypes_RequestBlob(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const req = new Request('https://example.com', {
+      method: 'POST',
+      body: 'request blob data',
+      headers: { 'content-type': 'application/octet-stream' },
+    });
+    const blob = await req.blob();
+    const text = await blob.text();
+    return Response.json({ text, type: blob.type, size: blob.size });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Text string `json:"text"`
+		Type string `json:"type"`
+		Size int    `json:"size"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Text != "request blob data" {
+		t.Errorf("blob text = %q, want 'request blob data'", data.Text)
+	}
+	if data.Type != "application/octet-stream" {
+		t.Errorf("blob type = %q, want 'application/octet-stream'", data.Type)
+	}
+	if data.Size != 17 {
+		t.Errorf("blob size = %d, want 17", data.Size)
+	}
+}

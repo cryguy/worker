@@ -396,3 +396,279 @@ func TestURLSearchParams_CombinedMutations(t *testing.T) {
 		t.Errorf("combined: got %q, want %q", data.Result, "a=99&c=4")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URLSearchParams constructor from array of pairs
+// ---------------------------------------------------------------------------
+
+func TestURLSearchParams_ConstructorFromArray(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const p = new URLSearchParams([['a', '1'], ['b', '2']]);
+    return Response.json({
+      str: p.toString(),
+      a: p.get('a'),
+      b: p.get('b'),
+      size: p.size,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Str  string `json:"str"`
+		A    string `json:"a"`
+		B    string `json:"b"`
+		Size int    `json:"size"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Str != "a=1&b=2" {
+		t.Errorf("toString() = %q, want %q", data.Str, "a=1&b=2")
+	}
+	if data.A != "1" {
+		t.Errorf("get('a') = %q, want %q", data.A, "1")
+	}
+	if data.B != "2" {
+		t.Errorf("get('b') = %q, want %q", data.B, "2")
+	}
+	if data.Size != 2 {
+		t.Errorf("size = %d, want 2", data.Size)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URLSearchParams constructor from object
+// ---------------------------------------------------------------------------
+
+func TestURLSearchParams_ConstructorFromObject(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const p = new URLSearchParams({a: '1', b: '2'});
+    return Response.json({
+      a: p.get('a'),
+      b: p.get('b'),
+      size: p.size,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		A    string `json:"a"`
+		B    string `json:"b"`
+		Size int    `json:"size"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.A != "1" {
+		t.Errorf("get('a') = %q, want %q", data.A, "1")
+	}
+	if data.B != "2" {
+		t.Errorf("get('b') = %q, want %q", data.B, "2")
+	}
+	if data.Size != 2 {
+		t.Errorf("size = %d, want 2", data.Size)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URLSearchParams constructor from existing USP (copy)
+// ---------------------------------------------------------------------------
+
+func TestURLSearchParams_ConstructorFromUSP(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const original = new URLSearchParams('a=1&b=2');
+    const copy = new URLSearchParams(original);
+    copy.set('a', '99');
+    return Response.json({
+      originalA: original.get('a'),
+      copyA: copy.get('a'),
+      originalStr: original.toString(),
+      copyStr: copy.toString(),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		OriginalA   string `json:"originalA"`
+		CopyA       string `json:"copyA"`
+		OriginalStr string `json:"originalStr"`
+		CopyStr     string `json:"copyStr"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.OriginalA != "1" {
+		t.Errorf("original.get('a') = %q, want %q", data.OriginalA, "1")
+	}
+	if data.CopyA != "99" {
+		t.Errorf("copy.get('a') = %q, want %q", data.CopyA, "99")
+	}
+	if data.OriginalStr != "a=1&b=2" {
+		t.Errorf("original.toString() = %q, want %q", data.OriginalStr, "a=1&b=2")
+	}
+	if data.CopyStr != "a=99&b=2" {
+		t.Errorf("copy.toString() = %q, want %q", data.CopyStr, "a=99&b=2")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URLSearchParams.size
+// ---------------------------------------------------------------------------
+
+func TestURLSearchParams_Size(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const p = new URLSearchParams('a=1&b=2&c=3');
+    return Response.json({
+      size: p.size,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Size int `json:"size"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Size != 3 {
+		t.Errorf("size = %d, want 3", data.Size)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URLSearchParams.has(name, value)
+// ---------------------------------------------------------------------------
+
+func TestURLSearchParams_HasWithValue(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const p = new URLSearchParams('a=1&b=2&a=3');
+    return Response.json({
+      hasA1: p.has('a', '1'),
+      hasA3: p.has('a', '3'),
+      hasAWrong: p.has('a', 'wrong'),
+      hasA: p.has('a'),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		HasA1     bool `json:"hasA1"`
+		HasA3     bool `json:"hasA3"`
+		HasAWrong bool `json:"hasAWrong"`
+		HasA      bool `json:"hasA"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.HasA1 {
+		t.Error("has('a', '1') should be true")
+	}
+	if !data.HasA3 {
+		t.Error("has('a', '3') should be true")
+	}
+	if data.HasAWrong {
+		t.Error("has('a', 'wrong') should be false")
+	}
+	if !data.HasA {
+		t.Error("has('a') should be true")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URLSearchParams.delete(name, value)
+// ---------------------------------------------------------------------------
+
+func TestURLSearchParams_DeleteWithValue(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const p = new URLSearchParams('a=1&b=2&a=3');
+    p.delete('a', '1');
+    return Response.json({
+      str: p.toString(),
+      hasA: p.has('a'),
+      getA: p.get('a'),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Str  string  `json:"str"`
+		HasA bool    `json:"hasA"`
+		GetA *string `json:"getA"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Str != "b=2&a=3" {
+		t.Errorf("toString() = %q, want %q", data.Str, "b=2&a=3")
+	}
+	if !data.HasA {
+		t.Error("has('a') should still be true (a=3 remains)")
+	}
+	if data.GetA == nil || *data.GetA != "3" {
+		t.Errorf("get('a') = %v, want '3'", data.GetA)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URLSearchParams Symbol.toStringTag
+// ---------------------------------------------------------------------------
+
+func TestURLSearchParams_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const tag = Object.prototype.toString.call(new URLSearchParams());
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object URLSearchParams]" {
+		t.Errorf("toStringTag = %q, want %q", data.Tag, "[object URLSearchParams]")
+	}
+}

@@ -68,7 +68,8 @@ globalThis.__makeAssets = function() {
 						url = input.url || '';
 						method = input.method || 'GET';
 						if (input.headers && input.headers._map) {
-							headers = input.headers._map;
+							var m = input.headers._map;
+							for (var hk in m) { if (m.hasOwnProperty(hk)) headers[hk] = Array.isArray(m[hk]) ? m[hk].join(', ') : m[hk]; }
 						}
 						body = input._bodyStr || null;
 					}

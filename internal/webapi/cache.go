@@ -80,7 +80,7 @@ class Cache {
 				response.headers.forEach(function(v, k) { hdrs[k] = v; });
 			} else if (response.headers._map) {
 				var m = response.headers._map;
-				for (var k in m) { if (m.hasOwnProperty(k)) hdrs[k] = String(m[k]); }
+				for (var k in m) { if (m.hasOwnProperty(k)) hdrs[k] = Array.isArray(m[k]) ? m[k].join(', ') : String(m[k]); }
 			}
 		}
 
@@ -117,6 +117,35 @@ class Cache {
 		var result = __cache_delete(reqID, this._name, url);
 		return Promise.resolve(result === 'true' || result === true);
 	}
+
+	async matchAll(request, options) {
+		if (!request) {
+			return [];
+		}
+		var url = typeof request === 'string' ? request : request.url;
+		var result = await this.match(url, options);
+		return result ? [result] : [];
+	}
+
+	async keys(request, options) {
+		if (!request) {
+			return [];
+		}
+		var url = typeof request === 'string' ? request : request.url;
+		var result = await this.match(url, options);
+		return result ? [new Request(url)] : [];
+	}
+
+	async add(request) {
+		var req = typeof request === 'string' ? new Request(request) : request;
+		var response = await fetch(req);
+		if (!response.ok) throw new TypeError('Bad response status');
+		return this.put(req, response);
+	}
+
+	async addAll(requests) {
+		await Promise.all(requests.map(r => this.add(r)));
+	}
 }
 
 class CacheStorage {
@@ -130,6 +159,31 @@ class CacheStorage {
 			this._caches[name] = new Cache(name);
 		}
 		return Promise.resolve(this._caches[name]);
+	}
+
+	async has(cacheName) {
+		return cacheName in this._caches;
+	}
+
+	async delete(cacheName) {
+		if (cacheName in this._caches) {
+			delete this._caches[cacheName];
+			return true;
+		}
+		return false;
+	}
+
+	async keys() {
+		return Object.keys(this._caches);
+	}
+
+	async match(request, options) {
+		for (var name in this._caches) {
+			if (!this._caches.hasOwnProperty(name)) continue;
+			var result = await this._caches[name].match(request, options);
+			if (result) return result;
+		}
+		return undefined;
 	}
 }
 

@@ -198,12 +198,8 @@ func TestGlobals_StructuredCloneRejectsUndefined(t *testing.T) {
 
 	source := `export default {
   fetch(request, env) {
-    try {
-      structuredClone(undefined);
-      return Response.json({ threw: false });
-    } catch(e) {
-      return Response.json({ threw: true, name: e.name });
-    }
+    var result = structuredClone(undefined);
+    return Response.json({ isUndefined: result === undefined });
   },
 };`
 
@@ -211,14 +207,13 @@ func TestGlobals_StructuredCloneRejectsUndefined(t *testing.T) {
 	assertOK(t, r)
 
 	var data struct {
-		Threw bool   `json:"threw"`
-		Name  string `json:"name"`
+		IsUndefined bool `json:"isUndefined"`
 	}
 	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
 		t.Fatal(err)
 	}
-	if !data.Threw {
-		t.Error("structuredClone(undefined) should throw")
+	if !data.IsUndefined {
+		t.Error("structuredClone(undefined) should return undefined")
 	}
 }
 
@@ -428,19 +423,18 @@ func TestGlobals_StructuredCloneRejectsSymbol(t *testing.T) {
 	}
 }
 
-func TestGlobals_StructuredCloneCircularThrows(t *testing.T) {
+func TestGlobals_StructuredCloneCircularResolved(t *testing.T) {
 	e := newTestEngine(t)
 
 	source := `export default {
   fetch(request, env) {
-    try {
-      var obj = {};
-      obj.self = obj;
-      structuredClone(obj);
-      return Response.json({ threw: false });
-    } catch(e) {
-      return Response.json({ threw: true, name: e.name });
-    }
+    var obj = { name: 'root' };
+    obj.self = obj;
+    var cloned = structuredClone(obj);
+    return Response.json({
+      name: cloned.name,
+      hasSelf: cloned.self === cloned,
+    });
   },
 };`
 
@@ -448,13 +442,17 @@ func TestGlobals_StructuredCloneCircularThrows(t *testing.T) {
 	assertOK(t, r)
 
 	var data struct {
-		Threw bool `json:"threw"`
+		Name    string `json:"name"`
+		HasSelf bool   `json:"hasSelf"`
 	}
 	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
 		t.Fatal(err)
 	}
-	if !data.Threw {
-		t.Error("structuredClone with circular reference should throw DataCloneError")
+	if data.Name != "root" {
+		t.Errorf("cloned.name = %q, want 'root'", data.Name)
+	}
+	if !data.HasSelf {
+		t.Error("structuredClone with circular reference should preserve self-reference")
 	}
 }
 
@@ -871,6 +869,73 @@ func TestGlobals_StructuredCloneInt32Array(t *testing.T) {
 	}
 	if !data.Independent {
 		t.Error("cloned Int32Array should be independent of original")
+	}
+}
+
+func TestGlobals_StructuredCloneTransferOption(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    try {
+      const result = structuredClone({a: 1}, {transfer: []});
+      return Response.json({ ok: true, a: result.a });
+    } catch(e) {
+      return Response.json({ ok: false, error: e.message });
+    }
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		OK bool `json:"ok"`
+		A  int  `json:"a"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.OK {
+		t.Error("structuredClone({a:1}, {transfer: []}) should not throw")
+	}
+	if data.A != 1 {
+		t.Errorf("a = %d, want 1", data.A)
+	}
+}
+
+func TestGlobals_PerformanceTimeOrigin(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    return Response.json({
+      hasTimeOrigin: 'timeOrigin' in performance,
+      typeOf: typeof performance.timeOrigin,
+      positive: performance.timeOrigin > 0,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		HasTimeOrigin bool   `json:"hasTimeOrigin"`
+		TypeOf        string `json:"typeOf"`
+		Positive      bool   `json:"positive"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.HasTimeOrigin {
+		t.Error("performance should have timeOrigin property")
+	}
+	if data.TypeOf != "number" {
+		t.Errorf("typeof performance.timeOrigin = %q, want 'number'", data.TypeOf)
+	}
+	if !data.Positive {
+		t.Error("performance.timeOrigin should be > 0")
 	}
 }
 

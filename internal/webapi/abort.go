@@ -15,16 +15,25 @@ class Event {
 		this.type = type;
 		this.bubbles = !!(options && options.bubbles);
 		this.cancelable = !!(options && options.cancelable);
+		this.composed = !!(options && options.composed);
+		this.eventPhase = 0;
+		this.isTrusted = false;
 		this.defaultPrevented = false;
 		this.target = null;
 		this.currentTarget = null;
 		this.timeStamp = performance.now();
 	}
+	static get NONE() { return 0; }
+	static get CAPTURING_PHASE() { return 1; }
+	static get AT_TARGET() { return 2; }
+	static get BUBBLING_PHASE() { return 3; }
 	preventDefault() {
 		if (this.cancelable) this.defaultPrevented = true;
 	}
 	stopPropagation() {}
 	stopImmediatePropagation() {}
+	composedPath() { return this.target ? [this.target] : []; }
+	get [Symbol.toStringTag]() { return 'Event'; }
 }
 
 class EventTarget {
@@ -32,52 +41,61 @@ class EventTarget {
 		this._listeners = {};
 	}
 	addEventListener(type, callback, options) {
-		if (typeof callback !== 'function') return;
+		if (!callback) return;
+		if (!this._listeners) this._listeners = {};
 		if (!this._listeners[type]) this._listeners[type] = [];
-		const once = options && options.once;
-		this._listeners[type].push({ callback, once });
+		const opts = typeof options === 'object' ? options : { capture: !!options };
+		const entry = { callback, once: !!opts.once, capture: !!opts.capture };
+		this._listeners[type].push(entry);
+		if (opts.signal) {
+			opts.signal.addEventListener('abort', () => {
+				this.removeEventListener(type, callback, options);
+			});
+		}
 	}
-	removeEventListener(type, callback) {
-		if (!this._listeners[type]) return;
-		this._listeners[type] = this._listeners[type].filter(l => l.callback !== callback);
+	removeEventListener(type, callback, options) {
+		if (!this._listeners || !this._listeners[type]) return;
+		const capture = typeof options === 'object' ? !!options.capture : !!options;
+		this._listeners[type] = this._listeners[type].filter(
+			l => !(l.callback === callback && l.capture === capture)
+		);
 	}
 	dispatchEvent(event) {
 		event.target = this;
-		event.currentTarget = this;
-		const listeners = this._listeners[event.type];
-		if (!listeners) return true;
-		const copy = listeners.slice();
-		for (const entry of copy) {
-			entry.callback.call(this, event);
-			if (entry.once) {
-				this.removeEventListener(event.type, entry.callback);
-			}
+		if (!this._listeners || !this._listeners[event.type]) return true;
+		const listeners = [...this._listeners[event.type]];
+		for (const l of listeners) {
+			l.callback.call(this, event);
+			if (l.once) this.removeEventListener(event.type, l.callback, { capture: l.capture });
 		}
 		return !event.defaultPrevented;
 	}
+	get [Symbol.toStringTag]() { return 'EventTarget'; }
 }
 
 class AbortSignal extends EventTarget {
 	constructor() {
 		super();
-		this.aborted = false;
-		this.reason = undefined;
+		this._aborted = false;
+		this._reason = undefined;
 		this.onabort = null;
 	}
+	get aborted() { return this._aborted; }
+	get reason() { return this._reason; }
 	throwIfAborted() {
-		if (this.aborted) throw this.reason;
+		if (this._aborted) throw this._reason;
 	}
 	static abort(reason) {
 		const signal = new AbortSignal();
-		signal.aborted = true;
-		signal.reason = reason !== undefined ? reason : new DOMException('The operation was aborted.', 'AbortError');
+		signal._aborted = true;
+		signal._reason = reason !== undefined ? reason : new DOMException('The operation was aborted.', 'AbortError');
 		return signal;
 	}
 	static timeout(ms) {
 		const signal = new AbortSignal();
 		setTimeout(function() {
-			signal.aborted = true;
-			signal.reason = new DOMException('The operation timed out.', 'TimeoutError');
+			signal._aborted = true;
+			signal._reason = new DOMException('The operation timed out.', 'TimeoutError');
 			var ev = new Event('abort');
 			if (signal.onabort) signal.onabort(ev);
 			signal.dispatchEvent(ev);
@@ -88,16 +106,16 @@ class AbortSignal extends EventTarget {
 		const signal = new AbortSignal();
 		for (const s of signals) {
 			if (s.aborted) {
-				signal.aborted = true;
-				signal.reason = s.reason;
+				signal._aborted = true;
+				signal._reason = s.reason;
 				return signal;
 			}
 		}
 		for (const s of signals) {
 			s.addEventListener('abort', function() {
-				if (!signal.aborted) {
-					signal.aborted = true;
-					signal.reason = s.reason;
+				if (!signal._aborted) {
+					signal._aborted = true;
+					signal._reason = s.reason;
 					var ev = new Event('abort');
 					if (signal.onabort) signal.onabort(ev);
 					signal.dispatchEvent(ev);
@@ -106,6 +124,7 @@ class AbortSignal extends EventTarget {
 		}
 		return signal;
 	}
+	get [Symbol.toStringTag]() { return 'AbortSignal'; }
 }
 
 class AbortController {
@@ -114,12 +133,13 @@ class AbortController {
 	}
 	abort(reason) {
 		if (this.signal.aborted) return;
-		this.signal.aborted = true;
-		this.signal.reason = reason !== undefined ? reason : new DOMException('The operation was aborted.', 'AbortError');
+		this.signal._aborted = true;
+		this.signal._reason = reason !== undefined ? reason : new DOMException('The operation was aborted.', 'AbortError');
 		var ev = new Event('abort');
 		if (this.signal.onabort) this.signal.onabort(ev);
 		this.signal.dispatchEvent(ev);
 	}
+	get [Symbol.toStringTag]() { return 'AbortController'; }
 }
 
 class DOMException extends Error {
@@ -127,8 +147,18 @@ class DOMException extends Error {
 		super(message || '');
 		this.name = name || 'Error';
 		this.message = message || '';
-		this.code = 0;
+		const codes = {
+			IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+			InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+			NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12,
+			InvalidModificationError: 13, NamespaceError: 14, InvalidAccessError: 15,
+			TypeMismatchError: 17, SecurityError: 18, NetworkError: 19,
+			AbortError: 20, URLMismatchError: 21, QuotaExceededError: 22,
+			TimeoutError: 23, DataCloneError: 25
+		};
+		this.code = codes[this.name] || 0;
 	}
+	get [Symbol.toStringTag]() { return 'DOMException'; }
 }
 
 class ScheduledEvent extends Event {

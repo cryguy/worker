@@ -17,26 +17,37 @@ class Headers {
 		this._map = {};
 		if (init) {
 			if (init instanceof Headers) {
-				for (const [k, v] of Object.entries(init._map)) this._map[k] = v;
+				for (const [k, v] of init.entries()) {
+					const key = k.toLowerCase();
+					if (!this._map[key]) this._map[key] = [];
+					this._map[key].push(v);
+				}
 			} else if (Array.isArray(init)) {
-				for (const [k, v] of init) this._map[k.toLowerCase()] = String(v);
+				for (const [k, v] of init) {
+					const key = k.toLowerCase();
+					if (!this._map[key]) this._map[key] = [];
+					this._map[key].push(String(v));
+				}
 			} else {
-				for (const [k, v] of Object.entries(init)) this._map[k.toLowerCase()] = String(v);
+				for (const [k, v] of Object.entries(init)) this._map[k.toLowerCase()] = [String(v)];
 			}
 		}
 	}
-	get(name) { return this._map[name.toLowerCase()] ?? null; }
-	set(name, value) { this._map[name.toLowerCase()] = String(value); }
+	get(name) { return this._map[name.toLowerCase()]?.join(', ') ?? null; }
+	set(name, value) { this._map[name.toLowerCase()] = [String(value)]; }
 	has(name) { return name.toLowerCase() in this._map; }
 	delete(name) { delete this._map[name.toLowerCase()]; }
 	append(name, value) {
 		const key = name.toLowerCase();
-		this._map[key] = this._map[key] ? this._map[key] + ', ' + String(value) : String(value);
+		if (!this._map[key]) this._map[key] = [];
+		this._map[key].push(String(value));
 	}
-	forEach(cb) { for (const [k, v] of Object.entries(this._map)) cb(v, k, this); }
-	entries() { return Object.entries(this._map)[Symbol.iterator](); }
+	forEach(cb) { for (const [k, vs] of Object.entries(this._map)) cb(vs.join(', '), k, this); }
+	entries() { return Object.entries(this._map).map(([k, vs]) => [k, vs.join(', ')])[Symbol.iterator](); }
 	keys() { return Object.keys(this._map)[Symbol.iterator](); }
-	values() { return Object.values(this._map)[Symbol.iterator](); }
+	values() { return Object.entries(this._map).map(([, vs]) => vs.join(', '))[Symbol.iterator](); }
+	getSetCookie() { return [...(this._map['set-cookie'] || [])]; }
+	get [Symbol.toStringTag]() { return 'Headers'; }
 	[Symbol.iterator]() { return this.entries(); }
 }
 
@@ -44,21 +55,82 @@ class URL {
 	constructor(input, base) {
 		const parsed = JSON.parse(__parseURL(input, base || ''));
 		if (parsed.error) throw new TypeError(parsed.error);
-		this.href = parsed.href;
-		this.protocol = parsed.protocol;
-		this.hostname = parsed.hostname;
-		this.port = parsed.port;
-		this.pathname = parsed.pathname;
-		this.search = parsed.search;
-		this.hash = parsed.hash;
-		this.origin = parsed.origin;
-		this.host = parsed.host;
-		this.username = parsed.username || '';
-		this.password = parsed.password || '';
-		this.searchParams = new URLSearchParams(this.search);
-		this.searchParams._url = this;
+		this._protocol = parsed.protocol;
+		this._hostname = parsed.hostname;
+		this._port = parsed.port;
+		this._pathname = parsed.pathname;
+		this._search = parsed.search;
+		this._hash = parsed.hash;
+		this._origin = parsed.origin;
+		this._host = parsed.host;
+		this._username = parsed.username || '';
+		this._password = parsed.password || '';
+		this._href = parsed.href;
+		this._buildHref();
+		this._searchParams = new URLSearchParams(this._search);
+		this._searchParams._url = this;
+	}
+	_buildHref() {
+		let userInfo = '';
+		if (this._username) {
+			userInfo = this._username + (this._password ? ':' + this._password : '') + '@';
+		}
+		this._host = this._port ? this._hostname + ':' + this._port : this._hostname;
+		this._origin = this._protocol + '//' + this._host;
+		this._href = this._protocol + '//' + userInfo + this._host + this._pathname + this._search + this._hash;
+	}
+	get href() { return this._href; }
+	set href(v) {
+		const parsed = JSON.parse(__parseURL(v, ''));
+		if (parsed.error) throw new TypeError(parsed.error);
+		this._protocol = parsed.protocol;
+		this._hostname = parsed.hostname;
+		this._port = parsed.port;
+		this._pathname = parsed.pathname;
+		this._search = parsed.search;
+		this._hash = parsed.hash;
+		this._username = parsed.username || '';
+		this._password = parsed.password || '';
+		this._buildHref();
+		this._rebuildSearchParams();
+	}
+	get protocol() { return this._protocol; }
+	set protocol(v) { this._protocol = v; this._buildHref(); }
+	get hostname() { return this._hostname; }
+	set hostname(v) { this._hostname = v; this._buildHref(); }
+	get port() { return this._port; }
+	set port(v) { this._port = String(v); this._buildHref(); }
+	get pathname() { return this._pathname; }
+	set pathname(v) { this._pathname = v; this._buildHref(); }
+	get search() { return this._search; }
+	set search(v) {
+		this._search = v;
+		this._buildHref();
+		this._rebuildSearchParams();
+	}
+	get hash() { return this._hash; }
+	set hash(v) { this._hash = v; this._buildHref(); }
+	get origin() { return this._origin; }
+	get host() { return this._host; }
+	get username() { return this._username; }
+	set username(v) { this._username = v; this._buildHref(); }
+	get password() { return this._password; }
+	set password(v) { this._password = v; this._buildHref(); }
+	get searchParams() { return this._searchParams; }
+	_rebuildSearchParams() {
+		if (!this._searchParams) return;
+		this._searchParams._entries = [];
+		const s = this._search.startsWith('?') ? this._search.slice(1) : this._search;
+		if (s) {
+			for (const pair of s.split('&')) {
+				const [k, ...rest] = pair.split('=');
+				this._searchParams._entries.push([decodeURIComponent(k.replace(/\+/g, '%20')), decodeURIComponent(rest.join('=').replace(/\+/g, '%20'))]);
+			}
+		}
 	}
 	toString() { return this.href; }
+	toJSON() { return this.href; }
+	get [Symbol.toStringTag]() { return 'URL'; }
 	static canParse(url, base) {
 		try {
 			if (url === null || url === undefined) {
@@ -78,7 +150,13 @@ class URL {
 class URLSearchParams {
 	constructor(init) {
 		this._entries = [];
-		if (typeof init === 'string') {
+		if (init instanceof URLSearchParams) {
+			this._entries = init._entries.map(e => [...e]);
+		} else if (Array.isArray(init)) {
+			for (const pair of init) this._entries.push([String(pair[0]), String(pair[1])]);
+		} else if (typeof init === 'object' && init !== null && !Array.isArray(init) && !(init instanceof URLSearchParams)) {
+			for (const [k, v] of Object.entries(init)) this._entries.push([String(k), String(v)]);
+		} else if (typeof init === 'string') {
 			const s = init.startsWith('?') ? init.slice(1) : init;
 			if (s) {
 				for (const pair of s.split('&')) {
@@ -92,23 +170,40 @@ class URLSearchParams {
 		const e = this._entries.find(([k]) => k === name);
 		return e ? e[1] : null;
 	}
-	has(name) { return this._entries.some(([k]) => k === name); }
+	has(name, value) {
+		return arguments.length > 1
+			? this._entries.some(([k, v]) => k === name && v === value)
+			: this._entries.some(([k]) => k === name);
+	}
+	get size() { return this._entries.length; }
 	toString() { return this._entries.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
 	forEach(cb) { for (const [k, v] of this._entries) cb(v, k, this); }
 	entries() { return this._entries[Symbol.iterator](); }
 	keys() { return this._entries.map(([k]) => k)[Symbol.iterator](); }
 	values() { return this._entries.map(([, v]) => v)[Symbol.iterator](); }
+	get [Symbol.toStringTag]() { return 'URLSearchParams'; }
 	[Symbol.iterator]() { return this.entries(); }
 }
 
 class Request {
 	constructor(input, init) {
 		init = init || {};
+		this._bodyUsed = false;
 		if (input instanceof Request) {
 			this.url = input.url;
 			this.method = input.method;
 			this.headers = new Headers(input.headers);
 			this._body = input._body;
+			this.redirect = input.redirect;
+			this.mode = input.mode;
+			this.credentials = input.credentials;
+			this.cache = input.cache;
+			this.referrer = input.referrer;
+			this.referrerPolicy = input.referrerPolicy;
+			this.integrity = input.integrity;
+			this.keepalive = input.keepalive;
+			this.signal = input.signal;
+			this.destination = input.destination;
 		} else {
 			try { this.url = new URL(String(input)).href; } catch(e) { this.url = String(input); }
 			this.method = (init.method || 'GET').toUpperCase();
@@ -118,6 +213,20 @@ class Request {
 		if (init.method) this.method = init.method.toUpperCase();
 		if (init.headers) this.headers = new Headers(init.headers);
 		if (init.body !== undefined) this._body = init.body;
+		if (['CONNECT','TRACE','TRACK'].indexOf(this.method) !== -1) throw new TypeError('Forbidden method: ' + this.method);
+		this.redirect = init.redirect || this.redirect || 'follow';
+		this.mode = init.mode || this.mode || 'cors';
+		this.credentials = init.credentials || this.credentials || 'same-origin';
+		this.cache = init.cache || this.cache || 'default';
+		this.referrer = init.referrer !== undefined ? init.referrer : (this.referrer !== undefined ? this.referrer : 'about:client');
+		this.referrerPolicy = init.referrerPolicy || this.referrerPolicy || '';
+		this.integrity = init.integrity || this.integrity || '';
+		this.keepalive = init.keepalive !== undefined ? !!init.keepalive : (this.keepalive !== undefined ? this.keepalive : false);
+		this.signal = init.signal !== undefined ? init.signal : (this.signal !== undefined ? this.signal : null);
+		this.destination = this.destination || '';
+		if (this._body !== null && this._body !== undefined && (this.method === 'GET' || this.method === 'HEAD')) {
+			throw new TypeError('Request with GET/HEAD method cannot have body.');
+		}
 	}
 	get body() {
 		if (this._body === null || this._body === undefined) return null;
@@ -141,34 +250,87 @@ class Request {
 		return stream;
 	}
 	get bodyUsed() {
-		if (this._body instanceof ReadableStream) return this._body._locked;
-		return false;
+		return this._bodyUsed || (this._body instanceof ReadableStream && this._body._locked);
 	}
-	async text() { return this._body !== null && this._body !== undefined ? String(this._body) : ''; }
+	async text() {
+		if (this._body instanceof ReadableStream) {
+			if (this._bodyUsed) throw new TypeError('body already consumed');
+			this._bodyUsed = true;
+			const reader = this._body.getReader();
+			const chunks = [];
+			while (true) {
+				const {done, value} = await reader.read();
+				if (done) break;
+				chunks.push(value);
+			}
+			const dec = new TextDecoder();
+			return chunks.map(c => dec.decode(c, {stream: true})).join('') + dec.decode();
+		}
+		return this._body !== null && this._body !== undefined ? String(this._body) : '';
+	}
 	async json() { return JSON.parse(await this.text()); }
 	async arrayBuffer() {
-		const t = await this.text();
+		if (this._body instanceof ReadableStream) {
+			if (this._bodyUsed) throw new TypeError('body already consumed');
+			this._bodyUsed = true;
+			const reader = this._body.getReader();
+			const chunks = [];
+			while (true) {
+				const {done, value} = await reader.read();
+				if (done) break;
+				chunks.push(value);
+			}
+			const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+			const result = new Uint8Array(totalLen);
+			let offset = 0;
+			for (const c of chunks) { result.set(c, offset); offset += c.byteLength; }
+			return result.buffer;
+		}
+		const t = this._body !== null && this._body !== undefined ? String(this._body) : '';
 		const enc = new TextEncoder();
 		return enc.encode(t).buffer;
 	}
 	async bytes() {
-		const t = await this.text();
+		if (this._body instanceof ReadableStream) {
+			if (this._bodyUsed) throw new TypeError('body already consumed');
+			this._bodyUsed = true;
+			const reader = this._body.getReader();
+			const chunks = [];
+			while (true) {
+				const {done, value} = await reader.read();
+				if (done) break;
+				chunks.push(value);
+			}
+			const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+			const result = new Uint8Array(totalLen);
+			let offset = 0;
+			for (const c of chunks) { result.set(c, offset); offset += c.byteLength; }
+			return result;
+		}
+		const t = this._body !== null && this._body !== undefined ? String(this._body) : '';
 		return new TextEncoder().encode(t);
 	}
 	clone() { return new Request(this); }
+	get [Symbol.toStringTag]() { return 'Request'; }
 }
 
 class Response {
 	constructor(body, init) {
 		init = init || {};
 		this._body = body !== undefined && body !== null ? body : null;
+		this._bodyUsed = false;
+		this.type = 'default';
 		this.status = init.status !== undefined ? init.status : 200;
+		if (init.status !== undefined && init.status !== 0 && (init.status < 200 || init.status > 599)) {
+			throw new RangeError('Invalid status code: ' + init.status);
+		}
 		this.statusText = init.statusText || '';
 		this.headers = new Headers(init.headers);
-		this.ok = this.status >= 200 && this.status < 300;
+		this.redirected = false;
 		this.url = init.url || '';
 		this.webSocket = init.webSocket || null;
 	}
+	get ok() { return this.status >= 200 && this.status < 300; }
 	get body() {
 		if (this._body === null || this._body === undefined) return null;
 		if (this._body instanceof ReadableStream) return this._body;
@@ -191,26 +353,77 @@ class Response {
 		return stream;
 	}
 	get bodyUsed() {
-		if (this._body instanceof ReadableStream) return this._body._locked;
-		return false;
+		return this._bodyUsed || (this._body instanceof ReadableStream && this._body._locked);
 	}
-	async text() { return this._body !== null && this._body !== undefined ? String(this._body) : ''; }
+	async text() {
+		if (this._body instanceof ReadableStream) {
+			if (this._bodyUsed) throw new TypeError('body already consumed');
+			this._bodyUsed = true;
+			const reader = this._body.getReader();
+			const chunks = [];
+			while (true) {
+				const {done, value} = await reader.read();
+				if (done) break;
+				chunks.push(value);
+			}
+			const dec = new TextDecoder();
+			return chunks.map(c => dec.decode(c, {stream: true})).join('') + dec.decode();
+		}
+		return this._body !== null && this._body !== undefined ? String(this._body) : '';
+	}
 	async json() { return JSON.parse(await this.text()); }
 	async arrayBuffer() {
-		const t = await this.text();
+		if (this._body instanceof ReadableStream) {
+			if (this._bodyUsed) throw new TypeError('body already consumed');
+			this._bodyUsed = true;
+			const reader = this._body.getReader();
+			const chunks = [];
+			while (true) {
+				const {done, value} = await reader.read();
+				if (done) break;
+				chunks.push(value);
+			}
+			const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+			const result = new Uint8Array(totalLen);
+			let offset = 0;
+			for (const c of chunks) { result.set(c, offset); offset += c.byteLength; }
+			return result.buffer;
+		}
+		const t = this._body !== null && this._body !== undefined ? String(this._body) : '';
 		const enc = new TextEncoder();
 		return enc.encode(t).buffer;
 	}
 	async bytes() {
-		const t = await this.text();
+		if (this._body instanceof ReadableStream) {
+			if (this._bodyUsed) throw new TypeError('body already consumed');
+			this._bodyUsed = true;
+			const reader = this._body.getReader();
+			const chunks = [];
+			while (true) {
+				const {done, value} = await reader.read();
+				if (done) break;
+				chunks.push(value);
+			}
+			const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+			const result = new Uint8Array(totalLen);
+			let offset = 0;
+			for (const c of chunks) { result.set(c, offset); offset += c.byteLength; }
+			return result;
+		}
+		const t = this._body !== null && this._body !== undefined ? String(this._body) : '';
 		return new TextEncoder().encode(t);
 	}
 	clone() {
-		return new Response(this._body, {
+		if (this._bodyUsed) throw new TypeError('Cannot clone a consumed response');
+		const r = new Response(this._body, {
 			status: this.status,
 			statusText: this.statusText,
 			headers: new Headers(this.headers),
 		});
+		r.type = this.type;
+		r.url = this.url;
+		r.redirected = this.redirected;
+		return r;
 	}
 	static json(data, init) {
 		init = init || {};
@@ -229,12 +442,15 @@ class Response {
 	static error() {
 		const r = new Response(null, { status: 0, statusText: '' });
 		r.type = 'error';
+		r.status = 0;
 		return r;
 	}
+	get [Symbol.toStringTag]() { return 'Response'; }
 }
 
 if (typeof TextEncoder === 'undefined') {
 	globalThis.TextEncoder = class TextEncoder {
+		get encoding() { return 'utf-8'; }
 		encode(str) {
 			str = String(str);
 			const buf = [];
@@ -254,6 +470,28 @@ if (typeof TextEncoder === 'undefined') {
 			}
 			return new Uint8Array(buf);
 		}
+		encodeInto(source, destination) {
+			source = String(source);
+			const encoded = this.encode(source);
+			const written = Math.min(encoded.length, destination.length);
+			destination.set(encoded.subarray(0, written));
+			let read = 0;
+			let byteCount = 0;
+			for (let i = 0; i < source.length && byteCount < written; i++) {
+				let c = source.charCodeAt(i);
+				let charBytes;
+				if (c < 0x80) charBytes = 1;
+				else if (c < 0x800) charBytes = 2;
+				else if (c >= 0xd800 && c <= 0xdbff) { charBytes = 4; }
+				else charBytes = 3;
+				if (byteCount + charBytes > written) break;
+				byteCount += charBytes;
+				read++;
+				if (charBytes === 4) i++;
+			}
+			return { read, written: byteCount };
+		}
+		get [Symbol.toStringTag]() { return 'TextEncoder'; }
 	};
 }
 
@@ -273,6 +511,7 @@ globalThis.TextDecoder = class TextDecoder {
 		get encoding() { return this._encoding; }
 		get fatal() { return this._fatal; }
 		get ignoreBOM() { return this._ignoreBOM; }
+		get [Symbol.toStringTag]() { return 'TextDecoder'; }
 		decode(buf, options) {
 			var stream = !!(options && options.stream);
 			// Build byte array: pending bytes prepended to new input.
@@ -431,7 +670,6 @@ USP._sync = function() {
 	if (this._url) {
 		var s = this.toString();
 		this._url.search = s ? '?' + s : '';
-		this._url.href = this._url.origin + this._url.pathname + this._url.search + this._url.hash;
 	}
 };
 
@@ -464,9 +702,13 @@ USP.append = function(name, value) {
 	this._sync();
 };
 
-var origDelete = USP['delete'];
-USP['delete'] = function(name) {
-	this._entries = this._entries.filter(function(e) { return e[0] !== name; });
+USP['delete'] = function(name, value) {
+	if (arguments.length > 1) {
+		var v = String(value);
+		this._entries = this._entries.filter(function(e) { return !(e[0] === name && e[1] === v); });
+	} else {
+		this._entries = this._entries.filter(function(e) { return e[0] !== name; });
+	}
 	this._sync();
 };
 

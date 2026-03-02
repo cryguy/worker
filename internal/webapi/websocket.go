@@ -23,9 +23,9 @@ const MaxWSMessageBytes = 64 * 1024
 var webSocketJS = `
 (function() {
 
-class WebSocket {
+class WebSocket extends EventTarget {
 	constructor(url, protocols) {
-		this._listeners = {};
+		super();
 		this._readyState = 0;
 		this._url = url || '';
 		this._protocol = '';
@@ -128,32 +128,21 @@ class WebSocket {
 		this._dispatch('close', { code: code || 1000, reason: reason || '', wasClean: true });
 	}
 
-	addEventListener(type, handler) {
-		if (!this._listeners[type]) this._listeners[type] = [];
-		this._listeners[type].push(handler);
-	}
-
-	removeEventListener(type, handler) {
-		var list = this._listeners[type];
-		if (!list) return;
-		this._listeners[type] = list.filter(function(h) { return h !== handler; });
-	}
-
-	_dispatch(type, event) {
+	_dispatch(type, detail) {
+		var ev = Object.assign(new Event(type), detail);
 		var prop = 'on' + type;
 		if (typeof this[prop] === 'function') {
-			this[prop](event);
+			this[prop](ev);
 		}
-		var list = this._listeners[type] || [];
-		for (var i = 0; i < list.length; i++) {
-			list[i](event);
-		}
+		this.dispatchEvent(ev);
 	}
 
 	get readyState() { return this._readyState; }
 	get url() { return this._url; }
 	get protocol() { return this._protocol; }
 	get extensions() { return this._extensions; }
+	get bufferedAmount() { return 0; }
+	get [Symbol.toStringTag]() { return 'WebSocket'; }
 }
 
 WebSocket.CONNECTING = 0;
@@ -170,6 +159,7 @@ class WebSocketPair {
 		this[0] = ws0;
 		this[1] = ws1;
 	}
+	get [Symbol.toStringTag]() { return 'WebSocketPair'; }
 }
 
 WebSocketPair.prototype[Symbol.iterator] = function() {

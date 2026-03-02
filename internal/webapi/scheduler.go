@@ -15,6 +15,26 @@ globalThis.scheduler = {
 			setTimeout(resolve, ms || 0);
 		});
 	},
+	postTask: function(callback, options) {
+		var delay = (options && options.delay) || 0;
+		var signal = options && options.signal;
+		return new Promise(function(resolve, reject) {
+			if (signal && signal.aborted) {
+				reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
+				return;
+			}
+			var id = setTimeout(function() {
+				try { resolve(callback()); }
+				catch(e) { reject(e); }
+			}, delay);
+			if (signal) {
+				signal.addEventListener('abort', function() {
+					clearTimeout(id);
+					reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
+				});
+			}
+		});
+	},
 };
 `
 

@@ -87,7 +87,7 @@ globalThis.__makeSB = function(bindingName) {
 						url = input.url || '';
 						method = input.method || 'GET';
 						if (input.headers && input.headers._map) {
-							for (var k in input.headers._map) headers[k] = input.headers._map[k];
+							for (var k in input.headers._map) headers[k] = Array.isArray(input.headers._map[k]) ? input.headers._map[k].join(', ') : input.headers._map[k];
 						}
 						body = input._body || null;
 					}
@@ -95,7 +95,7 @@ globalThis.__makeSB = function(bindingName) {
 						if (init.method) method = init.method;
 						if (init.headers) {
 							if (init.headers._map) {
-								for (var k in init.headers._map) headers[k] = init.headers._map[k];
+								for (var k in init.headers._map) headers[k] = Array.isArray(init.headers._map[k]) ? init.headers._map[k].join(', ') : init.headers._map[k];
 							} else if (typeof init.headers === 'object') {
 								for (var k in init.headers) headers[k] = init.headers[k];
 							}

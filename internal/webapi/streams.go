@@ -259,18 +259,30 @@ class ReadableStream {
 		}
 	}
 
-	async *[Symbol.asyncIterator]() {
+	values(options) {
+		const preventCancel = !!(options && options.preventCancel);
 		const reader = this.getReader();
-		try {
-			while (true) {
-				const { value, done } = await reader.read();
-				if (done) return;
-				yield value;
+		return {
+			[Symbol.asyncIterator]() { return this; },
+			async next() {
+				const { done, value } = await reader.read();
+				if (done) {
+					reader.releaseLock();
+					return { done: true, value: undefined };
+				}
+				return { done: false, value };
+			},
+			async return(v) {
+				if (!preventCancel) await reader.cancel(v);
+				reader.releaseLock();
+				return { done: true, value: v };
 			}
-		} finally {
-			reader.releaseLock();
-		}
+		};
 	}
+
+	[Symbol.asyncIterator]() { return this.values(); }
+
+	get [Symbol.toStringTag]() { return 'ReadableStream'; }
 }
 
 // --- WritableStream ---
@@ -379,10 +391,26 @@ class WritableStream {
 
 	get locked() { return this._locked; }
 
+	abort(reason) {
+		const writer = this.getWriter();
+		const p = writer.abort(reason);
+		writer.releaseLock();
+		return p;
+	}
+
+	close() {
+		const writer = this.getWriter();
+		const p = writer.close();
+		writer.releaseLock();
+		return p;
+	}
+
 	_errorInternal(e) {
 		this._errored = true;
 		this._error = e;
 	}
+
+	get [Symbol.toStringTag]() { return 'WritableStream'; }
 }
 
 // --- TransformStream ---
@@ -427,6 +455,8 @@ class TransformStream {
 			}
 		}, writableStrategy);
 	}
+
+	get [Symbol.toStringTag]() { return 'TransformStream'; }
 }
 
 // --- ReadableStream.from() ---

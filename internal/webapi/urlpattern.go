@@ -168,6 +168,13 @@ class URLPattern {
 	get pathname() { return this._pathname; }
 	get search() { return this._search; }
 	get hash() { return this._hash; }
+	get hasRegExpGroups() {
+		var check = function(p) { return p && p.indexOf('(') !== -1; };
+		return check(this._protocol) || check(this._hostname) ||
+			check(this._port) || check(this._pathname) ||
+			check(this._search) || check(this._hash) || false;
+	}
+	get [Symbol.toStringTag]() { return 'URLPattern'; }
 }
 
 globalThis.URLPattern = URLPattern;

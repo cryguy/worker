@@ -170,6 +170,16 @@ Response.prototype.json = async function() {
 	return JSON.parse(t);
 };
 
+Request.prototype.blob = async function() {
+	var text = await this.text();
+	return new Blob([text], { type: this.headers.get('content-type') || '' });
+};
+
+Response.prototype.blob = async function() {
+	var text = await this.text();
+	return new Blob([text], { type: this.headers.get('content-type') || '' });
+};
+
 Request.prototype.formData = async function() {
 	var ct = this.headers.get('content-type') || '';
 	var text = bodyToString(this._body);

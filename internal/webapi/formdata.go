@@ -16,7 +16,8 @@ const formdataJS = `
 class Blob {
 	constructor(parts, options) {
 		options = options || {};
-		this.type = options.type || '';
+		var t = String(options.type || '').toLowerCase();
+		this.type = /^[\x20-\x7e]*$/.test(t) ? t : '';
 		this._parts = [];
 		this._size = 0;
 
@@ -63,9 +64,13 @@ class Blob {
 	}
 
 	slice(start, end, contentType) {
+		const size = this._size;
+		let s = start === undefined ? 0 : start < 0 ? Math.max(size + start, 0) : Math.min(start, size);
+		let e = end === undefined ? size : end < 0 ? Math.max(size + end, 0) : Math.min(end, size);
 		const full = this._parts.join('');
-		const sliced = full.slice(start || 0, end !== undefined ? end : full.length);
-		return new Blob([sliced], { type: contentType || this.type });
+		const sliced = full.slice(s, e);
+		const ct = contentType !== undefined ? String(contentType).toLowerCase() : this.type;
+		return new Blob([sliced], { type: ct });
 	}
 
 	async text() {
@@ -77,6 +82,8 @@ class Blob {
 		const enc = new TextEncoder();
 		return enc.encode(text).buffer;
 	}
+
+	get [Symbol.toStringTag]() { return 'Blob'; }
 }
 
 // --- File ---
@@ -86,7 +93,10 @@ class File extends Blob {
 		super(parts, options);
 		this.name = name;
 		this.lastModified = (options && options.lastModified) || Date.now();
+		this.webkitRelativePath = '';
 	}
+
+	get [Symbol.toStringTag]() { return 'File'; }
 }
 
 // --- FormData ---
@@ -104,8 +114,25 @@ class FormData {
 	}
 
 	set(name, value, filename) {
-		this.delete(name);
-		this.append(name, value, filename);
+		if (value instanceof Blob && !(value instanceof File)) {
+			value = new File([value], filename || 'blob', { type: value.type });
+		}
+		const sName = String(name);
+		let found = false;
+		const filtered = [];
+		for (let i = 0; i < this._entries.length; i++) {
+			if (this._entries[i][0] === sName) {
+				if (!found) {
+					filtered.push([sName, value]);
+					found = true;
+				}
+				// skip duplicates
+			} else {
+				filtered.push(this._entries[i]);
+			}
+		}
+		if (!found) filtered.push([sName, value]);
+		this._entries = filtered;
 	}
 
 	get(name) {
@@ -146,6 +173,8 @@ class FormData {
 	[Symbol.iterator]() {
 		return this.entries();
 	}
+
+	get [Symbol.toStringTag]() { return 'FormData'; }
 }
 
 globalThis.Blob = Blob;

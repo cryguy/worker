@@ -61,7 +61,7 @@ func JsResponseToGo(rt core.JSRuntime) (*core.WorkerResponse, error) {
 		if (r.headers && r.headers._map) {
 			var m = r.headers._map;
 			for (var k in m) {
-				if (m.hasOwnProperty(k)) headers[k] = m[k];
+				if (m.hasOwnProperty(k)) headers[k] = Array.isArray(m[k]) ? m[k].join(', ') : m[k];
 			}
 		}
 		var hasWebSocket = !!(r.webSocket);

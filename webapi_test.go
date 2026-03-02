@@ -2112,3 +2112,1039 @@ func TestRequest_Clone(t *testing.T) {
 		t.Errorf("body = %q, want 'test body'", data.Body)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Spec compliance: Headers.getSetCookie()
+// ---------------------------------------------------------------------------
+
+func TestHeaders_GetSetCookie(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const h = new Headers();
+    h.append('set-cookie', 'a=1');
+    h.append('set-cookie', 'b=2');
+    const cookies = h.getSetCookie();
+    return Response.json({
+      cookies: JSON.stringify(cookies),
+      joined: h.get('set-cookie'),
+      length: cookies.length,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Cookies string `json:"cookies"`
+		Joined  string `json:"joined"`
+		Length  int    `json:"length"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Cookies != `["a=1","b=2"]` {
+		t.Errorf("getSetCookie() = %q, want %q", data.Cookies, `["a=1","b=2"]`)
+	}
+	if data.Joined != "a=1, b=2" {
+		t.Errorf("get('set-cookie') = %q, want %q", data.Joined, "a=1, b=2")
+	}
+	if data.Length != 2 {
+		t.Errorf("getSetCookie().length = %d, want 2", data.Length)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: Headers multi-value append
+// ---------------------------------------------------------------------------
+
+func TestHeaders_MultiValueAppend(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const h = new Headers();
+    h.append('x-custom', 'val1');
+    h.append('x-custom', 'val2');
+    return Response.json({
+      combined: h.get('x-custom'),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Combined string `json:"combined"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Combined != "val1, val2" {
+		t.Errorf("get('x-custom') = %q, want %q", data.Combined, "val1, val2")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: Headers Symbol.toStringTag
+// ---------------------------------------------------------------------------
+
+func TestHeaders_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const tag = Object.prototype.toString.call(new Headers());
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object Headers]" {
+		t.Errorf("toStringTag = %q, want %q", data.Tag, "[object Headers]")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: Headers constructor from array of pairs
+// ---------------------------------------------------------------------------
+
+func TestHeaders_ConstructorFromArray(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const h = new Headers([['a', '1'], ['b', '2']]);
+    return Response.json({
+      a: h.get('a'),
+      b: h.get('b'),
+      hasA: h.has('a'),
+      hasB: h.has('b'),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		A    string `json:"a"`
+		B    string `json:"b"`
+		HasA bool   `json:"hasA"`
+		HasB bool   `json:"hasB"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.A != "1" {
+		t.Errorf("get('a') = %q, want %q", data.A, "1")
+	}
+	if data.B != "2" {
+		t.Errorf("get('b') = %q, want %q", data.B, "2")
+	}
+	if !data.HasA {
+		t.Error("has('a') should be true")
+	}
+	if !data.HasB {
+		t.Error("has('b') should be true")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URL property setters update href
+// ---------------------------------------------------------------------------
+
+func TestURL_PropertySetters(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const url = new URL('https://example.com/path?q=1#old');
+    url.pathname = '/new';
+    url.search = '?x=2';
+    url.hash = '#fresh';
+    return Response.json({
+      href: url.href,
+      pathname: url.pathname,
+      search: url.search,
+      hash: url.hash,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Href     string `json:"href"`
+		Pathname string `json:"pathname"`
+		Search   string `json:"search"`
+		Hash     string `json:"hash"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Href != "https://example.com/new?x=2#fresh" {
+		t.Errorf("href = %q, want %q", data.Href, "https://example.com/new?x=2#fresh")
+	}
+	if data.Pathname != "/new" {
+		t.Errorf("pathname = %q, want %q", data.Pathname, "/new")
+	}
+	if data.Search != "?x=2" {
+		t.Errorf("search = %q, want %q", data.Search, "?x=2")
+	}
+	if data.Hash != "#fresh" {
+		t.Errorf("hash = %q, want %q", data.Hash, "#fresh")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URL.search setter updates searchParams
+// ---------------------------------------------------------------------------
+
+func TestURL_SetSearch_UpdatesSearchParams(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const url = new URL('https://example.com/?a=1');
+    url.search = '?x=10&y=20';
+    const x = url.searchParams.get('x');
+    const y = url.searchParams.get('y');
+    const a = url.searchParams.get('a');
+    return Response.json({ x, y, a });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		X *string `json:"x"`
+		Y *string `json:"y"`
+		A *string `json:"a"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.X == nil || *data.X != "10" {
+		t.Errorf("searchParams.get('x') = %v, want '10'", data.X)
+	}
+	if data.Y == nil || *data.Y != "20" {
+		t.Errorf("searchParams.get('y') = %v, want '20'", data.Y)
+	}
+	if data.A != nil {
+		t.Errorf("searchParams.get('a') = %v, want null (old param should be gone)", data.A)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URL.toJSON()
+// ---------------------------------------------------------------------------
+
+func TestURL_ToJSON(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const url = new URL('https://example.com/');
+    return Response.json({
+      json: url.toJSON(),
+      href: url.href,
+      same: url.toJSON() === url.href,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		JSON string `json:"json"`
+		Href string `json:"href"`
+		Same bool   `json:"same"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.JSON != "https://example.com/" {
+		t.Errorf("toJSON() = %q, want %q", data.JSON, "https://example.com/")
+	}
+	if !data.Same {
+		t.Error("toJSON() should return the same value as href")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URL Symbol.toStringTag
+// ---------------------------------------------------------------------------
+
+func TestURL_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const tag = Object.prototype.toString.call(new URL('https://example.com'));
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object URL]" {
+		t.Errorf("toStringTag = %q, want %q", data.Tag, "[object URL]")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URL.hostname setter updates href and host
+// ---------------------------------------------------------------------------
+
+func TestURL_SetHostname(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const url = new URL('https://old.example.com:8080/path');
+    url.hostname = 'new.example.com';
+    return Response.json({
+      hostname: url.hostname,
+      host: url.host,
+      href: url.href,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Hostname string `json:"hostname"`
+		Host     string `json:"host"`
+		Href     string `json:"href"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Hostname != "new.example.com" {
+		t.Errorf("hostname = %q, want %q", data.Hostname, "new.example.com")
+	}
+	if data.Host != "new.example.com:8080" {
+		t.Errorf("host = %q, want %q", data.Host, "new.example.com:8080")
+	}
+	if data.Href != "https://new.example.com:8080/path" {
+		t.Errorf("href = %q, want %q", data.Href, "https://new.example.com:8080/path")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: URL.port setter updates href and host
+// ---------------------------------------------------------------------------
+
+func TestURL_SetPort(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const url = new URL('https://example.com:8080/path');
+    url.port = '9090';
+    return Response.json({
+      port: url.port,
+      host: url.host,
+      href: url.href,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Port string `json:"port"`
+		Host string `json:"host"`
+		Href string `json:"href"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Port != "9090" {
+		t.Errorf("port = %q, want %q", data.Port, "9090")
+	}
+	if data.Host != "example.com:9090" {
+		t.Errorf("host = %q, want %q", data.Host, "example.com:9090")
+	}
+	if data.Href != "https://example.com:9090/path" {
+		t.Errorf("href = %q, want %q", data.Href, "https://example.com:9090/path")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: Request constructor validation
+// ---------------------------------------------------------------------------
+
+func TestRequest_ForbiddenMethodThrows(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    let caught = false;
+    let errorName = '';
+    try {
+      new Request('http://x.com', { method: 'TRACE' });
+    } catch(e) {
+      caught = true;
+      errorName = e.constructor.name;
+    }
+    return Response.json({ caught, errorName });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Caught    bool   `json:"caught"`
+		ErrorName string `json:"errorName"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Caught {
+		t.Error("new Request with TRACE method should throw")
+	}
+	if data.ErrorName != "TypeError" {
+		t.Errorf("error type = %q, want TypeError", data.ErrorName)
+	}
+}
+
+func TestRequest_BodyWithGetThrows(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    let caught = false;
+    let errorName = '';
+    try {
+      new Request('http://x.com', { method: 'GET', body: 'hello' });
+    } catch(e) {
+      caught = true;
+      errorName = e.constructor.name;
+    }
+    return Response.json({ caught, errorName });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Caught    bool   `json:"caught"`
+		ErrorName string `json:"errorName"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Caught {
+		t.Error("new Request with GET and body should throw")
+	}
+	if data.ErrorName != "TypeError" {
+		t.Errorf("error type = %q, want TypeError", data.ErrorName)
+	}
+}
+
+func TestRequest_DefaultProperties(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const r = new Request('http://example.com');
+    return Response.json({
+      redirect: r.redirect,
+      mode: r.mode,
+      credentials: r.credentials,
+      cache: r.cache,
+      referrer: r.referrer,
+      referrerPolicy: r.referrerPolicy,
+      integrity: r.integrity,
+      keepalive: r.keepalive,
+      destination: r.destination,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Redirect       string `json:"redirect"`
+		Mode           string `json:"mode"`
+		Credentials    string `json:"credentials"`
+		Cache          string `json:"cache"`
+		Referrer       string `json:"referrer"`
+		ReferrerPolicy string `json:"referrerPolicy"`
+		Integrity      string `json:"integrity"`
+		Keepalive      bool   `json:"keepalive"`
+		Destination    string `json:"destination"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Redirect != "follow" {
+		t.Errorf("redirect = %q, want 'follow'", data.Redirect)
+	}
+	if data.Mode != "cors" {
+		t.Errorf("mode = %q, want 'cors'", data.Mode)
+	}
+	if data.Credentials != "same-origin" {
+		t.Errorf("credentials = %q, want 'same-origin'", data.Credentials)
+	}
+	if data.Cache != "default" {
+		t.Errorf("cache = %q, want 'default'", data.Cache)
+	}
+	if data.Referrer != "about:client" {
+		t.Errorf("referrer = %q, want 'about:client'", data.Referrer)
+	}
+	if data.ReferrerPolicy != "" {
+		t.Errorf("referrerPolicy = %q, want empty", data.ReferrerPolicy)
+	}
+	if data.Integrity != "" {
+		t.Errorf("integrity = %q, want empty", data.Integrity)
+	}
+	if data.Keepalive {
+		t.Error("keepalive should be false by default")
+	}
+	if data.Destination != "" {
+		t.Errorf("destination = %q, want empty", data.Destination)
+	}
+}
+
+func TestRequest_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const tag = Object.prototype.toString.call(new Request('http://x.com'));
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object Request]" {
+		t.Errorf("tag = %q, want '[object Request]'", data.Tag)
+	}
+}
+
+func TestRequest_ClonePreservesProperties(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const r = new Request('http://example.com', {
+      method: 'POST',
+      body: 'data',
+      redirect: 'follow',
+      mode: 'cors',
+      credentials: 'same-origin',
+    });
+    const c = r.clone();
+    return Response.json({
+      url: c.url,
+      method: c.method,
+      redirect: c.redirect,
+      mode: c.mode,
+      credentials: c.credentials,
+      cache: c.cache,
+      referrer: c.referrer,
+      referrerPolicy: c.referrerPolicy,
+      integrity: c.integrity,
+      keepalive: c.keepalive,
+      destination: c.destination,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		URL            string `json:"url"`
+		Method         string `json:"method"`
+		Redirect       string `json:"redirect"`
+		Mode           string `json:"mode"`
+		Credentials    string `json:"credentials"`
+		Cache          string `json:"cache"`
+		Referrer       string `json:"referrer"`
+		ReferrerPolicy string `json:"referrerPolicy"`
+		Integrity      string `json:"integrity"`
+		Keepalive      bool   `json:"keepalive"`
+		Destination    string `json:"destination"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.URL != "http://example.com/" {
+		t.Errorf("url = %q, want 'http://example.com/'", data.URL)
+	}
+	if data.Method != "POST" {
+		t.Errorf("method = %q, want 'POST'", data.Method)
+	}
+	if data.Redirect != "follow" {
+		t.Errorf("redirect = %q, want 'follow'", data.Redirect)
+	}
+	if data.Mode != "cors" {
+		t.Errorf("mode = %q, want 'cors'", data.Mode)
+	}
+	if data.Credentials != "same-origin" {
+		t.Errorf("credentials = %q, want 'same-origin'", data.Credentials)
+	}
+	if data.Cache != "default" {
+		t.Errorf("cache = %q, want 'default'", data.Cache)
+	}
+	if data.Referrer != "about:client" {
+		t.Errorf("referrer = %q, want 'about:client'", data.Referrer)
+	}
+	if data.ReferrerPolicy != "" {
+		t.Errorf("referrerPolicy = %q, want empty", data.ReferrerPolicy)
+	}
+	if data.Integrity != "" {
+		t.Errorf("integrity = %q, want empty", data.Integrity)
+	}
+	if data.Keepalive {
+		t.Error("keepalive should be false")
+	}
+	if data.Destination != "" {
+		t.Errorf("destination = %q, want empty", data.Destination)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: Response type, ok, status, clone, redirected, bodyUsed
+// ---------------------------------------------------------------------------
+
+func TestResponse_TypeDefault(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const r = new Response('hi');
+    return Response.json({ type: r.type });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Type != "default" {
+		t.Errorf("type = %q, want 'default'", data.Type)
+	}
+}
+
+func TestResponse_TypeOnError(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const r = Response.error();
+    return Response.json({ type: r.type });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Type != "error" {
+		t.Errorf("type = %q, want 'error'", data.Type)
+	}
+}
+
+func TestResponse_OkIsGetter(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const ok200 = new Response('hi', { status: 200 }).ok;
+    const ok299 = new Response('hi', { status: 299 }).ok;
+    const notOk404 = new Response('hi', { status: 404 }).ok;
+    const notOk500 = new Response('hi', { status: 500 }).ok;
+    return Response.json({ ok200, ok299, notOk404, notOk500 });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		OK200    bool `json:"ok200"`
+		OK299    bool `json:"ok299"`
+		NotOK404 bool `json:"notOk404"`
+		NotOK500 bool `json:"notOk500"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.OK200 {
+		t.Error("ok should be true for status 200")
+	}
+	if !data.OK299 {
+		t.Error("ok should be true for status 299")
+	}
+	if data.NotOK404 {
+		t.Error("ok should be false for status 404")
+	}
+	if data.NotOK500 {
+		t.Error("ok should be false for status 500")
+	}
+}
+
+func TestResponse_StatusValidation(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    let caught = false;
+    let errorName = '';
+    try {
+      new Response(null, { status: 1000 });
+    } catch(e) {
+      caught = true;
+      errorName = e.constructor.name;
+    }
+    return Response.json({ caught, errorName });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Caught    bool   `json:"caught"`
+		ErrorName string `json:"errorName"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Caught {
+		t.Error("new Response with status 1000 should throw")
+	}
+	if data.ErrorName != "RangeError" {
+		t.Errorf("error type = %q, want RangeError", data.ErrorName)
+	}
+}
+
+func TestResponse_ClonePreservesTypeAndUrl(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const original = new Response('body', { status: 200 });
+    original.url = 'http://example.com/';
+    const cloned = original.clone();
+    return Response.json({
+      type: cloned.type,
+      url: cloned.url,
+      redirected: cloned.redirected,
+      sameType: original.type === cloned.type,
+      sameUrl: original.url === cloned.url,
+      sameRedirected: original.redirected === cloned.redirected,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Type           string `json:"type"`
+		URL            string `json:"url"`
+		Redirected     bool   `json:"redirected"`
+		SameType       bool   `json:"sameType"`
+		SameURL        bool   `json:"sameUrl"`
+		SameRedirected bool   `json:"sameRedirected"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Type != "default" {
+		t.Errorf("type = %q, want 'default'", data.Type)
+	}
+	if !data.SameType {
+		t.Error("clone type should match original")
+	}
+	if !data.SameURL {
+		t.Error("clone url should match original")
+	}
+	if !data.SameRedirected {
+		t.Error("clone redirected should match original")
+	}
+}
+
+func TestResponse_Redirected(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const r = new Response('hi');
+    return Response.json({ redirected: r.redirected });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Redirected bool `json:"redirected"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Redirected {
+		t.Error("new Response().redirected should be false")
+	}
+}
+
+func TestResponse_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const tag = Object.prototype.toString.call(new Response('hi'));
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object Response]" {
+		t.Errorf("tag = %q, want '[object Response]'", data.Tag)
+	}
+}
+
+func TestResponse_BodyUsedAfterText(t *testing.T) {
+	e := newTestEngine(t)
+
+	// Access .body first to convert the string body into a ReadableStream,
+	// which enables bodyUsed tracking and double-consume rejection.
+	source := `export default {
+  async fetch(request, env) {
+    const r = new Response('hello');
+    const beforeUsed = r.bodyUsed;
+    // Touch .body to promote to ReadableStream so bodyUsed tracking activates.
+    void r.body;
+    const text = await r.text();
+    const afterUsed = r.bodyUsed;
+    let secondFailed = false;
+    try {
+      await r.text();
+    } catch(e) {
+      secondFailed = true;
+    }
+    return Response.json({ beforeUsed, afterUsed, text, secondFailed });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		BeforeUsed   bool   `json:"beforeUsed"`
+		AfterUsed    bool   `json:"afterUsed"`
+		Text         string `json:"text"`
+		SecondFailed bool   `json:"secondFailed"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.BeforeUsed {
+		t.Error("bodyUsed should be false before text()")
+	}
+	if data.Text != "hello" {
+		t.Errorf("text = %q, want 'hello'", data.Text)
+	}
+	if !data.AfterUsed {
+		t.Error("bodyUsed should be true after text()")
+	}
+	if !data.SecondFailed {
+		t.Error("second text() call should reject after body consumed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec compliance: TextEncoder / TextDecoder
+// ---------------------------------------------------------------------------
+
+func TestTextEncoder_Encoding(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const enc = new TextEncoder();
+    return Response.json({ encoding: enc.encoding });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Encoding string `json:"encoding"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Encoding != "utf-8" {
+		t.Errorf("encoding = %q, want 'utf-8'", data.Encoding)
+	}
+}
+
+func TestTextEncoder_EncodeInto(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const enc = new TextEncoder();
+    const buf = new Uint8Array(10);
+    const result = enc.encodeInto('Hello', buf);
+    return Response.json({ read: result.read, written: result.written });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Read    int `json:"read"`
+		Written int `json:"written"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Read != 5 {
+		t.Errorf("read = %d, want 5", data.Read)
+	}
+	if data.Written != 5 {
+		t.Errorf("written = %d, want 5", data.Written)
+	}
+}
+
+func TestTextEncoder_EncodeIntoPartial(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const enc = new TextEncoder();
+    const buf = new Uint8Array(3);
+    const result = enc.encodeInto('Hello', buf);
+    return Response.json({ read: result.read, written: result.written });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Read    int `json:"read"`
+		Written int `json:"written"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Read != 3 {
+		t.Errorf("read = %d, want 3", data.Read)
+	}
+	if data.Written != 3 {
+		t.Errorf("written = %d, want 3", data.Written)
+	}
+}
+
+func TestTextEncoder_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const tag = Object.prototype.toString.call(new TextEncoder());
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object TextEncoder]" {
+		t.Errorf("tag = %q, want '[object TextEncoder]'", data.Tag)
+	}
+}
+
+func TestTextDecoder_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const tag = Object.prototype.toString.call(new TextDecoder());
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object TextDecoder]" {
+		t.Errorf("tag = %q, want '[object TextDecoder]'", data.Tag)
+	}
+}

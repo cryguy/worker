@@ -119,6 +119,67 @@ func TestScheduler_WaitNegative(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Scheduler spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestScheduler_PostTask(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const result = await scheduler.postTask(() => 42);
+    return Response.json({ result });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result int `json:"result"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Result != 42 {
+		t.Errorf("result = %d, want 42", data.Result)
+	}
+}
+
+func TestScheduler_PostTaskWithDelay(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const before = performance.now();
+    const result = await scheduler.postTask(() => 'ok', { delay: 10 });
+    const after = performance.now();
+    return Response.json({
+      result,
+      elapsed: after - before,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result  string  `json:"result"`
+		Elapsed float64 `json:"elapsed"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Result != "ok" {
+		t.Errorf("result = %q, want 'ok'", data.Result)
+	}
+	if data.Elapsed < 5 {
+		t.Errorf("elapsed = %f, expected >= 5ms (delay: 10ms)", data.Elapsed)
+	}
+}
+
 func TestScheduler_WaitNoArgs(t *testing.T) {
 	e := newTestEngine(t)
 

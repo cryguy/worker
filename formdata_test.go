@@ -403,3 +403,222 @@ func TestFormData_FileSlice(t *testing.T) {
 		t.Errorf("size = %d, want 4", data.Size)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Blob spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestBlob_TypeNormalization(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const blob = new Blob([], { type: 'TEXT/PLAIN' });
+    return Response.json({ type: blob.type });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Type != "text/plain" {
+		t.Errorf("type = %q, want 'text/plain' (lowercased)", data.Type)
+	}
+}
+
+func TestBlob_TypeInvalidCharsRejected(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const blob = new Blob([], { type: 'text/\x00plain' });
+    return Response.json({ type: blob.type });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Type != "" {
+		t.Errorf("type = %q, want '' (invalid chars should be rejected)", data.Type)
+	}
+}
+
+func TestBlob_SliceNegativeIndex(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const blob = new Blob(['hello']);
+    const sliced = blob.slice(-3);
+    const text = await sliced.text();
+    return Response.json({ text });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Text != "llo" {
+		t.Errorf("sliced text = %q, want 'llo'", data.Text)
+	}
+}
+
+func TestBlob_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const blob = new Blob([]);
+    const tag = Object.prototype.toString.call(blob);
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object Blob]" {
+		t.Errorf("tag = %q, want '[object Blob]'", data.Tag)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// File spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestFile_WebkitRelativePath(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const file = new File(['x'], 'test.txt');
+    return Response.json({ path: file.webkitRelativePath });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Path != "" {
+		t.Errorf("webkitRelativePath = %q, want '' (empty string)", data.Path)
+	}
+}
+
+func TestFile_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const file = new File(['x'], 'test.txt');
+    const tag = Object.prototype.toString.call(file);
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object File]" {
+		t.Errorf("tag = %q, want '[object File]'", data.Tag)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FormData spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestFormData_SetPreservesInsertionOrder(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const fd = new FormData();
+    fd.append('a', '1');
+    fd.append('b', '2');
+    fd.append('c', '3');
+    fd.set('a', '99');
+    const keys = [];
+    for (const [k] of fd) keys.push(k);
+    return Response.json({ keys, aValue: fd.get('a') });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Keys   []string `json:"keys"`
+		AValue string   `json:"aValue"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(data.Keys) != 3 || data.Keys[0] != "a" || data.Keys[1] != "b" || data.Keys[2] != "c" {
+		t.Errorf("keys = %v, want [a b c] (set should preserve insertion order)", data.Keys)
+	}
+	if data.AValue != "99" {
+		t.Errorf("fd.get('a') = %q, want '99'", data.AValue)
+	}
+}
+
+func TestFormData_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const fd = new FormData();
+    const tag = Object.prototype.toString.call(fd);
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object FormData]" {
+		t.Errorf("tag = %q, want '[object FormData]'", data.Tag)
+	}
+}

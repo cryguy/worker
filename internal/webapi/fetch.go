@@ -96,7 +96,7 @@ globalThis.fetch = function(input, init) {
 		if (input.headers) {
 			if (input.headers._map) {
 				var m = input.headers._map;
-				for (var k in m) { if (m.hasOwnProperty(k)) headers[k] = String(m[k]); }
+				for (var k in m) { if (m.hasOwnProperty(k)) headers[k] = Array.isArray(m[k]) ? m[k].join(', ') : String(m[k]); }
 			} else if (typeof input.headers.forEach === 'function') {
 				input.headers.forEach(function(v, k) { headers[k] = v; });
 			}
@@ -114,7 +114,9 @@ globalThis.fetch = function(input, init) {
 				src = {};
 				init.headers.forEach(function(v, k) { src[k] = v; });
 			} else if (init.headers._map) {
-				src = init.headers._map;
+				src = {};
+				var _m = init.headers._map;
+				for (var _k in _m) { if (_m.hasOwnProperty(_k)) src[_k] = Array.isArray(_m[_k]) ? _m[_k].join(', ') : _m[_k]; }
 			} else {
 				src = init.headers;
 			}

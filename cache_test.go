@@ -621,6 +621,249 @@ func TestCacheBridge_TTLZeroNoExpiry(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Cache spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestCache_MatchAll(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    var url1 = 'https://example.com/page1';
+    var url2 = 'https://example.com/page2';
+    await caches.default.put(url1, new Response('body1'));
+    await caches.default.put(url2, new Response('body2'));
+
+    // matchAll with a specific URL returns only that entry.
+    var specific = await caches.default.matchAll(url1);
+    // matchAll with no arg returns empty (our implementation).
+    var all = await caches.default.matchAll();
+
+    return Response.json({
+      specificLen: specific.length,
+      specificBody: specific.length > 0 ? specific[0]._body : null,
+      allLen: all.length,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, cacheEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		SpecificLen  int     `json:"specificLen"`
+		SpecificBody *string `json:"specificBody"`
+		AllLen       int     `json:"allLen"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.SpecificLen != 1 {
+		t.Errorf("matchAll(url) length = %d, want 1", data.SpecificLen)
+	}
+	if data.SpecificBody == nil || *data.SpecificBody != "body1" {
+		t.Errorf("matchAll(url) body = %v, want 'body1'", data.SpecificBody)
+	}
+	if data.AllLen != 0 {
+		t.Errorf("matchAll() length = %d, want 0 (no-arg returns empty)", data.AllLen)
+	}
+}
+
+func TestCache_Keys(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    var url = 'https://example.com/keyed';
+    await caches.default.put(url, new Response('data'));
+
+    var keys = await caches.default.keys(url);
+    return Response.json({
+      length: keys.length,
+      isRequest: keys.length > 0 ? keys[0] instanceof Request : false,
+      keyUrl: keys.length > 0 ? keys[0].url : null,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, cacheEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Length    int     `json:"length"`
+		IsReq    bool    `json:"isRequest"`
+		KeyURL   *string `json:"keyUrl"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.Length != 1 {
+		t.Errorf("keys(url) length = %d, want 1", data.Length)
+	}
+	if !data.IsReq {
+		t.Error("keys() should return Request objects")
+	}
+	if data.KeyURL == nil || *data.KeyURL != "https://example.com/keyed" {
+		t.Errorf("key url = %v, want 'https://example.com/keyed'", data.KeyURL)
+	}
+}
+
+func TestCacheStorage_Has(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    var beforeOpen = await caches.has('test-has');
+    await caches.open('test-has');
+    var afterOpen = await caches.has('test-has');
+    return Response.json({ beforeOpen, afterOpen });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		BeforeOpen bool `json:"beforeOpen"`
+		AfterOpen  bool `json:"afterOpen"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.BeforeOpen {
+		t.Error("caches.has should return false before open")
+	}
+	if !data.AfterOpen {
+		t.Error("caches.has should return true after open")
+	}
+}
+
+func TestCacheStorage_Delete(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    await caches.open('test-del');
+    var hasBefore = await caches.has('test-del');
+    var deleted = await caches.delete('test-del');
+    var hasAfter = await caches.has('test-del');
+    var deletedAgain = await caches.delete('test-del');
+    return Response.json({ hasBefore, deleted, hasAfter, deletedAgain });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		HasBefore    bool `json:"hasBefore"`
+		Deleted      bool `json:"deleted"`
+		HasAfter     bool `json:"hasAfter"`
+		DeletedAgain bool `json:"deletedAgain"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.HasBefore {
+		t.Error("cache should exist before delete")
+	}
+	if !data.Deleted {
+		t.Error("caches.delete should return true for existing cache")
+	}
+	if data.HasAfter {
+		t.Error("cache should not exist after delete")
+	}
+	if data.DeletedAgain {
+		t.Error("caches.delete should return false for non-existent cache")
+	}
+}
+
+func TestCacheStorage_Keys(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    await caches.open('alpha');
+    await caches.open('beta');
+    var keys = await caches.keys();
+    return Response.json({
+      isArray: Array.isArray(keys),
+      length: keys.length,
+      hasAlpha: keys.includes('alpha'),
+      hasBeta: keys.includes('beta'),
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		IsArray  bool `json:"isArray"`
+		Length   int  `json:"length"`
+		HasAlpha bool `json:"hasAlpha"`
+		HasBeta  bool `json:"hasBeta"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.IsArray {
+		t.Error("caches.keys() should return an array")
+	}
+	if data.Length < 2 {
+		t.Errorf("caches.keys() length = %d, want >= 2", data.Length)
+	}
+	if !data.HasAlpha {
+		t.Error("caches.keys() should include 'alpha'")
+	}
+	if !data.HasBeta {
+		t.Error("caches.keys() should include 'beta'")
+	}
+}
+
+func TestCacheStorage_Match(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    var myCache = await caches.open('search-cache');
+    var url = 'https://example.com/found';
+    await myCache.put(url, new Response('found-data'));
+
+    // caches.match searches across all named caches.
+    var result = await caches.match(url);
+    var miss = await caches.match('https://example.com/not-found');
+    return Response.json({
+      found: result !== undefined,
+      body: result ? result._body : null,
+      miss: miss === undefined,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, cacheEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Found bool    `json:"found"`
+		Body  *string `json:"body"`
+		Miss  bool    `json:"miss"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.Found {
+		t.Error("caches.match should find entry across caches")
+	}
+	if data.Body == nil || *data.Body != "found-data" {
+		t.Errorf("body = %v, want 'found-data'", data.Body)
+	}
+	if !data.Miss {
+		t.Error("caches.match should return undefined for miss")
+	}
+}
+
 func TestCache_MatchNullRequest(t *testing.T) {
 	e := newTestEngine(t)
 

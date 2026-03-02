@@ -67,6 +67,7 @@ class MessagePort extends EventTarget {
 		this._closed = true;
 		this._remote = null;
 	}
+	get [Symbol.toStringTag]() { return 'MessagePort'; }
 }
 
 class MessageChannel {
@@ -78,6 +79,7 @@ class MessageChannel {
 		this.port1._started = true;
 		this.port2._started = true;
 	}
+	get [Symbol.toStringTag]() { return 'MessageChannel'; }
 }
 
 globalThis.MessagePort = MessagePort;

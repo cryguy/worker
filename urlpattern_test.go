@@ -357,6 +357,66 @@ func TestURLPattern_ExecMethod(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// URLPattern spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestURLPattern_HasRegExpGroups(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const noRegex = new URLPattern({ pathname: '/users/:id' });
+    const withRegex = new URLPattern({ pathname: '/files/(\\d+)' });
+    return Response.json({
+      noRegex: noRegex.hasRegExpGroups,
+      withRegex: withRegex.hasRegExpGroups,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		NoRegex   bool `json:"noRegex"`
+		WithRegex bool `json:"withRegex"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.NoRegex {
+		t.Error("hasRegExpGroups should be false for named params only")
+	}
+	if !data.WithRegex {
+		t.Error("hasRegExpGroups should be true when pattern contains regex groups")
+	}
+}
+
+func TestURLPattern_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const tag = Object.prototype.toString.call(new URLPattern({ pathname: '/*' }));
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object URLPattern]" {
+		t.Errorf("tag = %q, want '[object URLPattern]'", data.Tag)
+	}
+}
+
 func TestURLPattern_InvalidInput(t *testing.T) {
 	e := newTestEngine(t)
 

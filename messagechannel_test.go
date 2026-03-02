@@ -148,6 +148,59 @@ func TestMessageChannel_MultipleListeners(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// MessageChannel/MessagePort spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestMessagePort_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const channel = new MessageChannel();
+    const tag = Object.prototype.toString.call(channel.port1);
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object MessagePort]" {
+		t.Errorf("tag = %q, want '[object MessagePort]'", data.Tag)
+	}
+}
+
+func TestMessageChannel_SymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const tag = Object.prototype.toString.call(new MessageChannel());
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object MessageChannel]" {
+		t.Errorf("tag = %q, want '[object MessageChannel]'", data.Tag)
+	}
+}
+
 func TestMessageChannel_DataCloned(t *testing.T) {
 	e := newTestEngine(t)
 

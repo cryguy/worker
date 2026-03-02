@@ -32,40 +32,55 @@ globalThis.structuredClone = (function() {
 	}
 
 	function deepClone(value, seen) {
-		if (value === undefined) throw cloneError('value could not be cloned');
-		if (value === null) return null;
+		if (value === null || value === undefined) return value;
 
 		var type = typeof value;
 		if (type === 'boolean' || type === 'number' || type === 'string' || type === 'bigint') return value;
-		if (type === 'function') throw cloneError('value could not be cloned');
-		if (type === 'symbol') throw cloneError('value could not be cloned');
+		if (type === 'symbol') throw cloneError('symbol cannot be cloned');
+		if (type === 'function') throw cloneError('function cannot be cloned');
 
 		if (typeof WeakMap !== 'undefined' && value instanceof WeakMap) throw cloneError('WeakMap cannot be cloned');
 		if (typeof WeakSet !== 'undefined' && value instanceof WeakSet) throw cloneError('WeakSet cannot be cloned');
 		if (typeof Promise !== 'undefined' && value instanceof Promise) throw cloneError('Promise cannot be cloned');
 
-		if (seen.has(value)) throw cloneError('value could not be cloned: circular reference');
-		seen.set(value, true);
+		if (seen.has(value)) return seen.get(value);
 
-		if (value instanceof Date) return new Date(value.getTime());
-		if (value instanceof RegExp) return new RegExp(value.source, value.flags);
-		if (value instanceof ArrayBuffer) { return value.slice(0); }
+		if (value instanceof Date) {
+			var clonedDate = new Date(value.getTime());
+			seen.set(value, clonedDate);
+			return clonedDate;
+		}
+		if (value instanceof RegExp) {
+			var clonedRegex = new RegExp(value.source, value.flags);
+			seen.set(value, clonedRegex);
+			return clonedRegex;
+		}
+		if (value instanceof ArrayBuffer) {
+			var clonedAB = value.slice(0);
+			seen.set(value, clonedAB);
+			return clonedAB;
+		}
 
 		for (var ti = 0; ti < TYPED_ARRAY_CONSTRUCTORS.length; ti++) {
 			var TA = TYPED_ARRAY_CONSTRUCTORS[ti];
 			if (value instanceof TA) {
 				var clonedBuf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
-				return new TA(clonedBuf);
+				var clonedTA = new TA(clonedBuf);
+				seen.set(value, clonedTA);
+				return clonedTA;
 			}
 		}
 
 		if (typeof DataView !== 'undefined' && value instanceof DataView) {
 			var dvBuf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
-			return new DataView(dvBuf);
+			var clonedDV = new DataView(dvBuf);
+			seen.set(value, clonedDV);
+			return clonedDV;
 		}
 
 		if (typeof Map !== 'undefined' && value instanceof Map) {
 			var clonedMap = new Map();
+			seen.set(value, clonedMap);
 			value.forEach(function(v, k) {
 				clonedMap.set(deepClone(k, seen), deepClone(v, seen));
 			});
@@ -74,6 +89,7 @@ globalThis.structuredClone = (function() {
 
 		if (typeof Set !== 'undefined' && value instanceof Set) {
 			var clonedSet = new Set();
+			seen.set(value, clonedSet);
 			value.forEach(function(v) {
 				clonedSet.add(deepClone(v, seen));
 			});
@@ -81,7 +97,8 @@ globalThis.structuredClone = (function() {
 		}
 
 		if (Array.isArray(value)) {
-			var arr = new Array(value.length);
+			var arr = [];
+			seen.set(value, arr);
 			for (var i = 0; i < value.length; i++) {
 				arr[i] = deepClone(value[i], seen);
 			}
@@ -89,6 +106,7 @@ globalThis.structuredClone = (function() {
 		}
 
 		var result = {};
+		seen.set(value, result);
 		var keys = Object.keys(value);
 		for (var j = 0; j < keys.length; j++) {
 			result[keys[j]] = deepClone(value[keys[j]], seen);
@@ -96,8 +114,13 @@ globalThis.structuredClone = (function() {
 		return result;
 	}
 
-	return function structuredClone(value) {
-		return deepClone(value, new WeakMap());
+	return function structuredClone(value, options) {
+		var cloned = deepClone(value, new WeakMap());
+		if (options && options.transfer) {
+			// Transfer is a no-op in our env but we accept the parameter
+			// to avoid TypeError when frameworks pass it
+		}
+		return cloned;
 	};
 })();
 
@@ -181,6 +204,7 @@ func SetupGlobals(rt core.JSRuntime, _ *eventloop.EventLoop) error {
 	// Set up performance object with Go-backed now().
 	if err := rt.Eval(`
 		globalThis.performance = {
+			timeOrigin: Date.now(),
 			now: function() { return __performanceNow(); }
 		};
 	`); err != nil {

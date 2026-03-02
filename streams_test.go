@@ -1881,3 +1881,184 @@ func TestStreams_PipeThroughTransformStream(t *testing.T) {
 		t.Errorf("result = %v, want [a!, b!, c!]", data.Result)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ReadableStream spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestStreams_ReadableStreamValues(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const rs = new ReadableStream({
+      start(c) { c.enqueue('a'); c.enqueue('b'); c.enqueue('c'); c.close(); }
+    });
+    const result = [];
+    for await (const v of rs.values()) result.push(v);
+    return Response.json({ result });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Result []string `json:"result"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(data.Result) != 3 || data.Result[0] != "a" || data.Result[1] != "b" || data.Result[2] != "c" {
+		t.Errorf("result = %v, want [a, b, c]", data.Result)
+	}
+}
+
+func TestStreams_ReadableStreamSymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const rs = new ReadableStream();
+    const tag = Object.prototype.toString.call(rs);
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object ReadableStream]" {
+		t.Errorf("tag = %q, want '[object ReadableStream]'", data.Tag)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WritableStream spec compliance tests
+// ---------------------------------------------------------------------------
+
+func TestStreams_WritableStreamAbortDirect(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const ws = new WritableStream();
+    try {
+      await ws.abort('done');
+      return Response.json({ success: true });
+    } catch(e) {
+      return Response.json({ success: false, error: e.message });
+    }
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Success {
+		t.Errorf("WritableStream.abort() should not throw, got error: %q", data.Error)
+	}
+}
+
+func TestStreams_WritableStreamCloseDirect(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  async fetch(request, env) {
+    const chunks = [];
+    const ws = new WritableStream({
+      write(chunk) { chunks.push(chunk); }
+    });
+    const writer = ws.getWriter();
+    await writer.write('hello');
+    writer.releaseLock();
+    try {
+      await ws.close();
+      return Response.json({ success: true, chunks });
+    } catch(e) {
+      return Response.json({ success: false, error: e.message });
+    }
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Success bool     `json:"success"`
+		Chunks  []string `json:"chunks"`
+		Error   string   `json:"error"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Success {
+		t.Errorf("WritableStream.close() should not throw, got error: %q", data.Error)
+	}
+	if len(data.Chunks) != 1 || data.Chunks[0] != "hello" {
+		t.Errorf("chunks = %v, want [hello]", data.Chunks)
+	}
+}
+
+func TestStreams_WritableStreamSymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const ws = new WritableStream();
+    const tag = Object.prototype.toString.call(ws);
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object WritableStream]" {
+		t.Errorf("tag = %q, want '[object WritableStream]'", data.Tag)
+	}
+}
+
+func TestStreams_TransformStreamSymbolToStringTag(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const ts = new TransformStream();
+    const tag = Object.prototype.toString.call(ts);
+    return Response.json({ tag });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data.Tag != "[object TransformStream]" {
+		t.Errorf("tag = %q, want '[object TransformStream]'", data.Tag)
+	}
+}
