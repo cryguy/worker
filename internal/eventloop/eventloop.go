@@ -206,6 +206,9 @@ func (el *EventLoop) Drain(rt core.JSRuntime, deadline time.Time) {
 						if el.DrainPendingFetches(rt) {
 							break
 						}
+						if next.cleared {
+							break
+						}
 						time.Sleep(1 * time.Millisecond)
 					}
 				}
@@ -214,7 +217,12 @@ func (el *EventLoop) Drain(rt core.JSRuntime, deadline time.Time) {
 			if hasFetches {
 				timerDeadline := now.Add(wait)
 				for time.Now().Before(timerDeadline) {
-					el.DrainPendingFetches(rt)
+					if el.DrainPendingFetches(rt) && next.cleared {
+						break
+					}
+					if next.cleared {
+						break
+					}
 					remaining := time.Until(timerDeadline)
 					if remaining <= 0 {
 						break
