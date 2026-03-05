@@ -2497,6 +2497,64 @@ func TestURL_SetPort(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Spec compliance: URL constructor accepts URL object input
+// ---------------------------------------------------------------------------
+
+func TestURL_ConstructFromURLObject(t *testing.T) {
+	e := newTestEngine(t)
+
+	source := `export default {
+  fetch(request, env) {
+    const orig = new URL('https://example.com:8080/path?q=1#frag');
+    const copy = new URL(orig);
+    return Response.json({
+      href: copy.href,
+      same: copy.href === orig.href,
+      hostname: copy.hostname,
+      port: copy.port,
+      pathname: copy.pathname,
+      search: copy.search,
+      hash: copy.hash,
+    });
+  },
+};`
+
+	r := execJS(t, e, source, defaultEnv(), getReq("http://localhost/"))
+	assertOK(t, r)
+
+	var data struct {
+		Href     string `json:"href"`
+		Same     bool   `json:"same"`
+		Hostname string `json:"hostname"`
+		Port     string `json:"port"`
+		Pathname string `json:"pathname"`
+		Search   string `json:"search"`
+		Hash     string `json:"hash"`
+	}
+	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !data.Same {
+		t.Errorf("new URL(urlObj) should produce identical href, got %q", data.Href)
+	}
+	if data.Hostname != "example.com" {
+		t.Errorf("hostname = %q, want %q", data.Hostname, "example.com")
+	}
+	if data.Port != "8080" {
+		t.Errorf("port = %q, want %q", data.Port, "8080")
+	}
+	if data.Pathname != "/path" {
+		t.Errorf("pathname = %q, want %q", data.Pathname, "/path")
+	}
+	if data.Search != "?q=1" {
+		t.Errorf("search = %q, want %q", data.Search, "?q=1")
+	}
+	if data.Hash != "#frag" {
+		t.Errorf("hash = %q, want %q", data.Hash, "#frag")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Spec compliance: Request constructor validation
 // ---------------------------------------------------------------------------
 

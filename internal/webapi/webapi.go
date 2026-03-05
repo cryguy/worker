@@ -53,6 +53,8 @@ class Headers {
 
 class URL {
 	constructor(input, base) {
+		if (typeof input === 'object' && input !== null) input = String(input);
+		if (base !== undefined && typeof base === 'object' && base !== null) base = String(base);
 		const parsed = JSON.parse(__parseURL(input, base || ''));
 		if (parsed.error) throw new TypeError(parsed.error);
 		this._protocol = parsed.protocol;
@@ -81,6 +83,7 @@ class URL {
 	}
 	get href() { return this._href; }
 	set href(v) {
+		if (typeof v === 'object' && v !== null) v = String(v);
 		const parsed = JSON.parse(__parseURL(v, ''));
 		if (parsed.error) throw new TypeError(parsed.error);
 		this._protocol = parsed.protocol;
