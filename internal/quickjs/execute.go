@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cryguy/worker/v2/internal/core"
+	"github.com/cryguy/worker/v2/internal/eventloop"
 	"github.com/cryguy/worker/v2/internal/webapi"
 	"modernc.org/quickjs"
 )
@@ -98,6 +99,16 @@ func (e *Engine) CompileAndCache(siteID string, deployKey string, source string)
 		return nil, fmt.Errorf("creating validation VM: %w", err)
 	}
 	defer vm.Close()
+
+	// Run polyfill setup so top-level references to Web APIs (TextEncoder, etc.)
+	// don't fail — QuickJS has no compile-only API, so EvalValue executes the script.
+	rt := &qjsRuntime{vm: vm}
+	el := eventloop.New()
+	for _, setup := range buildSetupFuncs(e.config) {
+		if err := setup(rt, el); err != nil {
+			return nil, fmt.Errorf("validation setup: %w", err)
+		}
+	}
 
 	wrapped := webapi.WrapESModule(source)
 	v, err := vm.EvalValue(wrapped, quickjs.EvalGlobal)
