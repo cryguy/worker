@@ -50,6 +50,7 @@ type RequestState struct {
 	NextTCPSocketID int64
 
 	// In-flight fetch cancellation: maps fetchID -> cancel function.
+	fetchMu      sync.Mutex
 	FetchCancels map[string]context.CancelFunc
 	NextFetchID  int64
 
@@ -216,6 +217,8 @@ func RegisterFetchCancel(reqID uint64, cancel context.CancelFunc) string {
 	if state == nil {
 		return ""
 	}
+	state.fetchMu.Lock()
+	defer state.fetchMu.Unlock()
 	state.NextFetchID++
 	id := strconv.FormatInt(state.NextFetchID, 10)
 	if state.FetchCancels == nil {
@@ -228,7 +231,12 @@ func RegisterFetchCancel(reqID uint64, cancel context.CancelFunc) string {
 // RemoveFetchCancel removes and returns the cancel function for a fetch.
 func RemoveFetchCancel(reqID uint64, fetchID string) context.CancelFunc {
 	state := GetRequestState(reqID)
-	if state == nil || state.FetchCancels == nil {
+	if state == nil {
+		return nil
+	}
+	state.fetchMu.Lock()
+	defer state.fetchMu.Unlock()
+	if state.FetchCancels == nil {
 		return nil
 	}
 	cancel := state.FetchCancels[fetchID]

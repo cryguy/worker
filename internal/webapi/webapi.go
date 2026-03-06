@@ -3,7 +3,9 @@ package webapi
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
+	"strings"
+
+	whatwgUrl "github.com/nlnwa/whatwg-url/url"
 
 	"github.com/cryguy/worker/v2/internal/core"
 	"github.com/cryguy/worker/v2/internal/eventloop"
@@ -57,6 +59,11 @@ class URL {
 		if (base !== undefined && typeof base === 'object' && base !== null) base = String(base);
 		const parsed = JSON.parse(__parseURL(input, base || ''));
 		if (parsed.error) throw new TypeError(parsed.error);
+		this._applyParsed(parsed);
+		this._searchParams = new URLSearchParams(this._search);
+		this._searchParams._url = this;
+	}
+	_applyParsed(parsed) {
 		this._protocol = parsed.protocol;
 		this._hostname = parsed.hostname;
 		this._port = parsed.port;
@@ -68,68 +75,47 @@ class URL {
 		this._username = parsed.username || '';
 		this._password = parsed.password || '';
 		this._href = parsed.href;
-		this._buildHref();
-		this._searchParams = new URLSearchParams(this._search);
-		this._searchParams._url = this;
 	}
-	_buildHref() {
-		let userInfo = '';
-		if (this._username) {
-			userInfo = this._username + (this._password ? ':' + this._password : '') + '@';
-		}
-		this._host = this._port ? this._hostname + ':' + this._port : this._hostname;
-		this._origin = this._protocol + '//' + this._host;
-		this._href = this._protocol + '//' + userInfo + this._host + this._pathname + this._search + this._hash;
+	_set(field, value) {
+		const parsed = JSON.parse(__setURL(this._href, field, String(value)));
+		if (parsed.error) return;
+		this._applyParsed(parsed);
 	}
 	get href() { return this._href; }
 	set href(v) {
 		if (typeof v === 'object' && v !== null) v = String(v);
-		const parsed = JSON.parse(__parseURL(v, ''));
+		const parsed = JSON.parse(__setURL(this._href, 'href', v));
 		if (parsed.error) throw new TypeError(parsed.error);
-		this._protocol = parsed.protocol;
-		this._hostname = parsed.hostname;
-		this._port = parsed.port;
-		this._pathname = parsed.pathname;
-		this._search = parsed.search;
-		this._hash = parsed.hash;
-		this._username = parsed.username || '';
-		this._password = parsed.password || '';
-		this._buildHref();
+		this._applyParsed(parsed);
 		this._rebuildSearchParams();
 	}
 	get protocol() { return this._protocol; }
-	set protocol(v) { this._protocol = v; this._buildHref(); }
+	set protocol(v) { this._set('protocol', v); }
 	get hostname() { return this._hostname; }
-	set hostname(v) { this._hostname = v; this._buildHref(); }
+	set hostname(v) { this._set('hostname', v); }
 	get port() { return this._port; }
-	set port(v) { this._port = String(v); this._buildHref(); }
+	set port(v) { this._set('port', v); }
 	get pathname() { return this._pathname; }
-	set pathname(v) { this._pathname = v; this._buildHref(); }
+	set pathname(v) { this._set('pathname', v); }
 	get search() { return this._search; }
 	set search(v) {
-		this._search = v;
-		this._buildHref();
+		this._set('search', v);
 		this._rebuildSearchParams();
 	}
 	get hash() { return this._hash; }
-	set hash(v) { this._hash = v; this._buildHref(); }
+	set hash(v) { this._set('hash', v); }
 	get origin() { return this._origin; }
 	get host() { return this._host; }
+	set host(v) { this._set('host', v); }
 	get username() { return this._username; }
-	set username(v) { this._username = v; this._buildHref(); }
+	set username(v) { this._set('username', v); }
 	get password() { return this._password; }
-	set password(v) { this._password = v; this._buildHref(); }
+	set password(v) { this._set('password', v); }
 	get searchParams() { return this._searchParams; }
 	_rebuildSearchParams() {
 		if (!this._searchParams) return;
-		this._searchParams._entries = [];
 		const s = this._search.startsWith('?') ? this._search.slice(1) : this._search;
-		if (s) {
-			for (const pair of s.split('&')) {
-				const [k, ...rest] = pair.split('=');
-				this._searchParams._entries.push([decodeURIComponent(k.replace(/\+/g, '%20')), decodeURIComponent(rest.join('=').replace(/\+/g, '%20'))]);
-			}
-		}
+		this._searchParams._entries = URLSearchParams._parseStr(s);
 	}
 	toString() { return this.href; }
 	toJSON() { return this.href; }
@@ -151,6 +137,28 @@ class URL {
 }
 
 class URLSearchParams {
+	static _pctDecode(s) {
+		try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch { return s.replace(/\+/g, ' '); }
+	}
+	static _parseStr(s) {
+		var entries = [];
+		if (!s) return entries;
+		var pairs = s.split('&');
+		for (var i = 0; i < pairs.length; i++) {
+			if (pairs[i] === '') continue;
+			var idx = pairs[i].indexOf('=');
+			var name, value;
+			if (idx === -1) { name = pairs[i]; value = ''; }
+			else { name = pairs[i].slice(0, idx); value = pairs[i].slice(idx + 1); }
+			entries.push([URLSearchParams._pctDecode(name), URLSearchParams._pctDecode(value)]);
+		}
+		return entries;
+	}
+	static _formEncode(s) {
+		return encodeURIComponent(s).replace(/%20/g, '+').replace(/[!'()~]/g, function(c) {
+			return '%' + c.charCodeAt(0).toString(16).toUpperCase();
+		});
+	}
 	constructor(init) {
 		this._entries = [];
 		if (init instanceof URLSearchParams) {
@@ -161,12 +169,7 @@ class URLSearchParams {
 			for (const [k, v] of Object.entries(init)) this._entries.push([String(k), String(v)]);
 		} else if (typeof init === 'string') {
 			const s = init.startsWith('?') ? init.slice(1) : init;
-			if (s) {
-				for (const pair of s.split('&')) {
-					const [k, ...rest] = pair.split('=');
-					this._entries.push([decodeURIComponent(k.replace(/\+/g, '%20')), decodeURIComponent(rest.join('=').replace(/\+/g, '%20'))]);
-				}
-			}
+			this._entries = URLSearchParams._parseStr(s);
 		}
 	}
 	get(name) {
@@ -174,12 +177,12 @@ class URLSearchParams {
 		return e ? e[1] : null;
 	}
 	has(name, value) {
-		return arguments.length > 1
+		return (arguments.length > 1 && value !== undefined)
 			? this._entries.some(([k, v]) => k === name && v === value)
 			: this._entries.some(([k]) => k === name);
 	}
 	get size() { return this._entries.length; }
-	toString() { return this._entries.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
+	toString() { return this._entries.map(([k, v]) => URLSearchParams._formEncode(k) + '=' + URLSearchParams._formEncode(v)).join('&'); }
 	forEach(cb) { for (const [k, v] of this._entries) cb(v, k, this); }
 	entries() { return this._entries[Symbol.iterator](); }
 	keys() { return this._entries.map(([k]) => k)[Symbol.iterator](); }
@@ -703,7 +706,7 @@ USP.append = function(name, value) {
 };
 
 USP['delete'] = function(name, value) {
-	if (arguments.length > 1) {
+	if (arguments.length > 1 && value !== undefined) {
 		var v = String(value);
 		this._entries = this._entries.filter(function(e) { return !(e[0] === name && e[1] === v); });
 	} else {
@@ -735,78 +738,101 @@ type URLParsed struct {
 	Password string `json:"password"`
 }
 
+// whatwgParser is a package-level URL parser using the WHATWG URL standard.
+var whatwgParser = whatwgUrl.NewParser(whatwgUrl.WithAcceptInvalidCodepoints())
+
+// __escNull replaces literal U+0000 with %00 so C-string FFI doesn't truncate.
+func __escNull(s string) string {
+	return strings.ReplaceAll(s, "\x00", "%00")
+}
+
+// urlOrigin computes the origin for a parsed URL per the WHATWG spec.
+func urlOrigin(u *whatwgUrl.Url) string {
+	scheme := u.Scheme()
+	switch scheme {
+	case "http", "https", "ftp", "ws", "wss":
+		return u.Protocol() + "//" + u.Host()
+	case "blob":
+		// Try parsing the path as a URL to get its origin.
+		inner, err := whatwgParser.Parse(u.Pathname())
+		if err == nil {
+			return urlOrigin(inner)
+		}
+		return "null"
+	default:
+		return "null"
+	}
+}
+
+// urlToParsed extracts all fields from a whatwg-url Url into a URLParsed.
+func urlToParsed(u *whatwgUrl.Url) *URLParsed {
+	return &URLParsed{
+		Href:     __escNull(u.Href(false)),
+		Protocol: __escNull(u.Protocol()),
+		Hostname: __escNull(u.Hostname()),
+		Port:     u.Port(),
+		Pathname: __escNull(u.Pathname()),
+		Search:   __escNull(u.Search()),
+		Hash:     __escNull(u.Hash()),
+		Origin:   __escNull(urlOrigin(u)),
+		Host:     __escNull(u.Host()),
+		Username: __escNull(u.Username()),
+		Password: __escNull(u.Password()),
+	}
+}
+
 func ParseURL(rawURL, base string) (*URLParsed, error) {
-	var u *url.URL
+	var u *whatwgUrl.Url
 	var err error
 
 	if base != "" {
-		baseURL, berr := url.Parse(base)
-		if berr != nil {
-			return nil, fmt.Errorf("invalid base URL: %s", base)
-		}
-		ref, rerr := url.Parse(rawURL)
-		if rerr != nil {
-			return nil, fmt.Errorf("invalid URL: %s", rawURL)
-		}
-		u = baseURL.ResolveReference(ref)
+		u, err = whatwgParser.ParseRef(base, rawURL)
 	} else {
-		u, err = url.Parse(rawURL)
-		if err != nil {
-			return nil, fmt.Errorf("invalid URL: %s", rawURL)
-		}
+		u, err = whatwgParser.Parse(rawURL)
 	}
-
-	if u.Scheme == "" {
+	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %s", rawURL)
 	}
 
-	protocol := u.Scheme + ":"
-	hostname := u.Hostname()
-	port := u.Port()
-	host := hostname
-	if port != "" {
-		host = hostname + ":" + port
-	}
-	origin := protocol + "//" + host
-	search := ""
-	if u.RawQuery != "" {
-		search = "?" + u.RawQuery
-	}
-	hash := ""
-	if u.Fragment != "" {
-		hash = "#" + u.Fragment
-	}
+	return urlToParsed(u), nil
+}
 
-	var username, password string
-	if u.User != nil {
-		username = u.User.Username()
-		password, _ = u.User.Password()
+// SetURL applies a setter operation on a parsed URL and returns the updated URLParsed.
+func SetURL(href, field, value string) (*URLParsed, error) {
+	u, err := whatwgParser.Parse(href)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %s", href)
 	}
-
-	pathname := u.Path
-	if pathname == "" {
-		pathname = "/"
+	switch field {
+	case "protocol":
+		u.SetProtocol(value)
+	case "username":
+		u.SetUsername(value)
+	case "password":
+		u.SetPassword(value)
+	case "host":
+		u.SetHost(value)
+	case "hostname":
+		u.SetHostname(value)
+	case "port":
+		u.SetPort(value)
+	case "pathname":
+		u.SetPathname(value)
+	case "search":
+		u.SetSearch(value)
+	case "hash":
+		u.SetHash(value)
+	case "href":
+		// No SetHref — re-parse the value as a new URL.
+		u2, err2 := whatwgParser.Parse(value)
+		if err2 != nil {
+			return nil, fmt.Errorf("invalid URL: %s", value)
+		}
+		return urlToParsed(u2), nil
+	default:
+		return nil, fmt.Errorf("unknown URL field: %s", field)
 	}
-
-	userInfo := ""
-	if u.User != nil {
-		userInfo = u.User.String() + "@"
-	}
-	href := protocol + "//" + userInfo + host + pathname + search + hash
-
-	return &URLParsed{
-		Href:     href,
-		Protocol: protocol,
-		Hostname: hostname,
-		Port:     port,
-		Pathname: pathname,
-		Search:   search,
-		Hash:     hash,
-		Origin:   origin,
-		Host:     host,
-		Username: username,
-		Password: password,
-	}, nil
+	return urlToParsed(u), nil
 }
 
 // SetupWebAPIs registers Go-backed helpers and evaluates the JS class
@@ -815,6 +841,18 @@ func SetupWebAPIs(rt core.JSRuntime, _ *eventloop.EventLoop) error {
 	// Register Go-backed URL parser.
 	if err := rt.RegisterFunc("__parseURL", func(rawURL, base string) (string, error) {
 		parsed, err := ParseURL(rawURL, base)
+		if err != nil {
+			return fmt.Sprintf(`{"error":%q}`, err.Error()), nil
+		}
+		data, _ := json.Marshal(parsed)
+		return string(data), nil
+	}); err != nil {
+		return err
+	}
+
+	// Register Go-backed URL setter.
+	if err := rt.RegisterFunc("__setURL", func(href, field, value string) (string, error) {
+		parsed, err := SetURL(href, field, value)
 		if err != nil {
 			return fmt.Sprintf(`{"error":%q}`, err.Error()), nil
 		}

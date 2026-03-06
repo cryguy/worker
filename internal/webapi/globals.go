@@ -42,6 +42,8 @@ globalThis.structuredClone = (function() {
 		if (typeof WeakMap !== 'undefined' && value instanceof WeakMap) throw cloneError('WeakMap cannot be cloned');
 		if (typeof WeakSet !== 'undefined' && value instanceof WeakSet) throw cloneError('WeakSet cannot be cloned');
 		if (typeof Promise !== 'undefined' && value instanceof Promise) throw cloneError('Promise cannot be cloned');
+		if (typeof URL !== 'undefined' && value instanceof URL) throw cloneError('URL cannot be cloned');
+		if (typeof URLSearchParams !== 'undefined' && value instanceof URLSearchParams) throw cloneError('URLSearchParams cannot be cloned');
 
 		if (seen.has(value)) return seen.get(value);
 
