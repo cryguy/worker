@@ -120,6 +120,9 @@ class URL {
 	toString() { return this.href; }
 	toJSON() { return this.href; }
 	get [Symbol.toStringTag]() { return 'URL'; }
+	static parse(url, base) {
+		try { return new URL(url, base); } catch { return null; }
+	}
 	static canParse(url, base) {
 		try {
 			if (url === null || url === undefined) {
@@ -138,7 +141,19 @@ class URL {
 
 class URLSearchParams {
 	static _pctDecode(s) {
-		try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch { return s.replace(/\+/g, ' '); }
+		s = s.replace(/\+/g, ' ');
+		try { return decodeURIComponent(s); } catch {}
+		var r = '', i = 0;
+		while (i < s.length) {
+			if (s[i] === '%' && i + 2 < s.length && /[0-9A-Fa-f]/.test(s[i+1]) && /[0-9A-Fa-f]/.test(s[i+2])) {
+				var enc = '';
+				while (i < s.length && s[i] === '%' && i + 2 < s.length && /[0-9A-Fa-f]/.test(s[i+1]) && /[0-9A-Fa-f]/.test(s[i+2])) {
+					enc += s.slice(i, i + 3); i += 3;
+				}
+				try { r += decodeURIComponent(enc); } catch { r += enc; }
+			} else { r += s[i]; i++; }
+		}
+		return r;
 	}
 	static _parseStr(s) {
 		var entries = [];
@@ -155,7 +170,7 @@ class URLSearchParams {
 		return entries;
 	}
 	static _formEncode(s) {
-		return encodeURIComponent(s).replace(/%20/g, '+').replace(/[!'()~]/g, function(c) {
+		return encodeURIComponent(s).replace(/%20/g, '+').replace(/%2[aA]/g, '*').replace(/[!'()~]/g, function(c) {
 			return '%' + c.charCodeAt(0).toString(16).toUpperCase();
 		});
 	}
@@ -173,20 +188,31 @@ class URLSearchParams {
 		}
 	}
 	get(name) {
+		name = String(name);
 		const e = this._entries.find(([k]) => k === name);
 		return e ? e[1] : null;
 	}
 	has(name, value) {
+		name = String(name);
 		return (arguments.length > 1 && value !== undefined)
-			? this._entries.some(([k, v]) => k === name && v === value)
+			? this._entries.some(([k, v]) => k === name && v === String(value))
 			: this._entries.some(([k]) => k === name);
 	}
 	get size() { return this._entries.length; }
 	toString() { return this._entries.map(([k, v]) => URLSearchParams._formEncode(k) + '=' + URLSearchParams._formEncode(v)).join('&'); }
-	forEach(cb) { for (const [k, v] of this._entries) cb(v, k, this); }
-	entries() { return this._entries[Symbol.iterator](); }
-	keys() { return this._entries.map(([k]) => k)[Symbol.iterator](); }
-	values() { return this._entries.map(([, v]) => v)[Symbol.iterator](); }
+	forEach(cb) { for (var i = 0; i < this._entries.length; i++) cb(this._entries[i][1], this._entries[i][0], this); }
+	entries() {
+		var self = this, i = 0;
+		return { next: function() { return i >= self._entries.length ? {done:true} : {done:false, value:self._entries[i++]}; }, [Symbol.iterator]: function() { return this; } };
+	}
+	keys() {
+		var self = this, i = 0;
+		return { next: function() { return i >= self._entries.length ? {done:true} : {done:false, value:self._entries[i++][0]}; }, [Symbol.iterator]: function() { return this; } };
+	}
+	values() {
+		var self = this, i = 0;
+		return { next: function() { return i >= self._entries.length ? {done:true} : {done:false, value:self._entries[i++][1]}; }, [Symbol.iterator]: function() { return this; } };
+	}
 	get [Symbol.toStringTag]() { return 'URLSearchParams'; }
 	[Symbol.iterator]() { return this.entries(); }
 }
@@ -677,10 +703,12 @@ USP._sync = function() {
 };
 
 USP.getAll = function(name) {
+	name = String(name);
 	return this._entries.filter(function(e) { return e[0] === name; }).map(function(e) { return e[1]; });
 };
 
 USP.set = function(name, value) {
+	name = String(name);
 	var s = String(value);
 	var found = false;
 	var filtered = [];
@@ -701,11 +729,12 @@ USP.set = function(name, value) {
 };
 
 USP.append = function(name, value) {
-	this._entries.push([name, String(value)]);
+	this._entries.push([String(name), String(value)]);
 	this._sync();
 };
 
 USP['delete'] = function(name, value) {
+	name = String(name);
 	if (arguments.length > 1 && value !== undefined) {
 		var v = String(value);
 		this._entries = this._entries.filter(function(e) { return !(e[0] === name && e[1] === v); });
