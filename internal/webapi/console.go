@@ -24,26 +24,28 @@ func SetupConsole(rt core.JSRuntime, _ *eventloop.EventLoop) error {
 	// Build console object in JS that calls __console.
 	consoleJS := `
 (function() {
+	function fmt(arg) {
+		if (arg === null) return 'null';
+		if (arg === undefined) return 'undefined';
+		if (typeof arg === 'symbol') return arg.toString();
+		if (typeof arg !== 'object') return String(arg);
+		return '[object Object]';
+	}
 	var levels = ['log', 'info', 'warn', 'error', 'debug'];
-	var con = {};
+	var proto = Object.create(Object.prototype);
+	var con = Object.create(proto);
 	for (var i = 0; i < levels.length; i++) {
 		(function(lvl) {
 			con[lvl] = function() {
 				var parts = [];
-				for (var j = 0; j < arguments.length; j++) {
-					var arg = arguments[j];
-					if (typeof arg === 'object' && arg !== null) {
-						parts.push('[object Object]');
-					} else {
-						parts.push(String(arg));
-					}
-				}
+				for (var j = 0; j < arguments.length; j++) parts.push(fmt(arguments[j]));
 				var reqID = globalThis.__requestID || '';
 				__console(reqID, lvl, parts.join(' '));
 			};
 		})(levels[i]);
 	}
-	globalThis.console = con;
+	Object.defineProperty(con, Symbol.toStringTag, { value: 'console', configurable: true });
+	Object.defineProperty(globalThis, 'console', { value: con, writable: true, enumerable: false, configurable: true });
 })();
 `
 	return rt.Eval(consoleJS)

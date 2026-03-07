@@ -31,10 +31,14 @@ func GoRequestToJS(rt core.JSRuntime, req *core.WorkerRequest) error {
 	script := fmt.Sprintf(`(function() {
 		var init = {
 			method: globalThis.__tmp_method,
-			headers: JSON.parse(globalThis.__tmp_headers_json),
 		};
 		%s
 		globalThis.__req = new Request(globalThis.__tmp_url, init);
+		globalThis.__req._headers._guard = 'none';
+		var _hdr = JSON.parse(globalThis.__tmp_headers_json);
+		for (var _k in _hdr) {
+			if (_hdr.hasOwnProperty(_k)) globalThis.__req._headers.set(_k, _hdr[_k]);
+		}
 		delete globalThis.__tmp_url;
 		delete globalThis.__tmp_method;
 		delete globalThis.__tmp_headers_json;

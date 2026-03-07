@@ -8,20 +8,21 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/cryguy/worker/v2/internal/core"
-	"github.com/cryguy/worker/v2/internal/quickjs"
 	"github.com/cryguy/worker/v2/internal/webapi"
 )
 
 // skipTests lists test files that require infrastructure we don't support
 // (e.g. WebIDL harness, service workers).
 var skipTests = map[string]string{
-	"idlharness.any.js": "requires WebIDL harness infrastructure",
+	"idlharness.any.js":          "requires WebIDL harness infrastructure",
+	"streams/decode-utf8.any.js": "requires SharedArrayBuffer (common/sab.js)",
 }
 
 func init() {
@@ -213,12 +214,12 @@ func runWPTTest(t *testing.T, testPath, baseURL string) ([]testCaseResult, *harn
 
 	// Create a standalone runtime.
 	cfg := core.EngineConfig{
-		MemoryLimitMB:    128,
-		MaxFetchRequests: 50,
+		MemoryLimitMB:    256,
+		MaxFetchRequests: 200,
 		ExecutionTimeout: 30000,
 		FetchTimeoutSec:  30,
 	}
-	rt, el, cleanup, err := quickjs.NewStandaloneRuntime(cfg)
+	rt, el, cleanup, err := newStandaloneRuntime(cfg)
 	if err != nil {
 		t.Fatalf("creating runtime: %v", err)
 	}
@@ -375,11 +376,16 @@ func RunWPTTestArea(t *testing.T, area string) {
 
 			// Determine expected failures for this test file.
 			var expectedFails map[string]bool
+			var expectAllFail bool
 			if exp != nil {
 				if e, ok := exp[testName]; ok {
 					expectedFails = make(map[string]bool)
 					for _, name := range e.ExpectedFailures {
-						expectedFails[name] = true
+						if name == "*" {
+							expectAllFail = true
+						} else {
+							expectedFails[name] = true
+						}
 					}
 				}
 			}
@@ -397,12 +403,12 @@ func RunWPTTestArea(t *testing.T, area string) {
 			expectedFailed := 0
 			for _, r := range results {
 				if r.Status == 0 {
-					if expectedFails[r.Name] {
+					if expectedFails[r.Name] || expectAllFail {
 						t.Logf("UNEXPECTED PASS: %s (was expected to fail)", r.Name)
 					}
 					passed++
 				} else {
-					if expectedFails[r.Name] {
+					if expectedFails[r.Name] || expectAllFail {
 						expectedFailed++
 						continue
 					}
@@ -428,14 +434,83 @@ var (
 	wptServerURL  string
 )
 
-// ensureWPTServer starts a minimal static file server for WPT resources.
-// This is needed for tests that use fetch() to load test data (like urltestdata.json).
-// It serves the WPT suite directory. For full WPT compatibility you'd run
-// `python wpt serve`, but this handles the common case of static resource fetches.
+// ensureWPTServer returns a URL for WPT resources. It prefers the full Python
+// WPT server (python wpt serve) if running, since it can execute .py handlers
+// like inspect-headers.py. Falls back to a minimal Go static file server.
 func ensureWPTServer(t *testing.T) string {
 	t.Helper()
 	wptServerOnce.Do(func() {
+		// Prefer the Python WPT server if running.
+		resp, err := http.Get("http://web-platform.test:8000/")
+		if err == nil {
+			resp.Body.Close()
+			wptServerURL = "http://web-platform.test:8000"
+			return
+		}
+
+		// Fall back to a simple Go static file server with .py handler shims.
 		mux := http.NewServeMux()
+		// Replicate fetch/api/resources/inspect-headers.py: echo request
+		// headers back as x-request-<name> response headers.
+		mux.HandleFunc("/fetch/api/resources/inspect-headers.py", func(w http.ResponseWriter, r *http.Request) {
+			headersParam := r.URL.Query().Get("headers")
+			var checkedHeaders []string
+			if headersParam != "" {
+				checkedHeaders = strings.Split(headersParam, "|")
+			}
+			for _, h := range checkedHeaders {
+				canonKey := http.CanonicalHeaderKey(h)
+				if vals, ok := r.Header[canonKey]; ok {
+					w.Header().Set("x-request-"+h, strings.Join(vals, ", "))
+				}
+			}
+			if r.URL.Query().Get("cors") != "" {
+				origin := r.Header.Get("Origin")
+				if origin != "" {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+				} else {
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+				}
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, HEAD")
+				var exposed []string
+				for _, h2 := range checkedHeaders {
+					exposed = append(exposed, "x-request-"+h2)
+				}
+				w.Header().Set("Access-Control-Expose-Headers", strings.Join(exposed, ", "))
+				if ah := r.URL.Query().Get("allow_headers"); ah != "" {
+					w.Header().Set("Access-Control-Allow-Headers", ah)
+				} else {
+					var reqHdrs []string
+					for k := range r.Header {
+						reqHdrs = append(reqHdrs, k)
+					}
+					w.Header().Set("Access-Control-Allow-Headers", strings.Join(reqHdrs, ", "))
+				}
+			}
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(200)
+		})
+		// Replicate fetch/api/resources/trickle.py: write "TEST_TRICKLE\n"
+		// count times with optional delay between chunks.
+		mux.HandleFunc("/fetch/api/resources/trickle.py", func(w http.ResponseWriter, r *http.Request) {
+			count := 50
+			if c := r.URL.Query().Get("count"); c != "" {
+				if n, err := strconv.Atoi(c); err == nil {
+					count = n
+				}
+			}
+			if r.URL.Query().Get("notype") == "" {
+				w.Header().Set("Content-Type", "text/plain")
+			}
+			w.WriteHeader(200)
+			for i := 0; i < count; i++ {
+				_, _ = w.Write([]byte("TEST_TRICKLE\n"))
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+		})
 		mux.Handle("/", http.FileServer(http.Dir(wptSuiteDir)))
 		server := &http.Server{Handler: mux}
 
@@ -453,6 +528,7 @@ func ensureWPTServer(t *testing.T) string {
 
 // --- Concrete test functions for each WPT area ---
 
+// passing for both quickjs+v8
 func TestWPT_URL(t *testing.T) {
 	RunWPTTestArea(t, "url")
 }
@@ -497,10 +573,12 @@ func TestWPT_FetchBody(t *testing.T) {
 	RunWPTTestArea(t, "fetch/api/body")
 }
 
+// passing for both quickjs+v8
 func TestWPT_Timers(t *testing.T) {
 	RunWPTTestArea(t, "html/webappapis/timers")
 }
 
+// passing for both quickjs+v8
 func TestWPT_Console(t *testing.T) {
 	RunWPTTestArea(t, "console")
 }

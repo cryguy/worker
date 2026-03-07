@@ -1,0 +1,33 @@
+{
+  "request-cache-default-conditional.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "request-cache-default.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "request-cache-force-cache.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "request-cache-no-cache.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "request-cache-no-store.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "request-cache-only-if-cached.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "request-cache-reload.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "request-consume-empty.any.js": {
+    "expectedFailures": [
+      "Consume empty FormData request body as text"
+    ]
+  },
+  "request-structure.any.js": {
+    "expectedFailures": [
+      "Request does not expose priority attribute"
+    ]
+  }
+}

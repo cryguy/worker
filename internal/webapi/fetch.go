@@ -48,6 +48,7 @@ const fetchJS = `
 globalThis.__fetchPromises = {};
 
 globalThis.fetch = function(input, init) {
+  try {
 	var reqID = String(globalThis.__requestID || '');
 	var url = '', method = 'GET', headers = {}, body = '', bodyIsBase64 = false;
 	var redirect = 'follow', signalAborted = false, signal = null;
@@ -109,24 +110,16 @@ globalThis.fetch = function(input, init) {
 	if (init && typeof init === 'object') {
 		if (init.method !== undefined) method = String(init.method).toUpperCase();
 		if (init.headers) {
-			var src;
-			if (init.headers instanceof Headers) {
-				src = {};
-				init.headers.forEach(function(v, k) { src[k] = v; });
-			} else if (init.headers._map) {
-				src = {};
-				var _m = init.headers._map;
-				for (var _k in _m) { if (_m.hasOwnProperty(_k)) src[_k] = Array.isArray(_m[_k]) ? _m[_k].join(', ') : _m[_k]; }
-			} else {
-				src = init.headers;
-			}
-			if (typeof src === 'object') {
-				for (var k2 in src) { if (src.hasOwnProperty(k2)) headers[k2.toLowerCase()] = String(src[k2]); }
-			}
+			var h = (init.headers instanceof Headers) ? init.headers : new Headers(init.headers);
+			h.forEach(function(v, k) { headers[k] = v; });
 		}
 		if (init.body != null) extractBody(init.body);
 		if (init.redirect !== undefined) redirect = String(init.redirect);
 		if (init.signal) { signal = init.signal; if (init.signal.aborted) signalAborted = true; }
+		if (init.priority !== undefined) {
+			var _fp = String(init.priority);
+			if (['high','low','auto'].indexOf(_fp) === -1) throw new TypeError('Invalid priority: ' + _fp);
+		}
 	}
 
 	if (!method) method = 'GET';
@@ -160,6 +153,7 @@ globalThis.fetch = function(input, init) {
 			}
 		} catch(e) { reject(e); }
 	});
+  } catch(e) { return Promise.reject(e); }
 };
 
 globalThis.__fetchResolve = function(fetchID, status, statusText, headersJSON, bodyB64, redirected, finalURL) {
@@ -181,6 +175,7 @@ globalThis.__fetchResolve = function(fetchID, status, statusText, headersJSON, b
 			}
 		}
 		var r = new Response(body, {status: status, statusText: statusText, headers: hdrs});
+		r.headers._guard = 'immutable';
 		if (redirected) {
 			Object.defineProperty(r, 'redirected', {value: true, writable: false});
 		}
@@ -272,7 +267,10 @@ func SetupFetch(rt core.JSRuntime, cfg core.EngineConfig, el *eventloop.EventLoo
 			if ForbiddenFetchHeaders[strings.ToLower(k)] {
 				continue
 			}
-			httpReq.Header.Set(k, v)
+			// Use direct map assignment to bypass Go's header value validation.
+			// The Fetch spec allows control chars (other than NUL/LF/CR) in
+			// header values, but Go's Header.Set rejects them.
+			httpReq.Header[http.CanonicalHeaderKey(k)] = []string{v}
 		}
 
 		redirectMode := args.Redirect

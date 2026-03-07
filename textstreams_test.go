@@ -84,20 +84,26 @@ func TestTextEncoderStream_Encoding(t *testing.T) {
 	}
 }
 
-func TestTextEncoderStream_NonStringThrows(t *testing.T) {
+func TestTextEncoderStream_NonStringCoerced(t *testing.T) {
 	e := newTestEngine(t)
 
+	// Per spec, TextEncoderStream coerces input via String(chunk).
+	// Uint8Array([1,2,3]) becomes "1,2,3" — no error.
 	source := `export default {
   async fetch(request, env) {
     const stream = new TextEncoderStream();
     const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
     let threw = false;
     try {
       await writer.write(new Uint8Array([1,2,3]));
+      await writer.close();
     } catch(e) {
       threw = true;
     }
-    return Response.json({ threw });
+    const { value } = await reader.read();
+    const text = new TextDecoder().decode(value);
+    return Response.json({ threw, text });
   },
 };`
 
@@ -105,13 +111,17 @@ func TestTextEncoderStream_NonStringThrows(t *testing.T) {
 	assertOK(t, r)
 
 	var data struct {
-		Threw bool `json:"threw"`
+		Threw bool   `json:"threw"`
+		Text  string `json:"text"`
 	}
 	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if !data.Threw {
-		t.Error("TextEncoderStream should throw on non-string input")
+	if data.Threw {
+		t.Error("TextEncoderStream should not throw for non-string input (coerced via String())")
+	}
+	if data.Text != "1,2,3" {
+		t.Errorf("text = %q, want %q", data.Text, "1,2,3")
 	}
 }
 

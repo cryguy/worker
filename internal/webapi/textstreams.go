@@ -15,12 +15,27 @@ const textStreamsJS = `
 class TextEncoderStream extends TransformStream {
 	constructor() {
 		const encoder = new TextEncoder();
+		let pendingHighSurrogate = '';
 		super({
 			transform(chunk, controller) {
-				if (typeof chunk !== 'string') {
-					throw new TypeError('TextEncoderStream expects string chunks');
+				let text = pendingHighSurrogate + String(chunk);
+				pendingHighSurrogate = '';
+				if (text.length > 0) {
+					const last = text.charCodeAt(text.length - 1);
+					if (last >= 0xD800 && last <= 0xDBFF) {
+						pendingHighSurrogate = text.charAt(text.length - 1);
+						text = text.slice(0, -1);
+					}
 				}
-				controller.enqueue(encoder.encode(chunk));
+				if (text.length > 0) {
+					controller.enqueue(encoder.encode(text));
+				}
+			},
+			flush(controller) {
+				if (pendingHighSurrogate) {
+					controller.enqueue(encoder.encode(pendingHighSurrogate));
+					pendingHighSurrogate = '';
+				}
 			}
 		});
 		this._encoding = 'utf-8';

@@ -1602,18 +1602,18 @@ func TestResponse_Bytes_EmptyBody(t *testing.T) {
 func TestResponse_Bytes_CalledTwice(t *testing.T) {
 	e := newTestEngine(t)
 
-	// Note: the current implementation uses .text() which reads _body as a
-	// string (no locking), so calling bytes() twice works the same as calling
-	// text() twice. This test verifies the second call still succeeds and
-	// returns the same data (consistent with the existing arrayBuffer behaviour).
+	// Per spec, body can only be consumed once. Second call should reject
+	// with "body already consumed".
 	source := `export default {
   async fetch(request, env) {
     const resp = new Response("data");
     const b1 = await resp.bytes();
-    const b2 = await resp.bytes();
+    var secondError = '';
+    try { await resp.bytes(); } catch(e) { secondError = e.message; }
     return Response.json({
       first: new TextDecoder().decode(b1),
-      second: new TextDecoder().decode(b2),
+      secondError: secondError,
+      bodyUsed: resp.bodyUsed,
     });
   },
 };`
@@ -1622,8 +1622,9 @@ func TestResponse_Bytes_CalledTwice(t *testing.T) {
 	assertOK(t, r)
 
 	var data struct {
-		First  string `json:"first"`
-		Second string `json:"second"`
+		First       string `json:"first"`
+		SecondError string `json:"secondError"`
+		BodyUsed    bool   `json:"bodyUsed"`
 	}
 	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -1631,8 +1632,11 @@ func TestResponse_Bytes_CalledTwice(t *testing.T) {
 	if data.First != "data" {
 		t.Errorf("first = %q, want 'data'", data.First)
 	}
-	if data.Second != "data" {
-		t.Errorf("second = %q, want 'data'", data.Second)
+	if data.SecondError == "" {
+		t.Error("expected error on second bytes() call")
+	}
+	if !data.BodyUsed {
+		t.Error("bodyUsed should be true after consumption")
 	}
 }
 
@@ -1829,9 +1833,10 @@ func TestRequest_BodyUsed(t *testing.T) {
     });
     const beforeUsed = req.bodyUsed;
     const reader = req.body.getReader();
-    const afterUsed = req.bodyUsed;
+    const afterLock = req.bodyUsed;
     const { value } = await reader.read();
-    return Response.json({ beforeUsed, afterUsed });
+    const afterRead = req.bodyUsed;
+    return Response.json({ beforeUsed, afterLock, afterRead });
   },
 };`
 
@@ -1840,7 +1845,8 @@ func TestRequest_BodyUsed(t *testing.T) {
 
 	var data struct {
 		BeforeUsed bool `json:"beforeUsed"`
-		AfterUsed  bool `json:"afterUsed"`
+		AfterLock  bool `json:"afterLock"`
+		AfterRead  bool `json:"afterRead"`
 	}
 	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -1848,8 +1854,11 @@ func TestRequest_BodyUsed(t *testing.T) {
 	if data.BeforeUsed {
 		t.Error("bodyUsed should be false before consuming")
 	}
-	if !data.AfterUsed {
-		t.Error("bodyUsed should be true after consuming")
+	if data.AfterLock {
+		t.Error("bodyUsed should be false after getReader() per spec (only true after read/cancel)")
+	}
+	if !data.AfterRead {
+		t.Error("bodyUsed should be true after read()")
 	}
 }
 

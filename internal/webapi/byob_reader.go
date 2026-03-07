@@ -27,6 +27,9 @@ class ReadableByteStreamController {
 			const dst = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
 			const copyLen = Math.min(src.length, dst.length);
 			for (let i = 0; i < copyLen; i++) dst[i] = src[i];
+			if (copyLen < src.length) {
+				this._stream._queue.unshift(src.subarray(copyLen));
+			}
 			const filledView = new Uint8Array(view.buffer, view.byteOffset, copyLen);
 			resolve({ value: filledView, done: false });
 			return;
@@ -92,13 +95,16 @@ class ReadableStreamBYOBReader {
 			return Promise.reject(stream._error);
 		}
 		if (stream._queue.length > 0) {
-			const chunk = stream._queue.shift();
+			const chunk = stream._queue[0];
 			const src = chunk instanceof ArrayBuffer
 				? new Uint8Array(chunk)
 				: chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer || chunk);
 			const dst = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
 			const copyLen = Math.min(src.length, dst.length);
 			for (let i = 0; i < copyLen; i++) dst[i] = src[i];
+			if (copyLen >= src.length) { stream._queue.shift(); }
+			else { stream._queue[0] = src.subarray(copyLen); }
+			stream._disturbed = true;
 			const filledView = new Uint8Array(view.buffer, view.byteOffset, copyLen);
 			return Promise.resolve({ value: filledView, done: false });
 		}

@@ -33,7 +33,7 @@ function bodyToString(body) {
 		return body.toString();
 	}
 	if (body instanceof FormData) {
-		var boundary = '----FormDataBoundary' + Math.random().toString(36).slice(2);
+		var boundary = body._boundary || ('----FormDataBoundary' + Math.random().toString(36).slice(2));
 		var result = '';
 		body.forEach(function(value, name) {
 			result += '--' + boundary + '\r\n';
@@ -106,8 +106,7 @@ async function __readStreamBytes(stream) {
 		if (chunk instanceof Uint8Array) { bytes = chunk; }
 		else if (chunk instanceof ArrayBuffer) { bytes = new Uint8Array(chunk); }
 		else if (ArrayBuffer.isView(chunk)) { bytes = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength); }
-		else if (typeof chunk === 'string') { bytes = new TextEncoder().encode(chunk); }
-		else { bytes = new TextEncoder().encode(String(chunk)); }
+		else { throw new TypeError('Response body stream chunk is not Uint8Array'); }
 		chunks.push(bytes);
 		totalLen += bytes.length;
 	}
@@ -120,7 +119,24 @@ async function __readStreamBytes(stream) {
 	return merged;
 }
 
+function __markBodyUsed(obj) {
+	if (obj._bodyUsed) throw new TypeError('body already consumed');
+	if (obj._body instanceof ReadableStream && obj._body._disturbed) throw new TypeError('body stream already disturbed');
+	if (obj._body !== null && obj._body !== undefined) obj._bodyUsed = true;
+}
+
+function __bodyToBytes(body) {
+	if (body === null || body === undefined) return new Uint8Array(0);
+	if (body instanceof Uint8Array) return body;
+	if (body instanceof ArrayBuffer) return new Uint8Array(body);
+	if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength));
+	if (body instanceof ReadableStream) return null;
+	var s = bodyToString(body);
+	return new TextEncoder().encode(s);
+}
+
 Request.prototype.text = async function() {
+	__markBodyUsed(this);
 	if (this._body instanceof ReadableStream) {
 		var bytes = await __readStreamBytes(this._body);
 		return new TextDecoder().decode(bytes);
@@ -129,14 +145,15 @@ Request.prototype.text = async function() {
 };
 
 Response.prototype.text = async function() {
-	if (this._body instanceof ReadableStream) {
-		var bytes = await __readStreamBytes(this._body);
-		return new TextDecoder().decode(bytes);
-	}
-	return bodyToString(this._body);
+	__markBodyUsed(this);
+	var _s = this.body;
+	if (_s === null) return '';
+	var bytes = await __readStreamBytes(_s);
+	return new TextDecoder().decode(bytes);
 };
 
 Request.prototype.arrayBuffer = async function() {
+	__markBodyUsed(this);
 	if (this._body instanceof ArrayBuffer) return this._body;
 	if (ArrayBuffer.isView(this._body)) return this._body.buffer.slice(this._body.byteOffset, this._body.byteOffset + this._body.byteLength);
 	if (this._body instanceof ReadableStream) {
@@ -149,15 +166,11 @@ Request.prototype.arrayBuffer = async function() {
 };
 
 Response.prototype.arrayBuffer = async function() {
-	if (this._body instanceof ArrayBuffer) return this._body;
-	if (ArrayBuffer.isView(this._body)) return this._body.buffer.slice(this._body.byteOffset, this._body.byteOffset + this._body.byteLength);
-	if (this._body instanceof ReadableStream) {
-		var bytes = await __readStreamBytes(this._body);
-		return bytes.buffer;
-	}
-	var t = bodyToString(this._body);
-	var enc = new TextEncoder();
-	return enc.encode(t).buffer;
+	__markBodyUsed(this);
+	var _s = this.body;
+	if (_s === null) return new ArrayBuffer(0);
+	var bytes = await __readStreamBytes(_s);
+	return bytes.buffer;
 };
 
 Request.prototype.json = async function() {
@@ -166,23 +179,52 @@ Request.prototype.json = async function() {
 };
 
 Response.prototype.json = async function() {
-	var t = await this.text();
-	return JSON.parse(t);
+	__markBodyUsed(this);
+	var _s = this.body;
+	if (_s === null) return JSON.parse('');
+	var bytes = await __readStreamBytes(_s);
+	return JSON.parse(new TextDecoder().decode(bytes));
+};
+
+Request.prototype.bytes = async function() {
+	__markBodyUsed(this);
+	if (this._body instanceof ReadableStream) {
+		return await __readStreamBytes(this._body);
+	}
+	return __bodyToBytes(this._body);
+};
+
+Response.prototype.bytes = async function() {
+	__markBodyUsed(this);
+	var _s = this.body;
+	if (_s === null) return new Uint8Array(0);
+	return await __readStreamBytes(_s);
 };
 
 Request.prototype.blob = async function() {
-	var text = await this.text();
-	return new Blob([text], { type: this.headers.get('content-type') || '' });
+	__markBodyUsed(this);
+	var ct = this.headers.get('content-type') || '';
+	if (this._body instanceof ReadableStream) {
+		var bytes = await __readStreamBytes(this._body);
+		return new Blob([bytes], { type: ct });
+	}
+	var bytes2 = __bodyToBytes(this._body);
+	return new Blob([bytes2], { type: ct });
 };
 
 Response.prototype.blob = async function() {
-	var text = await this.text();
-	return new Blob([text], { type: this.headers.get('content-type') || '' });
+	__markBodyUsed(this);
+	var ct = this.headers.get('content-type') || '';
+	var _s = this.body;
+	if (_s === null) return new Blob([], { type: ct });
+	var bytes = await __readStreamBytes(_s);
+	return new Blob([bytes], { type: ct });
 };
 
 Request.prototype.formData = async function() {
+	__markBodyUsed(this);
 	var ct = this.headers.get('content-type') || '';
-	var text = bodyToString(this._body);
+	var text = (this._body === null || this._body === undefined) ? '' : bodyToString(this._body);
 	if (ct.indexOf('application/x-www-form-urlencoded') !== -1) {
 		var fd = new FormData();
 		var params = new URLSearchParams(text);
@@ -190,14 +232,21 @@ Request.prototype.formData = async function() {
 		return fd;
 	}
 	if (ct.indexOf('multipart/form-data') !== -1) {
+		if (!text) throw new TypeError('Could not parse content as FormData');
 		return parseMultipart(text, ct);
 	}
 	throw new TypeError('Could not parse content as FormData');
 };
 
 Response.prototype.formData = async function() {
+	__markBodyUsed(this);
 	var ct = this.headers.get('content-type') || '';
-	var text = bodyToString(this._body);
+	var _s = this.body;
+	var text = '';
+	if (_s !== null) {
+		var bytes = await __readStreamBytes(_s);
+		text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes);
+	}
 	if (ct.indexOf('application/x-www-form-urlencoded') !== -1) {
 		var fd = new FormData();
 		var params = new URLSearchParams(text);
@@ -205,6 +254,7 @@ Response.prototype.formData = async function() {
 		return fd;
 	}
 	if (ct.indexOf('multipart/form-data') !== -1) {
+		if (!text) throw new TypeError('Could not parse content as FormData');
 		return parseMultipart(text, ct);
 	}
 	throw new TypeError('Could not parse content as FormData');

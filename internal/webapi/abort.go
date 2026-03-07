@@ -191,6 +191,15 @@ Object.keys(DOMException).forEach(function(k) {
 		DOMException.prototype[k] = DOMException[k];
 	}
 });
+// Add branded getters per Web IDL: accessing name/message/code on
+// the prototype (not an instance) throws TypeError.
+['name', 'message', 'code'].forEach(function(prop) {
+	Object.defineProperty(DOMException.prototype, prop, {
+		get() { if (!(this instanceof DOMException)) throw new TypeError('Illegal invocation'); },
+		set(v) { Object.defineProperty(this, prop, {value: v, writable: true, enumerable: true, configurable: true}); },
+		enumerable: true, configurable: true
+	});
+});
 
 class ScheduledEvent extends Event {
 	constructor(scheduledTime, cron) {

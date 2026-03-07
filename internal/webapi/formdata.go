@@ -102,37 +102,52 @@ class File extends Blob {
 // --- FormData ---
 
 class FormData {
-	constructor() {
+	constructor(form) {
+		if (form !== undefined) {
+			throw new TypeError("Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'.");
+		}
 		this._entries = [];
 	}
 
 	append(name, value, filename) {
-		if (value instanceof Blob && !(value instanceof File)) {
-			value = new File([value], filename || 'blob', { type: value.type });
+		if (value instanceof Blob) {
+			if (!(value instanceof File)) {
+				value = new File([value], filename || 'blob', { type: value.type });
+			} else if (filename !== undefined) {
+				value = new File([value], filename, { type: value.type, lastModified: value.lastModified });
+			}
+		} else {
+			value = String(value);
 		}
 		this._entries.push([String(name), value]);
 	}
 
 	set(name, value, filename) {
-		if (value instanceof Blob && !(value instanceof File)) {
-			value = new File([value], filename || 'blob', { type: value.type });
+		if (value instanceof Blob) {
+			if (!(value instanceof File)) {
+				value = new File([value], filename || 'blob', { type: value.type });
+			} else if (filename !== undefined) {
+				value = new File([value], filename, { type: value.type, lastModified: value.lastModified });
+			}
+		} else {
+			value = String(value);
 		}
 		const sName = String(name);
 		let found = false;
-		const filtered = [];
-		for (let i = 0; i < this._entries.length; i++) {
+		for (let i = 0; i < this._entries.length; ) {
 			if (this._entries[i][0] === sName) {
 				if (!found) {
-					filtered.push([sName, value]);
+					this._entries[i] = [sName, value];
 					found = true;
+					i++;
+				} else {
+					this._entries.splice(i, 1);
 				}
-				// skip duplicates
 			} else {
-				filtered.push(this._entries[i]);
+				i++;
 			}
 		}
-		if (!found) filtered.push([sName, value]);
-		this._entries = filtered;
+		if (!found) this._entries.push([sName, value]);
 	}
 
 	get(name) {
@@ -149,7 +164,11 @@ class FormData {
 	}
 
 	delete(name) {
-		this._entries = this._entries.filter(([k]) => k !== name);
+		for (let i = this._entries.length - 1; i >= 0; i--) {
+			if (this._entries[i][0] === name) {
+				this._entries.splice(i, 1);
+			}
+		}
 	}
 
 	entries() {
@@ -165,8 +184,8 @@ class FormData {
 	}
 
 	forEach(callback, thisArg) {
-		for (const [name, value] of this._entries) {
-			callback.call(thisArg, value, name, this);
+		for (let i = 0; i < this._entries.length; i++) {
+			callback.call(thisArg, this._entries[i][1], this._entries[i][0], this);
 		}
 	}
 

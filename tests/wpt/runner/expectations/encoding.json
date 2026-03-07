@@ -1,0 +1,109 @@
+{
+  "api-basics.any.js": {
+    "expectedFailures": [
+      "Decode sample: utf-16le",
+      "Decode sample: utf-16be",
+      "Decode sample: utf-16"
+    ]
+  },
+  "encodeInto.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "iso-2022-jp-decoder.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "legacy-mb-schinese/gb18030/gb18030-decoder.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "legacy-mb-schinese/gbk/gbk-decoder.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "replacement-encodings.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "streams/backpressure.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "streams/decode-attributes.any.js": {
+    "expectedFailures": [
+      "encoding attribute should have correct value for 'iso-8859-2'",
+      "encoding attribute should have correct value for 'ascii'",
+      "encoding attribute should have correct value for 'utf-16'"
+    ]
+  },
+  "streams/decode-ignore-bom.any.js": {
+    "expectedFailures": [
+      "ignoreBOM should work for encoding utf-16le, split at character 0",
+      "ignoreBOM should work for encoding utf-16le, split at character 1",
+      "ignoreBOM should work for encoding utf-16le, split at character 2",
+      "ignoreBOM should work for encoding utf-16le, split at character 3",
+      "ignoreBOM should work for encoding utf-16be, split at character 0",
+      "ignoreBOM should work for encoding utf-16be, split at character 1",
+      "ignoreBOM should work for encoding utf-16be, split at character 2",
+      "ignoreBOM should work for encoding utf-16be, split at character 3"
+    ]
+  },
+  "streams/decode-non-utf8.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "streams/encode-bad-chunks.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "textdecoder-arguments.any.js": {
+    "expectedFailures": [
+      "TextDecoder decode() with array buffer detached during arg conversion"
+    ]
+  },
+  "textdecoder-byte-order-marks.any.js": {
+    "expectedFailures": [
+      "Byte-order marks: utf-16le",
+      "Byte-order marks: utf-16be"
+    ]
+  },
+  "textdecoder-copy.any.js": {
+    "expectedFailures": [
+      "Modify buffer after passing it in (SharedArrayBuffer)"
+    ]
+  },
+  "textdecoder-eof.any.js": {
+    "expectedFailures": [
+      "TextDecoder end-of-queue handling",
+      "TextDecoder end-of-queue handling using stream: true"
+    ]
+  },
+  "textdecoder-fatal.any.js": {
+    "expectedFailures": [
+      "Fatal flag: utf-16le - truncated code unit"
+    ]
+  },
+  "textdecoder-fatal-single-byte.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "textdecoder-fatal-streaming.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "textdecoder-ignorebom.any.js": {
+    "expectedFailures": [
+      "BOM is ignored if ignoreBOM option is specified: utf-16le",
+      "BOM is ignored if ignoreBOM option is specified: utf-16be"
+    ]
+  },
+  "textdecoder-labels.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "textdecoder-mistakes.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "textdecoder-streaming.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "textdecoder-utf16-surrogates.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "textencoder-constructor-non-utf.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "unsupported-encodings.any.js": {
+    "expectedFailures": ["*"]
+  }
+}

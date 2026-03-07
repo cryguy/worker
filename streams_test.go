@@ -1523,8 +1523,8 @@ func TestBodyUsed_Tracking(t *testing.T) {
 	if data.AfterAccess {
 		t.Error("bodyUsed should be false after just accessing .body (not locked yet)")
 	}
-	if !data.AfterLock {
-		t.Error("bodyUsed should be true after getReader() locks the stream")
+	if data.AfterLock {
+		t.Error("bodyUsed should be false after getReader() (only true after read/cancel per spec)")
 	}
 	if !data.AfterRead {
 		t.Error("bodyUsed should be true after reading the body")

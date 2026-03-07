@@ -309,12 +309,15 @@ func TestEncodingEdge_EncodingLabelAliases(t *testing.T) {
 	source := `export default {
   fetch(request, env) {
     const utf8Labels   = ['utf-8', 'utf8', 'unicode-1-1-utf-8'];
-    const latin1Labels = ['iso-8859-1', 'latin1', 'ascii', 'us-ascii', 'windows-1252'];
+    const rejectLabels = ['iso-8859-1', 'latin1', 'ascii', 'us-ascii', 'windows-1252'];
 
     const utf8Results   = utf8Labels.map(l => ({ label: l, encoding: new TextDecoder(l).encoding }));
-    const latin1Results = latin1Labels.map(l => ({ label: l, encoding: new TextDecoder(l).encoding }));
+    const rejectResults = rejectLabels.map(l => {
+      try { new TextDecoder(l); return { label: l, threw: false }; }
+      catch(e) { return { label: l, threw: true, name: e.name }; }
+    });
 
-    return Response.json({ utf8Results, latin1Results });
+    return Response.json({ utf8Results, rejectResults });
   },
 };`
 
@@ -323,7 +326,11 @@ func TestEncodingEdge_EncodingLabelAliases(t *testing.T) {
 
 	var data struct {
 		UTF8Results   []struct{ Label, Encoding string } `json:"utf8Results"`
-		Latin1Results []struct{ Label, Encoding string } `json:"latin1Results"`
+		RejectResults []struct {
+			Label string `json:"label"`
+			Threw bool   `json:"threw"`
+			Name  string `json:"name"`
+		} `json:"rejectResults"`
 	}
 	if err := json.Unmarshal(r.Response.Body, &data); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -333,9 +340,11 @@ func TestEncodingEdge_EncodingLabelAliases(t *testing.T) {
 			t.Errorf("label %q: encoding = %q, want utf-8", item.Label, item.Encoding)
 		}
 	}
-	for _, item := range data.Latin1Results {
-		if item.Encoding != "windows-1252" {
-			t.Errorf("label %q: encoding = %q, want windows-1252", item.Label, item.Encoding)
+	for _, item := range data.RejectResults {
+		if !item.Threw {
+			t.Errorf("label %q: expected RangeError, but did not throw", item.Label)
+		} else if item.Name != "RangeError" {
+			t.Errorf("label %q: expected RangeError, got %s", item.Label, item.Name)
 		}
 	}
 }

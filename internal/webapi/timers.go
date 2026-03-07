@@ -17,7 +17,9 @@ const timersJS = `
 		}
 		var args = [];
 		for (var i = 2; i < arguments.length; i++) args.push(arguments[i]);
-		var id = __timerRegister(delay || 0, false);
+		var d = (delay || 0) | 0;
+		if (d < 0) d = 0;
+		var id = __timerRegister(d, false);
 		globalThis.__timerCallbacks[id] = { fn: fn, args: args };
 		return id;
 	};
@@ -27,7 +29,9 @@ const timersJS = `
 		}
 		var args = [];
 		for (var i = 2; i < arguments.length; i++) args.push(arguments[i]);
-		var id = __timerRegister(interval || 0, true);
+		var d = (interval || 0) | 0;
+		if (d < 0) d = 0;
+		var id = __timerRegister(d, true);
 		globalThis.__timerCallbacks[id] = { fn: fn, args: args, interval: true };
 		return id;
 	};

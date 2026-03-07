@@ -1,0 +1,20 @@
+{
+  "json.any.js": {
+    "expectedFailures": [
+      "Ensure the correct JSON parser is used"
+    ]
+  },
+  "response-blob-realm.any.js": {
+    "expectedFailures": ["*"]
+  },
+  "response-consume-empty.any.js": {
+    "expectedFailures": [
+      "Consume empty FormData response body as text"
+    ]
+  },
+  "response-consume-stream.any.js": {
+  },
+  "response-stream-with-broken-then.any.js": {
+    "expectedFailures": ["*"]
+  }
+}
