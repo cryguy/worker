@@ -139,7 +139,7 @@ class ReadableStreamBYOBReader {
 	}
 
 	cancel(reason) {
-		return this._stream.cancel(reason);
+		return this._stream._cancelSteps(reason);
 	}
 }
 
@@ -167,6 +167,7 @@ globalThis.ReadableStream = function ReadableStream(underlyingSource, strategy) 
 };
 
 globalThis.ReadableStream.prototype = OrigReadableStream.prototype;
+globalThis.ReadableStream.prototype.constructor = globalThis.ReadableStream;
 globalThis.ReadableStream.from = OrigReadableStream.from;
 
 OrigReadableStream.prototype.getReader = function(options) {

@@ -18,9 +18,30 @@ class ReadableStreamDefaultController {
 	constructor(stream) {
 		this._stream = stream;
 		this._closeRequested = false;
+		this._enqueuing = false;
 	}
 	enqueue(chunk) {
 		if (this._closeRequested) throw new TypeError('Cannot enqueue after close');
+		if (this._stream._errored) throw this._stream._error;
+		if (this._stream._sizeFn) {
+			if (this._enqueuing) throw new TypeError('Cannot enqueue reentrantly');
+			this._enqueuing = true;
+			var chunkSize;
+			try {
+				chunkSize = this._stream._sizeFn(chunk);
+			} catch(e) {
+				this._enqueuing = false;
+				this._stream._errorInternal(e);
+				throw e;
+			}
+			this._enqueuing = false;
+			chunkSize = Number(chunkSize);
+			if (chunkSize !== chunkSize || chunkSize === Infinity || chunkSize === -Infinity) {
+				var rangeErr = new RangeError('Invalid chunk size');
+				this._stream._errorInternal(rangeErr);
+				throw rangeErr;
+			}
+		}
 		this._stream._queue.push(chunk);
 		this._stream._pull();
 	}
@@ -32,6 +53,8 @@ class ReadableStreamDefaultController {
 		this._stream._errorInternal(e);
 	}
 	get desiredSize() {
+		if (this._stream._errored) return null;
+		if (this._closeRequested || this._stream._closed) return 0;
 		return this._stream._highWaterMark - this._stream._queue.length;
 	}
 }
@@ -59,6 +82,8 @@ class ReadableByteStreamController {
 		this._stream._errorInternal(e);
 	}
 	get desiredSize() {
+		if (this._stream._errored) return null;
+		if (this._closeRequested || this._stream._closed) return 0;
 		return this._stream._highWaterMark - this._stream._queue.length;
 	}
 	get byobRequest() { return null; }
@@ -100,8 +125,11 @@ class ReadableStreamDefaultReader {
 					stream._pulling = false;
 					if (stream._closed || stream._errored) return;
 					try {
+						var qBefore = stream._queue.length;
 						var r = stream._pullFn(stream._controller);
 						function afterPull() {
+							var madeProgress = stream._queue.length > qBefore || stream._closed || stream._errored || stream._pendingReads.length === 0;
+							if (!madeProgress) return;
 							if (stream._pendingReads.length > 0 && stream._queue.length === 0 && !stream._closed && !stream._errored && stream._pullFn) {
 								stream._pulling = true;
 								Promise.resolve().then(pullLoop);
@@ -124,7 +152,7 @@ class ReadableStreamDefaultReader {
 		return this._closedPromise;
 	}
 	cancel(reason) {
-		return this._stream.cancel(reason);
+		return this._stream._cancelSteps(reason);
 	}
 }
 
@@ -180,8 +208,11 @@ class ReadableStreamBYOBReader {
 					stream._pulling = false;
 					if (stream._closed || stream._errored) return;
 					try {
+						var qBefore = stream._queue.length;
 						var r = stream._pullFn(stream._controller);
 						function afterPull() {
+							var madeProgress = stream._queue.length > qBefore || stream._closed || stream._errored || stream._pendingBYOBReads.length === 0;
+							if (!madeProgress) return;
 							if (stream._pendingBYOBReads.length > 0 && stream._queue.length === 0 && !stream._closed && !stream._errored && stream._pullFn) {
 								stream._pulling = true;
 								Promise.resolve().then(pullLoop);
@@ -201,11 +232,30 @@ class ReadableStreamBYOBReader {
 		}
 	}
 	get closed() { return this._closedPromise; }
-	cancel(reason) { return this._stream.cancel(reason); }
+	cancel(reason) { return this._stream._cancelSteps(reason); }
 }
 
 class ReadableStream {
 	constructor(underlyingSource, strategy) {
+		// Extract strategy properties first (spec conversion order).
+		var hwm = 1;
+		var sizeFn;
+		if (strategy !== undefined && strategy !== null) {
+			if (strategy.highWaterMark !== undefined) {
+				hwm = Number(strategy.highWaterMark);
+			}
+			sizeFn = strategy.size;
+		}
+
+		// Validate underlyingSource.
+		if (underlyingSource === null) throw new TypeError("The provided value 'null' is not of type 'object'.");
+		if (underlyingSource !== undefined && typeof underlyingSource !== 'object' && typeof underlyingSource !== 'function') {
+			throw new TypeError("parameter 1 is not of type 'object'.");
+		}
+
+		// Validate highWaterMark.
+		if (hwm !== hwm || hwm < 0) throw new RangeError('Invalid highWaterMark');
+
 		this._queue = [];
 		this._locked = false;
 		this._disturbed = false;
@@ -216,11 +266,20 @@ class ReadableStream {
 		this._pendingReads = [];
 		this._pendingBYOBReads = [];
 		this._pulling = false;
-		this._highWaterMark = (strategy && strategy.highWaterMark) || 1;
+		this._highWaterMark = hwm;
+		this._sizeFn = sizeFn;
 		this._byteStream = false;
 
-		if (underlyingSource && underlyingSource.type === 'bytes') {
+		var sourceType = underlyingSource ? underlyingSource.type : undefined;
+		if (sourceType !== undefined && sourceType !== 'bytes') {
+			throw new RangeError("Invalid type: " + sourceType);
+		}
+
+		if (sourceType === 'bytes') {
+			if (sizeFn !== undefined) throw new RangeError('The strategy for a byte stream cannot have a size function');
 			this._byteStream = true;
+			var autoAllocateChunkSize = underlyingSource.autoAllocateChunkSize;
+			if (autoAllocateChunkSize === 0) throw new TypeError('autoAllocateChunkSize must be greater than 0');
 			this._controller = new ReadableByteStreamController(this);
 		} else {
 			this._controller = new ReadableStreamDefaultController(this);
@@ -229,30 +288,59 @@ class ReadableStream {
 		this._cancelFn = null;
 
 		if (underlyingSource) {
-			if (typeof underlyingSource.pull === 'function') {
-				this._pullFn = underlyingSource.pull.bind(underlyingSource);
+			var startFn = underlyingSource.start;
+			var pullFn = underlyingSource.pull;
+			var cancelFn = underlyingSource.cancel;
+			if (startFn !== undefined && typeof startFn !== 'function') throw new TypeError("start is not a function");
+			if (pullFn !== undefined && typeof pullFn !== 'function') throw new TypeError("pull is not a function");
+			if (cancelFn !== undefined && typeof cancelFn !== 'function') throw new TypeError("cancel is not a function");
+			if (typeof pullFn === 'function') {
+				this._pullFn = pullFn.bind(underlyingSource);
 			}
-			if (typeof underlyingSource.cancel === 'function') {
-				this._cancelFn = underlyingSource.cancel.bind(underlyingSource);
+			if (typeof cancelFn === 'function') {
+				this._cancelFn = cancelFn.bind(underlyingSource);
 			}
-			if (typeof underlyingSource.start === 'function') {
-				underlyingSource.start(this._controller);
+			if (typeof startFn === 'function') {
+				startFn.call(underlyingSource, this._controller);
 			}
 		}
 	}
 
 	getReader(options) {
-		if (options && options.mode === 'byob') {
-			return new ReadableStreamBYOBReader(this);
+		if (options !== undefined && options !== null && options.mode !== undefined) {
+			var mode = String(options.mode);
+			if (mode === 'byob') return new ReadableStreamBYOBReader(this);
+			throw new RangeError("Invalid mode: " + mode);
 		}
 		return new ReadableStreamDefaultReader(this);
 	}
 
 	cancel(reason) {
+		if (this._locked) return Promise.reject(new TypeError('Cannot cancel a locked ReadableStream'));
+		return this._cancelSteps(reason);
+	}
+	_cancelSteps(reason) {
 		this._disturbed = true;
 		this._closed = true;
-		if (this._cancelFn) this._cancelFn(reason);
+		var cancelResult;
+		if (this._cancelFn) {
+			try {
+				cancelResult = this._cancelFn(reason);
+			} catch(e) {
+				this._drainPending();
+				if (this._reader && this._reader._closedResolve) {
+					this._reader._closedResolve();
+				}
+				return Promise.reject(e);
+			}
+		}
 		this._drainPending();
+		if (this._reader && this._reader._closedResolve) {
+			this._reader._closedResolve();
+		}
+		if (cancelResult && typeof cancelResult.then === 'function') {
+			return cancelResult.then(function() { return undefined; });
+		}
 		return Promise.resolve();
 	}
 
@@ -435,6 +523,9 @@ class ReadableStream {
 
 class WritableStreamDefaultController {
 	constructor(stream) {
+		if (!stream || !(stream instanceof WritableStream) || stream._controller !== undefined) {
+			throw new TypeError('WritableStreamDefaultController constructor is not directly constructible');
+		}
 		this._stream = stream;
 	}
 	error(e) {
@@ -444,6 +535,7 @@ class WritableStreamDefaultController {
 
 class WritableStreamDefaultWriter {
 	constructor(stream) {
+		if (!(stream instanceof WritableStream)) throw new TypeError('WritableStreamDefaultWriter requires a WritableStream argument');
 		if (stream._locked) throw new TypeError('WritableStream is already locked');
 		this._stream = stream;
 		stream._locked = true;
@@ -456,47 +548,67 @@ class WritableStreamDefaultWriter {
 			this._closedResolve();
 		}
 	}
+	get desiredSize() {
+		if (!this._stream) throw new TypeError('Writer has been released');
+		var s = this._stream;
+		if (s._errored) return null;
+		if (s._closed) return 0;
+		return s._highWaterMark - (s._queueSize || 0);
+	}
 	write(chunk) {
+		if (!this._stream) return Promise.reject(new TypeError('Writer has been released'));
 		if (this._stream._closed) throw new TypeError('Cannot write to a closed stream');
 		if (this._stream._errored) throw this._stream._error;
-		if (this._stream._writeFn) {
-			const result = this._stream._writeFn(chunk, this._stream._controller);
-			if (result && typeof result.then === 'function') return result;
+		var s = this._stream;
+		s._queueSize++;
+		if (s._writeFn) {
+			const result = s._writeFn(chunk, s._controller);
+			if (result && typeof result.then === 'function') {
+				return result.then(function() { s._queueSize--; }, function(e) { s._queueSize--; throw e; });
+			}
 		}
+		s._queueSize--;
 		return Promise.resolve();
 	}
 	close() {
-		const self = this;
-		if (this._stream._closeFn) {
-			const result = this._stream._closeFn();
+		if (!this._stream) return Promise.reject(new TypeError('Writer has been released'));
+		var stream = this._stream;
+		var self = this;
+		if (stream._closeFn) {
+			var result = stream._closeFn();
 			if (result && typeof result.then === 'function') {
 				return result.then(function() {
-					self._stream._closed = true;
+					stream._closed = true;
 					if (self._closedResolve) self._closedResolve();
 				});
 			}
 		}
-		this._stream._closed = true;
+		stream._closed = true;
 		if (this._closedResolve) this._closedResolve();
 		return Promise.resolve();
 	}
 	abort(reason) {
-		const self = this;
-		if (this._stream._abortFn) {
-			const result = this._stream._abortFn(reason);
+		if (!this._stream) return Promise.reject(new TypeError('Writer has been released'));
+		var stream = this._stream;
+		var self = this;
+		if (stream._abortFn) {
+			var result = stream._abortFn(reason);
 			if (result && typeof result.then === 'function') {
 				return result.then(function() {
-					self._stream._closed = true;
+					stream._closed = true;
 					if (self._closedResolve) self._closedResolve();
 				});
 			}
 		}
-		this._stream._closed = true;
+		stream._closed = true;
 		if (this._closedResolve) this._closedResolve();
 		return Promise.resolve();
 	}
 	releaseLock() {
-		this._stream._locked = false;
+		if (this._stream) {
+			this._stream._locked = false;
+			this._stream = null;
+		}
 	}
 	get closed() {
 		return this._closedPromise;
@@ -506,27 +618,52 @@ class WritableStreamDefaultWriter {
 
 class WritableStream {
 	constructor(underlyingSink, strategy) {
+		// Extract strategy properties first (spec conversion order).
+		this._highWaterMark = 1;
+		var sizeFn;
+		if (strategy !== undefined && strategy !== null) {
+			if (strategy.highWaterMark !== undefined) {
+				this._highWaterMark = Number(strategy.highWaterMark);
+			}
+			sizeFn = strategy.size;
+		}
+
+		// Validate highWaterMark.
+		if (this._highWaterMark !== this._highWaterMark || this._highWaterMark < 0) throw new RangeError('Invalid highWaterMark');
+
 		this._locked = false;
 		this._closed = false;
 		this._errored = false;
 		this._error = null;
+		this._queueSize = 0;
 		this._controller = new WritableStreamDefaultController(this);
 		this._writeFn = null;
 		this._closeFn = null;
 		this._abortFn = null;
 
 		if (underlyingSink) {
-			if (typeof underlyingSink.write === 'function') {
-				this._writeFn = underlyingSink.write.bind(underlyingSink);
+			if (underlyingSink.type !== undefined) {
+				throw new RangeError('WritableStream does not support a type');
 			}
-			if (typeof underlyingSink.close === 'function') {
-				this._closeFn = underlyingSink.close.bind(underlyingSink);
+			var sinkStart = underlyingSink.start;
+			var sinkWrite = underlyingSink.write;
+			var sinkClose = underlyingSink.close;
+			var sinkAbort = underlyingSink.abort;
+			if (sinkStart !== undefined && typeof sinkStart !== 'function') throw new TypeError("start is not a function");
+			if (sinkWrite !== undefined && typeof sinkWrite !== 'function') throw new TypeError("write is not a function");
+			if (sinkClose !== undefined && typeof sinkClose !== 'function') throw new TypeError("close is not a function");
+			if (sinkAbort !== undefined && typeof sinkAbort !== 'function') throw new TypeError("abort is not a function");
+			if (typeof sinkWrite === 'function') {
+				this._writeFn = sinkWrite.bind(underlyingSink);
 			}
-			if (typeof underlyingSink.abort === 'function') {
-				this._abortFn = underlyingSink.abort.bind(underlyingSink);
+			if (typeof sinkClose === 'function') {
+				this._closeFn = sinkClose.bind(underlyingSink);
 			}
-			if (typeof underlyingSink.start === 'function') {
-				underlyingSink.start(this._controller);
+			if (typeof sinkAbort === 'function') {
+				this._abortFn = sinkAbort.bind(underlyingSink);
+			}
+			if (typeof sinkStart === 'function') {
+				sinkStart.call(underlyingSink, this._controller);
 			}
 		}
 	}
@@ -563,6 +700,10 @@ class WritableStream {
 
 class TransformStream {
 	constructor(transformer, writableStrategy, readableStrategy) {
+		if (transformer !== undefined && transformer !== null) {
+			if (transformer.readableType !== undefined) throw new RangeError('readableType is not supported');
+			if (transformer.writableType !== undefined) throw new RangeError('writableType is not supported');
+		}
 		const self = this;
 		let readableController;
 
@@ -583,7 +724,12 @@ class TransformStream {
 			enqueue(chunk) { readableController.enqueue(chunk); },
 			error(e) { readableController.error(e); },
 			terminate() { readableController.close(); },
+			get desiredSize() { return readableController.desiredSize; },
 		};
+
+		if (transformer && typeof transformer.start === 'function') {
+			transformer.start(transformController);
+		}
 
 		this.writable = new WritableStream({
 			async write(chunk) {
@@ -611,22 +757,65 @@ ReadableStream.from = function(asyncIterable) {
 	if (asyncIterable == null) {
 		throw new TypeError('ReadableStream.from called on null or undefined');
 	}
-	const asyncIteratorMethod = asyncIterable[Symbol.asyncIterator];
-	const iteratorMethod = asyncIterable[Symbol.iterator];
-	if (typeof asyncIteratorMethod !== 'function' && typeof iteratorMethod !== 'function') {
-		throw new TypeError('ReadableStream.from requires an iterable or async iterable');
+	var asyncIteratorMethod = asyncIterable[Symbol.asyncIterator];
+	var iteratorMethod;
+	var isAsync;
+	if (asyncIteratorMethod != null) {
+		if (typeof asyncIteratorMethod !== 'function') {
+			throw new TypeError('ReadableStream.from requires an iterable or async iterable');
+		}
+		isAsync = true;
+	} else {
+		iteratorMethod = asyncIterable[Symbol.iterator];
+		if (typeof iteratorMethod !== 'function') {
+			throw new TypeError('ReadableStream.from requires an iterable or async iterable');
+		}
+		isAsync = false;
 	}
-	const iterator = typeof asyncIteratorMethod === 'function'
-		? asyncIterable[Symbol.asyncIterator]()
-		: asyncIterable[Symbol.iterator]();
+	var iterator = isAsync
+		? asyncIteratorMethod.call(asyncIterable)
+		: iteratorMethod.call(asyncIterable);
+	if (iterator == null || (typeof iterator !== 'object' && typeof iterator !== 'function')) {
+		throw new TypeError('The result of the iterator method is not an object');
+	}
+	var nextMethod = iterator.next;
+	var iteratorReturn = iterator.return;
+	var iteratorFinished = false;
 	return new ReadableStream({
 		async pull(controller) {
-			const { value, done } = await iterator.next();
-			if (done) {
+			var result;
+			try {
+				result = await Promise.resolve(nextMethod.call(iterator));
+			} catch(e) {
+				controller.error(e);
+				throw e;
+			}
+			if (result == null || typeof result !== 'object') {
+				var err = new TypeError('Iterator result is not an object');
+				controller.error(err);
+				throw err;
+			}
+			if (result.done) {
+				iteratorFinished = true;
 				controller.close();
 			} else {
-				controller.enqueue(value);
+				controller.enqueue(isAsync ? result.value : await result.value);
 			}
+		},
+		cancel(reason) {
+			if (iteratorFinished) return undefined;
+			iteratorFinished = true;
+			if (iteratorReturn === undefined || iteratorReturn === null) {
+				return undefined;
+			}
+			if (typeof iteratorReturn !== 'function') {
+				throw new TypeError('iterator.return is not a function');
+			}
+			return Promise.resolve(iteratorReturn.call(iterator, reason)).then(function(r) {
+				if (r == null || typeof r !== 'object') {
+					throw new TypeError('Iterator result is not an object');
+				}
+			});
 		}
 	});
 };
@@ -682,7 +871,9 @@ globalThis.FixedLengthStream = FixedLengthStream;
 const queuingStrategiesJS = `
 class ByteLengthQueuingStrategy {
 	constructor(init) {
-		this.highWaterMark = init.highWaterMark;
+		if (typeof init !== 'object' || init === null) throw new TypeError('ByteLengthQueuingStrategy requires an object argument');
+		if (!('highWaterMark' in init)) throw new TypeError("Required member 'highWaterMark' is undefined.");
+		this.highWaterMark = Number(init.highWaterMark);
 	}
 	size(chunk) {
 		return chunk.byteLength;
@@ -691,9 +882,11 @@ class ByteLengthQueuingStrategy {
 
 class CountQueuingStrategy {
 	constructor(init) {
-		this.highWaterMark = init.highWaterMark;
+		if (typeof init !== 'object' || init === null) throw new TypeError('CountQueuingStrategy requires an object argument');
+		if (!('highWaterMark' in init)) throw new TypeError("Required member 'highWaterMark' is undefined.");
+		this.highWaterMark = Number(init.highWaterMark);
 	}
-	size(chunk) {
+	size() {
 		return 1;
 	}
 }

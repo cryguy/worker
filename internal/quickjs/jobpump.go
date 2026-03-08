@@ -24,8 +24,9 @@ func executePendingJobs(vm *quickjs.VM) int {
 		return 0
 	}
 
+	const maxJobs = 10000 // prevent infinite microtask loops from blocking the Go runtime
 	count := 0
-	for {
+	for count < maxJobs {
 		ret := lib.XJS_ExecutePendingJob(tls, rt, 0)
 		if ret <= 0 {
 			break
